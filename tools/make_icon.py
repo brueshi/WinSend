@@ -26,6 +26,10 @@ WHITE = (255, 255, 255)
 STAND = (150, 178, 226)
 
 SIZES = (16, 32, 48)
+# The window and taskbar icon is handed to eframe as raw pixels, so it is
+# written out already decoded. A .ico would mean parsing a container at startup
+# to recover exactly this.
+RGBA_SIZE = 64
 # Every shape is drawn at this multiple and box-filtered down, which is the
 # whole of the antialiasing strategy.
 SUPERSAMPLE = 8
@@ -167,6 +171,22 @@ def write_ico(path):
     return path
 
 
+def write_rgba(path, size):
+    """Raw RGBA rows, top-down, no header.
+
+    The consumer is eframe's window icon, which wants exactly this. Keeping it
+    headerless means the Rust side is an include_bytes! and two constants
+    rather than an image decoder pulled in for one 64-pixel square.
+    """
+    raw = bytearray()
+    for row in render(size):
+        for r, g, b, a in row:
+            raw += bytes((r, g, b, a))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(raw))
+    return path
+
+
 def write_png(path, size):
     """Preview only. Never embedded; the .ico is what ships."""
     pixels = render(size)
@@ -200,6 +220,9 @@ if __name__ == "__main__":
 
     written = write_ico(Path("assets/winsend.ico"))
     print(f"wrote {written} ({written.stat().st_size} bytes)")
+
+    rgba = write_rgba(Path(f"assets/winsend-{RGBA_SIZE}.rgba"), RGBA_SIZE)
+    print(f"wrote {rgba} ({rgba.stat().st_size} bytes)")
 
     if args.preview:
         write_png(args.preview, args.preview_size)

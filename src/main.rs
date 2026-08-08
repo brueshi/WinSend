@@ -34,6 +34,23 @@ fn select_platform() -> Box<dyn Platform> {
     Box::new(mock::MockPlatform::new())
 }
 
+/// The window and taskbar icon, as raw RGBA rather than an encoded image.
+///
+/// Written out already decoded by `tools/make_icon.py`, so setting it costs an
+/// include and two constants instead of an image decoder pulled in to unpack
+/// one 64-pixel square at startup. This is separate from the icon compiled into
+/// the executable's resources, which is what Explorer shows on the file.
+const WINDOW_ICON: &[u8] = include_bytes!("../assets/winsend-64.rgba");
+const WINDOW_ICON_SIZE: u32 = 64;
+
+fn window_icon() -> eframe::egui::IconData {
+    eframe::egui::IconData {
+        rgba: WINDOW_ICON.to_vec(),
+        width: WINDOW_ICON_SIZE,
+        height: WINDOW_ICON_SIZE,
+    }
+}
+
 fn main() -> eframe::Result {
     let core = Core::new(select_platform(), Config::load());
 
@@ -46,7 +63,8 @@ fn main() -> eframe::Result {
         // programmatically when the picker opens, and a non-resizable window
         // would leave the user stuck with whatever size it chose.
         .with_resizable(true)
-        .with_always_on_top();
+        .with_always_on_top()
+        .with_icon(window_icon());
 
     // Fixed position only in debug, so UI screenshots land in a known place.
     #[cfg(debug_assertions)]
