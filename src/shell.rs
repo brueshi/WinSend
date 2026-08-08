@@ -6,6 +6,8 @@
 //! spot. The shell instead delivers events on the OS's schedule, from a thread
 //! of its own, and that difference is what shapes everything below.
 
+use std::sync::Arc;
+
 use crate::hotkey::{Action, Hotkeys};
 
 /// Wakes the UI thread. Called from the shell's own thread as soon as an event
@@ -15,7 +17,11 @@ use crate::hotkey::{Action, Hotkeys};
 /// the UI toolkit. It is not optional: an idle eframe window never calls
 /// `update`, so without a wake a hotkey press would do nothing until the user
 /// moved the mouse over the window they pressed the hotkey to avoid touching.
-pub type Waker = Box<dyn Fn() + Send + Sync>;
+///
+/// Shared rather than owned, because the Win32 shell needs it in two places at
+/// once: its message loop and its window procedure, which receive different
+/// kinds of message and cannot be merged.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// Something the user asked for from outside the main window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +146,7 @@ mod tests {
     fn shell() -> (MockShell, Arc<AtomicUsize>) {
         let wakes = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&wakes);
-        let shell = MockShell::new(Box::new(move || {
+        let shell = MockShell::new(Arc::new(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         }));
         (shell, wakes)

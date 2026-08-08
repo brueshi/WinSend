@@ -92,7 +92,7 @@ impl WinSendApp {
         // a hotkey press would sit in the queue until something else woke the
         // window, which defeats the point of not having to touch the window.
         let ctx = cc.egui_ctx.clone();
-        let shell = shell::create(Box::new(move || ctx.request_repaint()));
+        let shell = shell::create(std::sync::Arc::new(move || ctx.request_repaint()));
         shell.apply_hotkeys(core.config.hotkeys);
 
         // Only the debug-only screen override below mutates this.

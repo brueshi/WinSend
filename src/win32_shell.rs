@@ -6,10 +6,14 @@
 //! its own with a message-only window and its own loop, and forwards what it
 //! sees to the UI over a channel.
 //!
-//! The window is created even though hotkeys alone would not need one —
-//! `WM_HOTKEY` is intercepted in the loop before dispatch. It exists because
-//! `Shell_NotifyIcon` genuinely does need a window to send its callbacks to,
-//! and standing up a second thread for that later would be the wrong shape.
+//! The window exists because `Shell_NotifyIcon` needs one to send its callbacks
+//! to. Hotkeys alone would not have needed it.
+//!
+//! Those two kinds of message arrive by different routes, and the difference
+//! matters: `WM_HOTKEY` is **posted**, so it turns up in the queue and is
+//! handled in the loop, while the tray's callback is **sent**, so it goes
+//! straight to the window procedure and never enters the queue at all. Handling
+//! the tray in the loop looks reasonable and simply never runs.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -34,7 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LookupIconIdFromDirectoryEx, PostMessageW, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, HWND_MESSAGE, LR_DEFAULTCOLOR,
     MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_HOTKEY, WM_LBUTTONUP,
+    WM_RBUTTONUP, WNDCLASSW,
 };
 
 use crate::hotkey::{Action, Hotkey, Hotkeys};
@@ -102,15 +107,65 @@ fn modifiers_of(hotkey: Hotkey) -> HOT_KEY_MODIFIERS {
     modifiers
 }
 
-/// Nothing but the default behaviour yet. It exists because a window needs a
-/// procedure at all, and because the tray icon's callbacks will arrive here.
+/// What the window procedure needs in order to answer a tray click.
+struct Context {
+    events: Sender<ShellEvent>,
+    waker: Waker,
+    can_retrieve: bool,
+}
+
+thread_local! {
+    /// Populated by the shell thread before its loop starts.
+    ///
+    /// A thread-local rather than a pointer parked in `GWLP_USERDATA`, because
+    /// the window is owned by exactly one thread and its procedure never runs
+    /// on any other. That makes the lifetime obvious and the access safe
+    /// without a single raw pointer.
+    static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
+}
+
+/// The window procedure.
+///
+/// The tray icon's callbacks arrive **here** and not in the message loop,
+/// because `Shell_NotifyIcon` sends its callback rather than posting it. A sent
+/// message goes straight to the procedure and never enters the queue that
+/// `GetMessageW` drains, so a tray arm in that loop is code that can never run.
+/// `WM_HOTKEY` is posted, which is why that one is handled there instead.
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    DefWindowProcW(hwnd, message, wparam, lparam)
+    if message != WM_TRAY {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    // Read and release before opening the menu. `TrackPopupMenu` runs a modal
+    // loop of its own, and holding the borrow across it would turn any
+    // re-entrant callback into a panic.
+    let can_retrieve =
+        CONTEXT.with(|context| matches!(context.borrow().as_ref(), Some(c) if c.can_retrieve));
+
+    // With the default icon version the mouse message arrives in lParam.
+    // WM_CONTEXTMENU covers the keyboard route to the same menu.
+    let chosen = match lparam.0 as u32 {
+        WM_LBUTTONUP => Some(ShellEvent::ShowWindow),
+        WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd, can_retrieve),
+        _ => None,
+    };
+
+    if let Some(event) = chosen {
+        CONTEXT.with(|context| {
+            if let Some(context) = context.borrow().as_ref() {
+                if context.events.send(event).is_ok() {
+                    (context.waker)();
+                }
+            }
+        });
+    }
+
+    LRESULT(0)
 }
 
 unsafe fn create_message_window() -> Option<HWND> {
@@ -337,9 +392,18 @@ fn run(
         // documented as safe to call across threads.
         let _ = startup.send(Some(hwnd.0 as isize));
 
+        // The procedure needs its own route to the UI, since the tray's sent
+        // callbacks never reach the loop below.
+        CONTEXT.with(|context| {
+            *context.borrow_mut() = Some(Context {
+                events: events.clone(),
+                waker: Arc::clone(&waker),
+                can_retrieve: false,
+            });
+        });
+
         let mut registered = Hotkeys::default();
         let mut tray = Tray::add(hwnd);
-        let mut can_retrieve = false;
         let mut message = MSG::default();
 
         // `.0 > 0` rather than `as_bool`: GetMessageW returns -1 on error, and
@@ -362,22 +426,14 @@ fn run(
                 }
                 WM_SET_TRAY => {
                     let state = tray_pending.lock().map(|s| s.clone()).unwrap_or_default();
-                    can_retrieve = state.can_retrieve;
-                    tray.set_tooltip(&state.tooltip);
-                }
-                WM_TRAY => {
-                    // With the default icon version the mouse message arrives
-                    // in lParam and the icon id in wParam.
-                    let chosen = match message.lParam.0 as u32 {
-                        WM_LBUTTONUP => Some(ShellEvent::ShowWindow),
-                        WM_RBUTTONUP => show_menu(hwnd, can_retrieve),
-                        _ => None,
-                    };
-                    if let Some(event) = chosen {
-                        if !emit(&events, &waker, event) {
-                            break;
+                    // Handed to the procedure, which is what greys the menu's
+                    // Retrieve item and cannot read this loop's locals.
+                    CONTEXT.with(|context| {
+                        if let Some(context) = context.borrow_mut().as_mut() {
+                            context.can_retrieve = state.can_retrieve;
                         }
-                    }
+                    });
+                    tray.set_tooltip(&state.tooltip);
                 }
                 WM_STOP => PostQuitMessage(0),
                 _ => {
