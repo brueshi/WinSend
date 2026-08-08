@@ -16,8 +16,10 @@ including thumbnail capture. The UI, configuration, window-identity matching,
 binding rules and the Send/Retrieve logic are covered by tests that run on any
 platform.
 
-The global hotkey and the tray icon compile for Windows but have not yet been
-exercised there, in the same position `win32.rs` was in before its first run.
+Global hotkeys are confirmed working on Windows. The tray icon appears, and its
+menu is fixed but not yet re-tested: `Shell_NotifyIcon` sends its callback
+rather than posting it, so the first attempt handled it in the message loop
+where it could never arrive. Hide-to-tray is still unverified.
 
 Known limitation: Zoom's main and video windows are identical in process, class
 and title, so after restarting WinSend the window has to be picked again. Within
@@ -75,6 +77,15 @@ Four decisions worth knowing:
   they press it. Pressing Send twice is already a no-op, where double-tapping a
   toggle would bounce the window mid-broadcast.
 
+- **A sent window is held above everything else, and put back afterwards.**
+  Moving it onto a monitor that already has something full-screen on it would
+  otherwise leave it behind that content, which looks identical to nothing
+  happening. Raising this window is the only way in front without touching the
+  other application, so whatever is playing keeps playing and is still there on
+  Retrieve. The original z-order is recorded rather than assumed, since Zoom has
+  an always-on-top option of its own that must not be silently cleared. This
+  cannot beat true exclusive-fullscreen content, where nothing can draw above.
+
 Restore points are captured only on the first Send, so pressing it twice cannot
 overwrite the original position, and are cleared once Retrieve consumes them.
 Minimised windows are un-minimised before their bounds are read, because Windows
@@ -119,9 +130,14 @@ python3 tools/make_icon.py                    # rewrites assets/winsend.ico
 python3 tools/make_icon.py --preview /tmp/icon.png
 ```
 
-It is embedded with `include_bytes!` and built at runtime, not compiled in as a
-`.rc` resource, because a resource compiler in the build is what would break the
-cross-compile above. The cost is that Explorer shows no icon on the `.exe`.
+It produces three things from one description: `winsend.ico` for the tray and
+the executable's resources, and `winsend-64.rgba` for the window and taskbar
+icon, which eframe wants as raw pixels.
+
+The tray and window icons carry their bytes inline, so only the icon Explorer
+shows on the file needs `assets/winsend.rc` and the resource step in `build.rs`.
+That step is a no-op for non-Windows targets and only ever a warning when a
+resource compiler is missing, so it cannot break either build above.
 
 ## The probe
 
