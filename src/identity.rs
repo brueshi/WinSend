@@ -40,6 +40,14 @@ fn eq_ignore_case(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.eq_ignore_ascii_case(b)
 }
 
+/// Whether a window still looks like the one that was confirmed, ignoring the
+/// title. Used to validate a remembered handle before trusting it: a handle can
+/// be reused by the OS after its window dies, so existence alone is not enough.
+pub fn matches_structurally(identity: &WindowIdentity, candidate: &WindowCandidate) -> bool {
+    eq_ignore_case(&candidate.process_name, &identity.process_name)
+        && eq_ignore_case(&candidate.class_name, &identity.class_name)
+}
+
 /// Resolve a persisted identity against the windows currently on screen.
 ///
 /// Process and class are treated as the structural identity and must both
@@ -49,10 +57,7 @@ fn eq_ignore_case(a: &str, b: &str) -> bool {
 pub fn resolve(identity: &WindowIdentity, candidates: &[WindowCandidate]) -> Resolution {
     let structural: Vec<&WindowCandidate> = candidates
         .iter()
-        .filter(|c| {
-            eq_ignore_case(&c.process_name, &identity.process_name)
-                && eq_ignore_case(&c.class_name, &identity.class_name)
-        })
+        .filter(|c| matches_structurally(identity, c))
         .collect();
 
     match structural.len() {

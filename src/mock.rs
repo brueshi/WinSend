@@ -45,17 +45,20 @@ impl MockPlatform {
 
 fn default_windows() -> Vec<WindowCandidate> {
     vec![
+        // The main meeting window and the video window are indistinguishable by
+        // description: same process, same class, same title. Observed on real
+        // Windows, and the reason a remembered handle is needed to tell them
+        // apart at all.
         WindowCandidate {
             handle: 0x1001,
             process_name: "Zoom.exe".into(),
             class_name: "ZPContentViewWndClass".into(),
-            title: "Zoom Meeting".into(),
+            title: "Zoom Workplace".into(),
             bounds: Bounds::new(120, 80, 1280, 800),
             monitor_id: r"\\.\DISPLAY1".into(),
             likely_zoom: true,
         },
-        // The target: same process and class as the main window, which is
-        // exactly why the user has to confirm it visually.
+        // The target.
         WindowCandidate {
             handle: 0x1002,
             process_name: "Zoom.exe".into(),
@@ -80,6 +83,16 @@ fn default_windows() -> Vec<WindowCandidate> {
             class_name: "Qt5152QWindowIcon".into(),
             title: "OBS 30.0.2 - Profile: Live".into(),
             bounds: Bounds::new(0, 0, 1200, 760),
+            monitor_id: r"\\.\DISPLAY1".into(),
+            likely_zoom: false,
+        },
+        // Long title, to keep the picker layout honest about overflow.
+        WindowCandidate {
+            handle: 0x2003,
+            process_name: "explorer.exe".into(),
+            class_name: "CabinetWClass".into(),
+            title: "Q3 Broadcast Assets — Final — Approved — Do Not Move Or Rename".into(),
+            bounds: Bounds::new(400, 300, 1100, 700),
             monitor_id: r"\\.\DISPLAY1".into(),
             likely_zoom: false,
         },
