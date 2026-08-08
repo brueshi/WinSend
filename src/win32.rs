@@ -45,10 +45,18 @@ const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
 const THUMBNAIL_WIDTH: u32 = 192;
 
 pub struct Win32Platform {
-    /// Window styles we stripped to go borderless, so they can be put back.
+    /// The style bits taken off a window to go borderless, so exactly those can
+    /// be put back.
+    ///
+    /// The bits removed, not the style word they came from. Snapshotting the
+    /// whole word meant restoring it discarded anything the application changed
+    /// in the meantime, and Zoom does change its own styles — it enters its own
+    /// full-screen mode when the video window is moved. Putting back a stale
+    /// snapshot is what left odd chrome around it.
+    ///
     /// Held here rather than in `Core` because it is a detail of how this
     /// platform achieves a borderless fill, not something the app logic needs.
-    stripped_styles: RefCell<HashMap<u64, isize>>,
+    cleared_styles: RefCell<HashMap<u64, isize>>,
     /// Whether a window was already topmost before we raised it, so putting it
     /// back does not quietly clear an always-on-top the user set themselves.
     was_topmost: RefCell<HashMap<u64, bool>>,
@@ -68,7 +76,7 @@ impl Win32Platform {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
         Self {
-            stripped_styles: RefCell::new(HashMap::new()),
+            cleared_styles: RefCell::new(HashMap::new()),
             was_topmost: RefCell::new(HashMap::new()),
         }
     }
@@ -109,13 +117,14 @@ impl Drop for Win32Platform {
             }
         }
 
-        for (handle, style) in self.stripped_styles.borrow().iter() {
+        for (handle, cleared) in self.cleared_styles.borrow().iter() {
             let hwnd = handle_to_hwnd(*handle);
             unsafe {
                 if !IsWindow(Some(hwnd)).as_bool() {
                     continue;
                 }
-                SetWindowLongPtrW(hwnd, GWL_STYLE, *style);
+                let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, current | *cleared);
                 // The frame does not come back until the window is told to
                 // recalculate it.
                 let _ = SetWindowPos(
@@ -595,11 +604,21 @@ impl Platform for Win32Platform {
                     let chrome = (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0
                         | WS_MAXIMIZEBOX.0
                         | WS_SYSMENU.0) as isize;
-                    self.stripped_styles.borrow_mut().insert(handle, current);
+                    // Only the bits actually present, accumulated rather than
+                    // replaced. Sending twice used to record the already
+                    // stripped style as the thing to restore, which put the
+                    // window back frameless and permanently.
+                    let clearing = current & chrome;
+                    if clearing != 0 {
+                        *self.cleared_styles.borrow_mut().entry(handle).or_insert(0) |= clearing;
+                    }
                     SetWindowLongPtrW(hwnd, GWL_STYLE, current & !chrome);
                 }
-            } else if let Some(original) = self.stripped_styles.borrow_mut().remove(&handle) {
-                SetWindowLongPtrW(hwnd, GWL_STYLE, original);
+            } else if let Some(cleared) = self.cleared_styles.borrow_mut().remove(&handle) {
+                // Put back what was taken, on top of whatever the style is now,
+                // so anything the application changed in between survives.
+                let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, current | cleared);
             }
 
             // Which band to place the window in, and what to put back.
