@@ -10,7 +10,7 @@
 use crate::config::Config;
 use crate::hotkey::{Action, Hotkey};
 use crate::identity::{matches_structurally, resolve, Resolution, WindowIdentity};
-use crate::platform::{Bounds, MonitorInfo, Platform, WindowCandidate};
+use crate::platform::{Bounds, MonitorInfo, Placement, Platform, WindowCandidate};
 
 /// Why an action could not complete.
 ///
@@ -213,7 +213,10 @@ impl Core {
         };
 
         self.platform
-            .set_window_bounds(window.handle, destination, self.config.borderless)
+            .place_window(
+                window.handle,
+                Placement { bounds: destination, borderless: self.config.borderless },
+            )
             .map_err(|e| Failure::plain(format!("Could not move the window: {e}")))?;
 
         // Commit the restore point only once the move has actually succeeded,
@@ -234,7 +237,7 @@ impl Core {
         self.ensure_visible(&window)?;
 
         self.platform
-            .set_window_bounds(window.handle, bounds, false)
+            .place_window(window.handle, Placement { bounds, borderless: false })
             .map_err(|e| Failure::plain(format!("Could not restore the window: {e}")))?;
 
         // Consumed: the next Send captures a fresh restore point rather than
@@ -346,7 +349,7 @@ mod tests {
 
         let moved_by_hand = Bounds::new(300, 300, 640, 360);
         core.platform
-            .set_window_bounds(VIDEO_WINDOW, moved_by_hand, false)
+            .place_window(VIDEO_WINDOW, Placement { bounds: moved_by_hand, borderless: false })
             .unwrap();
 
         core.send().unwrap();

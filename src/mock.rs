@@ -10,7 +10,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::hotkey::{Action, Hotkey, Hotkeys};
-use crate::platform::{Bounds, MonitorInfo, Platform, PlatformError, Thumbnail, WindowCandidate};
+use crate::platform::{
+    Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate,
+};
 use crate::shell::{HotkeyReport, Shell, ShellEvent, TrayState, Waker};
 
 pub struct MockPlatform {
@@ -311,12 +313,7 @@ impl Platform for MockPlatform {
             .ok_or(PlatformError::WindowGone)
     }
 
-    fn set_window_bounds(
-        &self,
-        handle: u64,
-        bounds: Bounds,
-        _borderless: bool,
-    ) -> Result<(), PlatformError> {
+    fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError> {
         if !self.zoom_present() {
             return Err(PlatformError::WindowGone);
         }
@@ -325,7 +322,7 @@ impl Platform for MockPlatform {
             .iter_mut()
             .find(|w| w.handle == handle)
             .ok_or(PlatformError::WindowGone)?;
-        window.bounds = bounds;
+        window.bounds = placement.bounds;
         Ok(())
     }
 

@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::platform::{
-    Bounds, MonitorInfo, Platform, PlatformError, Thumbnail, WindowCandidate,
+    Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate,
 };
 
 /// Renders the window's full content even when it is occluded or composited by
@@ -391,12 +391,7 @@ impl Platform for Win32Platform {
         Ok(rect_to_bounds(rect))
     }
 
-    fn set_window_bounds(
-        &self,
-        handle: u64,
-        bounds: Bounds,
-        borderless: bool,
-    ) -> Result<(), PlatformError> {
+    fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError> {
         let hwnd = handle_to_hwnd(handle);
 
         unsafe {
@@ -406,7 +401,7 @@ impl Platform for Win32Platform {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
 
-            if borderless {
+            if placement.borderless {
                 let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
                 if current != 0 {
                     let chrome = (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0
@@ -422,10 +417,10 @@ impl Platform for Win32Platform {
             SetWindowPos(
                 hwnd,
                 None,
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height,
+                placement.bounds.x,
+                placement.bounds.y,
+                placement.bounds.width,
+                placement.bounds.height,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
             .map_err(|e| {

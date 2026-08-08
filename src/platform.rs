@@ -66,6 +66,18 @@ pub struct WindowCandidate {
     pub minimized: bool,
 }
 
+/// How a window should be placed.
+///
+/// A struct rather than a list of positional flags: the call sites read as
+/// `borderless: false` instead of a bare `false` whose meaning has to be looked
+/// up, and placement has more than one dimension to it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    pub bounds: Bounds,
+    /// Strip the window's frame so it fills the monitor edge to edge.
+    pub borderless: bool,
+}
+
 /// RGBA8 preview of a window, sized by the platform layer.
 #[derive(Debug, Clone)]
 pub struct Thumbnail {
@@ -110,14 +122,8 @@ pub trait Platform {
     /// off-screen coordinates that would make Retrieve useless.
     fn unminimize(&self, handle: u64) -> Result<(), PlatformError>;
 
-    /// Move and resize, optionally stripping the window's frame so it fills the
-    /// target monitor edge to edge.
-    fn set_window_bounds(
-        &self,
-        handle: u64,
-        bounds: Bounds,
-        borderless: bool,
-    ) -> Result<(), PlatformError>;
+    /// Move and resize a window according to `placement`.
+    fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError>;
 
     /// Escape hatch for the mock-only debug controls. Absent from Windows
     /// builds entirely, so it cannot leak into the shipped binary.
