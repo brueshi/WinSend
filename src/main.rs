@@ -33,15 +33,24 @@ fn select_platform() -> Box<dyn Platform> {
 fn main() -> eframe::Result {
     let core = Core::new(select_platform(), Config::load());
 
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("WinSend")
-            .with_inner_size([340.0, 260.0])
-            .with_min_inner_size([320.0, 220.0])
-            .with_position([60.0, 60.0])
-            .with_always_on_top(),
-        ..Default::default()
-    };
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("WinSend")
+        .with_inner_size([340.0, 260.0])
+        .with_min_inner_size([300.0, 200.0])
+        // Explicit rather than relying on the default: the window is resized
+        // programmatically when the picker opens, and a non-resizable window
+        // would leave the user stuck with whatever size it chose.
+        .with_resizable(true)
+        .with_always_on_top();
+
+    // Fixed position only in debug, so UI screenshots land in a known place.
+    #[cfg(debug_assertions)]
+    {
+        viewport = viewport.with_position([60.0, 60.0]);
+    }
+
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
         "WinSend",

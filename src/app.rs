@@ -11,7 +11,9 @@ use crate::platform::WindowCandidate;
 /// while picking a window, where showing only two entries would force scrolling
 /// through a list the user is trying to compare visually.
 const COMPACT_SIZE: egui::Vec2 = egui::vec2(340.0, 260.0);
-const PICKER_SIZE: egui::Vec2 = egui::vec2(380.0, 500.0);
+/// Tall enough to compare several candidates without scrolling. The user can
+/// still resize from here; this is only the starting size.
+const PICKER_SIZE: egui::Vec2 = egui::vec2(460.0, 640.0);
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(78, 142, 240);
 const OK: egui::Color32 = egui::Color32::from_rgb(102, 187, 122);
@@ -281,13 +283,22 @@ impl WinSendApp {
         ui.add_space(8.0);
 
         let mut confirmed = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // auto_shrink false: without it the list sizes to its content and the
+        // window's spare height goes unused, which is what made this feel
+        // cramped at anything short of full screen.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
             for candidate in &self.candidates {
                 let response = ui
                     .push_id(candidate.handle, |ui| {
                         egui::Frame::group(ui.style())
                             .fill(egui::Color32::from_gray(28))
                             .show(ui, |ui| {
+                                // Uniform full-width rows; without this each
+                                // row sizes to its own content and the right
+                                // edges come out ragged.
+                                ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     if let Some(texture) = self.thumbnails.get(&candidate.handle) {
                                         ui.add(
@@ -312,28 +323,44 @@ impl WinSendApp {
                                             egui::Color32::from_gray(110),
                                         );
                                     }
+                                    // Truncate rather than wrap: a long title
+                                    // would otherwise widen every row and push
+                                    // the window past the screen.
                                     ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(&candidate.title).size(12.0).strong(),
+                                        let detail = |text: String, size: f32, gray: u8| {
+                                            egui::Label::new(
+                                                egui::RichText::new(text)
+                                                    .size(size)
+                                                    .color(egui::Color32::from_gray(gray)),
+                                            )
+                                            .truncate()
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&candidate.title)
+                                                    .size(12.0)
+                                                    .strong(),
+                                            )
+                                            .truncate(),
                                         );
-                                        ui.label(
-                                            egui::RichText::new(format!(
+                                        ui.add(detail(
+                                            format!(
                                                 "{} · {}",
                                                 candidate.process_name, candidate.class_name
-                                            ))
-                                            .size(10.0)
-                                            .color(egui::Color32::from_gray(140)),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
+                                            ),
+                                            10.0,
+                                            140,
+                                        ));
+                                        ui.add(detail(
+                                            format!(
                                                 "{}x{} on {}",
                                                 candidate.bounds.width,
                                                 candidate.bounds.height,
                                                 candidate.monitor_id
-                                            ))
-                                            .size(10.0)
-                                            .color(egui::Color32::from_gray(120)),
-                                        );
+                                            ),
+                                            10.0,
+                                            120,
+                                        ));
                                     });
                                 });
                             });
