@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::core::{Core, Failure};
-use crate::hotkey::Action;
+use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::WindowCandidate;
-use crate::shell::{self, Shell, ShellEvent};
+use crate::shell::{self, HotkeyReport, Shell, ShellEvent};
 
 /// The utility sits on screen during a broadcast, so it stays small — except
 /// while picking a window, where showing only two entries would force scrolling
@@ -16,16 +16,31 @@ const COMPACT_SIZE: egui::Vec2 = egui::vec2(340.0, 260.0);
 /// Tall enough to compare several candidates without scrolling. The user can
 /// still resize from here; this is only the starting size.
 const PICKER_SIZE: egui::Vec2 = egui::vec2(460.0, 640.0);
+/// Settings outgrew the compact height once hotkeys were added. It is a
+/// transient screen rather than the one that sits over a broadcast, so it can
+/// afford the room.
+const SETTINGS_SIZE: egui::Vec2 = egui::vec2(360.0, 470.0);
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(78, 142, 240);
 const OK: egui::Color32 = egui::Color32::from_rgb(102, 187, 122);
 const ERR: egui::Color32 = egui::Color32::from_rgb(226, 106, 106);
+const SUBDUED: egui::Color32 = egui::Color32::from_gray(150);
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Main,
     Settings,
     SelectWindow,
+}
+
+impl Screen {
+    fn size(self) -> egui::Vec2 {
+        match self {
+            Screen::Main => COMPACT_SIZE,
+            Screen::Settings => SETTINGS_SIZE,
+            Screen::SelectWindow => PICKER_SIZE,
+        }
+    }
 }
 
 enum Status {
@@ -43,6 +58,12 @@ pub struct WinSendApp {
     /// reshuffle under the cursor while the user is reading it.
     candidates: Vec<WindowCandidate>,
     thumbnails: HashMap<u64, egui::TextureHandle>,
+    /// The action whose binding is being captured, if any. While this is set,
+    /// every key press belongs to the capture and nothing else.
+    capturing: Option<Action>,
+    /// Which bindings the shell refused, so the offending row can say so
+    /// rather than the reason living only in the status bar.
+    hotkey_report: HotkeyReport,
 }
 
 impl WinSendApp {
@@ -65,13 +86,15 @@ impl WinSendApp {
             status: Status::Idle,
             candidates: Vec::new(),
             thumbnails: HashMap::new(),
+            capturing: None,
+            hotkey_report: HotkeyReport::default(),
         };
 
         // Debug builds only: open straight onto a screen so it can be inspected
         // without clicking through. Compiled out of release entirely.
         #[cfg(debug_assertions)]
         match std::env::var("WINSEND_SCREEN").as_deref() {
-            Ok("settings") => app.screen = Screen::Settings,
+            Ok("settings") => app.go_to(&cc.egui_ctx, Screen::Settings),
             Ok("select") => app.open_picker(&cc.egui_ctx),
             _ => {}
         }
@@ -115,7 +138,75 @@ impl WinSendApp {
                 if let Some(summary) = report.summary() {
                     self.status = Status::Err(summary);
                 }
+                self.hotkey_report = report;
             }
+        }
+    }
+
+    /// Begin capturing a combination for `action`.
+    ///
+    /// The registered bindings are dropped first. A registered hotkey is
+    /// swallowed by the OS and never reaches this window, so without this,
+    /// rebinding a key to itself — or to the other action's key — would look
+    /// like the capture had simply stopped working.
+    fn start_capture(&mut self, action: Action) {
+        self.capturing = Some(action);
+        self.shell.apply_hotkeys(Default::default());
+        self.status = Status::Idle;
+    }
+
+    fn end_capture(&mut self) {
+        self.capturing = None;
+        self.shell.apply_hotkeys(self.core.config.hotkeys);
+    }
+
+    /// Consume this frame's keyboard input on behalf of a capture in progress.
+    ///
+    /// Runs before anything is drawn and swallows every key event, which is
+    /// what lets Escape and Tab be bound like any other key instead of being
+    /// acted on by the widgets underneath.
+    fn capture_step(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.capturing else {
+            return;
+        };
+
+        let (modifiers, pressed) = ctx.input_mut(|input| {
+            let pressed = input.events.iter().find_map(|event| match event {
+                egui::Event::Key { key, pressed: true, .. } => key_from_egui(*key),
+                _ => None,
+            });
+            input.events.clear();
+            (input.modifiers, pressed)
+        });
+
+        // Modifiers alone are not a binding; keep waiting for the real key.
+        let Some(key) = pressed else {
+            return;
+        };
+
+        let hotkey = Hotkey {
+            ctrl: modifiers.ctrl,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+            // egui does not report the Windows key as a modifier, so it cannot
+            // be captured here. Bindings that use it still parse from a
+            // hand-edited config; Windows reserves most of them anyway.
+            win: false,
+            key,
+        };
+
+        // A rejected combination leaves the capture running, so the user can
+        // correct it by pressing another rather than starting over.
+        if let Err(why) = hotkey.validate() {
+            self.status = Status::Err(why);
+            return;
+        }
+        match self.core.set_hotkey(action, Some(hotkey)) {
+            Ok(message) => {
+                self.status = Status::Ok(message);
+                self.end_capture();
+            }
+            Err(failure) => self.status = Status::Err(failure.message),
         }
     }
 
@@ -136,15 +227,22 @@ impl WinSendApp {
                 self.thumbnails.insert(candidate.handle, texture);
             }
         }
-        self.screen = Screen::SelectWindow;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(PICKER_SIZE));
+        self.go_to(ctx, Screen::SelectWindow);
     }
 
     fn leave_picker(&mut self, ctx: &egui::Context, to: Screen) {
-        self.screen = to;
         self.thumbnails.clear();
         self.candidates.clear();
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(COMPACT_SIZE));
+        self.go_to(ctx, to);
+    }
+
+    /// Switch screens and resize to suit. Also ends any capture in progress,
+    /// so a half-finished binding cannot keep swallowing keys from a screen
+    /// that has no way to finish it.
+    fn go_to(&mut self, ctx: &egui::Context, screen: Screen) {
+        self.capturing = None;
+        self.screen = screen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(screen.size()));
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -170,6 +268,7 @@ impl WinSendApp {
             .map(|m| m.label())
             .unwrap_or_else(|| "no target monitor selected".to_string());
 
+        let mut opening_settings = false;
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("Target: {target}"))
@@ -181,10 +280,14 @@ impl WinSendApp {
                     .button(egui::RichText::new("Settings").size(11.0))
                     .clicked()
                 {
-                    self.screen = Screen::Settings;
+                    opening_settings = true;
                 }
             });
         });
+        if opening_settings {
+            self.go_to(ctx, Screen::Settings);
+            return;
+        }
 
         ui.add_space(12.0);
 
@@ -259,12 +362,17 @@ impl WinSendApp {
     }
 
     fn settings_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut going_back = false;
         ui.horizontal(|ui| {
             if ui.button(egui::RichText::new("Back").size(11.0)).clicked() {
-                self.screen = Screen::Main;
+                going_back = true;
             }
             ui.label(egui::RichText::new("Settings").size(14.0).strong());
         });
+        if going_back {
+            self.go_to(ctx, Screen::Main);
+            return;
+        }
         ui.add_space(8.0);
 
         ui.label(egui::RichText::new("Target monitor").size(12.0).strong());
@@ -327,7 +435,80 @@ impl WinSendApp {
             self.open_picker(ctx);
         }
 
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        self.hotkey_settings(ui, ctx);
+
         self.status_bar(ui);
+    }
+
+    fn hotkey_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("Hotkeys").size(12.0).strong());
+        ui.label(
+            egui::RichText::new("Work from inside Zoom, without focusing this window.")
+                .size(11.0)
+                .color(SUBDUED),
+        );
+        ui.add_space(4.0);
+
+        // Collected rather than applied inline: every branch below borrows
+        // `self` through the closure, and acting on it there would conflict.
+        let mut start = None;
+        let mut cancel = false;
+        let mut cleared = None;
+
+        for action in Action::ALL {
+            let capturing = self.capturing == Some(action);
+            let bound = self.core.config.hotkeys.binding(action);
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(action.label()).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if capturing {
+                        if ui.small_button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                        ui.label(
+                            egui::RichText::new("press a combination")
+                                .size(11.0)
+                                .color(ACCENT),
+                        );
+                        return;
+                    }
+                    if bound.is_some() && ui.small_button("Clear").clicked() {
+                        cleared = Some(action);
+                    }
+                    if ui
+                        .small_button(if bound.is_some() { "Change" } else { "Set" })
+                        .clicked()
+                    {
+                        start = Some(action);
+                    }
+                    let (text, colour) = match bound {
+                        Some(hotkey) => (hotkey.to_string(), egui::Color32::from_gray(210)),
+                        None => ("not set".to_string(), SUBDUED),
+                    };
+                    ui.label(egui::RichText::new(text).size(11.0).color(colour));
+                });
+            });
+
+            // The row that failed says so, rather than the reason being one
+            // status message the user has already scrolled past.
+            if let Some(why) = self.hotkey_report.reason(action) {
+                ui.label(egui::RichText::new(why).size(10.0).color(ERR));
+            }
+        }
+
+        if let Some(action) = start {
+            self.start_capture(action);
+        } else if cancel {
+            self.end_capture();
+        } else if let Some(action) = cleared {
+            let outcome = self.core.set_hotkey(action, None);
+            self.report(ctx, outcome);
+            self.shell.apply_hotkeys(self.core.config.hotkeys);
+        }
     }
 
     fn select_window_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -456,12 +637,86 @@ impl eframe::App for WinSendApp {
         for event in self.shell.poll() {
             self.handle(ctx, event);
         }
+        // Before any widget sees the keyboard, so a capture in progress takes
+        // every press for itself.
+        self.capture_step(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| match self.screen {
             Screen::Main => self.main_screen(ui, ctx),
-            Screen::Settings => self.settings_screen(ui, ctx),
+            // Scrollable as a safety net: the window is user-resizable, and
+            // settings content clipped with no way to reach it would be worse
+            // than a scrollbar that is usually not needed.
+            Screen::Settings => {
+                egui::ScrollArea::vertical().show(ui, |ui| self.settings_screen(ui, ctx));
+            }
             Screen::SelectWindow => self.select_window_screen(ui, ctx),
         });
+    }
+}
+
+/// Translate an egui key into one that can be registered with Windows.
+///
+/// Returning `None` is the normal answer for anything without a virtual-key
+/// code, such as egui's F25 upward, and simply means the capture keeps waiting.
+fn key_from_egui(key: egui::Key) -> Option<Key> {
+    use egui::Key as E;
+
+    let name = match key {
+        E::ArrowLeft => "Left",
+        E::ArrowRight => "Right",
+        E::ArrowUp => "Up",
+        E::ArrowDown => "Down",
+        E::Escape => "Escape",
+        E::Tab => "Tab",
+        E::Backspace => "Backspace",
+        E::Enter => "Enter",
+        E::Space => "Space",
+        E::Insert => "Insert",
+        E::Delete => "Delete",
+        E::Home => "Home",
+        E::End => "End",
+        E::PageUp => "PageUp",
+        E::PageDown => "PageDown",
+        // Letters, digits and function keys name themselves, give or take the
+        // prefix egui puts on digits.
+        other => return other.name().strip_prefix("Num").unwrap_or(other.name()).parse().ok(),
+    };
+    name.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str) -> Option<Key> {
+        name.parse().ok()
+    }
+
+    #[test]
+    fn capturable_keys_map_onto_bindable_ones() {
+        for (pressed, expected) in [
+            (egui::Key::A, "A"),
+            (egui::Key::Z, "Z"),
+            (egui::Key::Num0, "0"),
+            (egui::Key::F9, "F9"),
+            (egui::Key::F13, "F13"),
+            (egui::Key::F24, "F24"),
+            (egui::Key::Escape, "Escape"),
+            (egui::Key::Tab, "Tab"),
+            (egui::Key::Space, "Space"),
+            (egui::Key::ArrowLeft, "Left"),
+            (egui::Key::PageDown, "PageDown"),
+        ] {
+            assert_eq!(key_from_egui(pressed), key(expected), "{pressed:?}");
+        }
+    }
+
+    /// egui models keys Windows has no virtual code for. Capture must ignore
+    /// them and keep waiting rather than bind something unregisterable.
+    #[test]
+    fn keys_windows_cannot_register_are_ignored() {
+        assert_eq!(key_from_egui(egui::Key::F35), None);
+        assert_eq!(key_from_egui(egui::Key::Plus), None);
     }
 }
 

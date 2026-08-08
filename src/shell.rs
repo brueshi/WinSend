@@ -38,9 +38,7 @@ pub struct HotkeyReport {
 
 impl HotkeyReport {
     /// Read by the settings screen, which marks the offending row rather than
-    /// leaving the reason only in the status bar. That lands with the capture
-    /// UI; the tests exercise it in the meantime.
-    #[allow(dead_code)]
+    /// leaving the reason only in the status bar.
     pub fn reason(&self, action: Action) -> Option<&str> {
         self.rejected
             .iter()

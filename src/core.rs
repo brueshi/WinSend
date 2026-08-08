@@ -8,6 +8,7 @@
 //! something else entirely.
 
 use crate::config::Config;
+use crate::hotkey::{Action, Hotkey};
 use crate::identity::{matches_structurally, resolve, Resolution, WindowIdentity};
 use crate::platform::{Bounds, MonitorInfo, Platform, WindowCandidate};
 
@@ -99,6 +100,17 @@ impl Core {
         self.config.set_target(monitor);
         self.config.save()?;
         Ok(format!("Target set to {}", monitor.label()))
+    }
+
+    /// Bind or clear a hotkey. Persisted immediately, since a binding the user
+    /// has to remember to save is a binding they will lose.
+    pub fn set_hotkey(&mut self, action: Action, hotkey: Option<Hotkey>) -> Result<String, Failure> {
+        self.config.hotkeys.set(action, hotkey).map_err(Failure::plain)?;
+        self.config.save()?;
+        Ok(match hotkey {
+            Some(hotkey) => format!("{} hotkey set to {hotkey}", action.label()),
+            None => format!("{} hotkey cleared", action.label()),
+        })
     }
 
     pub fn set_borderless(&mut self, borderless: bool) -> Result<(), String> {
