@@ -1,0 +1,49 @@
+[package]
+name = "winsend"
+version = "0.1.0"
+edition = "2021"
+authors = ["brueshi"]
+description = "Sends Zoom's dual-monitor video window to a chosen display and back"
+
+[features]
+# The throwaway window-enumeration tool. Windows-only, and excluded from the
+# default build so `cargo test` works natively on macOS.
+probe = []
+
+[[bin]]
+name = "winsend"
+path = "src/main.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+required-features = ["probe"]
+
+[dependencies]
+eframe = "0.33.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Win32 bindings are the only genuinely platform-bound dependency. Keeping them
+# target-scoped is what lets the UI, config and matching logic build and run on
+# macOS against the mock platform.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    # PrintWindow lives here, grouped with the printing APIs rather than with
+    # window management.
+    "Win32_Storage_Xps",
+] }
+
+[profile.release]
+# opt-level 3 rather than "z": this runs live during a broadcast, so UI latency
+# matters more than the couple of MB a size-optimised build would save.
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

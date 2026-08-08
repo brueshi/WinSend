@@ -1,0 +1,212 @@
+//! A fake desktop, so the UI and every state transition can be exercised on a
+//! machine that is not Windows.
+//!
+//! It models the situation that makes this app necessary: a main Zoom meeting
+//! window and a dual-monitor video window that share a window class and differ
+//! only by title. Windows can be made to vanish on demand to exercise the
+//! "confirmed window is gone" path without needing Zoom to cooperate.
+
+use std::cell::RefCell;
+
+use crate::platform::{Bounds, MonitorInfo, Platform, PlatformError, Thumbnail, WindowCandidate};
+
+pub struct MockPlatform {
+    windows: RefCell<Vec<WindowCandidate>>,
+    /// Flips the Zoom windows out of existence to test the reconfirm prompt.
+    zoom_present: RefCell<bool>,
+}
+
+impl Default for MockPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockPlatform {
+    pub fn new() -> Self {
+        Self {
+            windows: RefCell::new(default_windows()),
+            zoom_present: RefCell::new(true),
+        }
+    }
+
+    pub fn zoom_present(&self) -> bool {
+        *self.zoom_present.borrow()
+    }
+
+    /// Driven by the mock-only debug checkbox, which is compiled out on
+    /// Windows even though the mock itself remains reachable there via
+    /// `WINSEND_MOCK=1`.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn set_zoom_present(&self, present: bool) {
+        *self.zoom_present.borrow_mut() = present;
+    }
+}
+
+fn default_windows() -> Vec<WindowCandidate> {
+    vec![
+        WindowCandidate {
+            handle: 0x1001,
+            process_name: "Zoom.exe".into(),
+            class_name: "ZPContentViewWndClass".into(),
+            title: "Zoom Meeting".into(),
+            bounds: Bounds::new(120, 80, 1280, 800),
+            monitor_id: r"\\.\DISPLAY1".into(),
+            likely_zoom: true,
+        },
+        // The target: same process and class as the main window, which is
+        // exactly why the user has to confirm it visually.
+        WindowCandidate {
+            handle: 0x1002,
+            process_name: "Zoom.exe".into(),
+            class_name: "ZPContentViewWndClass".into(),
+            title: "Zoom Workplace".into(),
+            bounds: Bounds::new(2700, 200, 960, 540),
+            monitor_id: r"\\.\DISPLAY2".into(),
+            likely_zoom: true,
+        },
+        WindowCandidate {
+            handle: 0x2001,
+            process_name: "chrome.exe".into(),
+            class_name: "Chrome_WidgetWin_1".into(),
+            title: "Production runsheet - Google Docs".into(),
+            bounds: Bounds::new(300, 150, 1440, 900),
+            monitor_id: r"\\.\DISPLAY1".into(),
+            likely_zoom: false,
+        },
+        WindowCandidate {
+            handle: 0x2002,
+            process_name: "obs64.exe".into(),
+            class_name: "Qt5152QWindowIcon".into(),
+            title: "OBS 30.0.2 - Profile: Live".into(),
+            bounds: Bounds::new(0, 0, 1200, 760),
+            monitor_id: r"\\.\DISPLAY1".into(),
+            likely_zoom: false,
+        },
+    ]
+}
+
+impl Platform for MockPlatform {
+    fn monitors(&self) -> Vec<MonitorInfo> {
+        vec![
+            MonitorInfo {
+                id: r"\\.\DISPLAY1".into(),
+                bounds: Bounds::new(0, 0, 2560, 1440),
+                work_area: Bounds::new(0, 0, 2560, 1400),
+                is_primary: true,
+            },
+            MonitorInfo {
+                id: r"\\.\DISPLAY2".into(),
+                bounds: Bounds::new(2560, 0, 1920, 1080),
+                work_area: Bounds::new(2560, 0, 1920, 1040),
+                is_primary: false,
+            },
+        ]
+    }
+
+    fn candidate_windows(&self) -> Vec<WindowCandidate> {
+        let present = self.zoom_present();
+        self.windows
+            .borrow()
+            .iter()
+            .filter(|w| present || w.process_name != "Zoom.exe")
+            .cloned()
+            .collect()
+    }
+
+    fn thumbnail(&self, handle: u64) -> Option<Thumbnail> {
+        let windows = self.windows.borrow();
+        let window = windows.iter().find(|w| w.handle == handle)?;
+        Some(synthetic_thumbnail(window))
+    }
+
+    fn window_bounds(&self, handle: u64) -> Result<Bounds, PlatformError> {
+        if !self.zoom_present() {
+            return Err(PlatformError::WindowGone);
+        }
+        self.windows
+            .borrow()
+            .iter()
+            .find(|w| w.handle == handle)
+            .map(|w| w.bounds)
+            .ok_or(PlatformError::WindowGone)
+    }
+
+    fn set_window_bounds(
+        &self,
+        handle: u64,
+        bounds: Bounds,
+        _borderless: bool,
+    ) -> Result<(), PlatformError> {
+        if !self.zoom_present() {
+            return Err(PlatformError::WindowGone);
+        }
+        let mut windows = self.windows.borrow_mut();
+        let window = windows
+            .iter_mut()
+            .find(|w| w.handle == handle)
+            .ok_or(PlatformError::WindowGone)?;
+        window.bounds = bounds;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn as_mock(&self) -> Option<&MockPlatform> {
+        Some(self)
+    }
+}
+
+/// Distinguishable placeholder art, so the picker's thumbnail rendering can be
+/// developed without a real capture backend. Zoom-ish windows get a "video"
+/// look (a bright centre block on dark) and everything else a flat panel.
+fn synthetic_thumbnail(window: &WindowCandidate) -> Thumbnail {
+    const WIDTH: u32 = 192;
+    const HEIGHT: u32 = 108;
+
+    // Spread hues across handles so two windows never look identical.
+    let hue = ((window.handle.wrapping_mul(2654435761)) % 360) as f32;
+    let (r, g, b) = hsv_to_rgb(hue, 0.55, 0.85);
+
+    let mut rgba = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let in_centre = window.likely_zoom
+                && x > WIDTH / 4
+                && x < WIDTH * 3 / 4
+                && y > HEIGHT / 5
+                && y < HEIGHT * 4 / 5;
+            let (pr, pg, pb) = if window.likely_zoom {
+                if in_centre {
+                    (r, g, b)
+                } else {
+                    (18, 18, 22)
+                }
+            } else {
+                let shade = 40 + (y * 60 / HEIGHT) as u8;
+                (shade, shade, shade + 8)
+            };
+            rgba.extend_from_slice(&[pr, pg, pb, 255]);
+        }
+    }
+
+    Thumbnail { width: WIDTH, height: HEIGHT, rgba }
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h as u32 {
+        0..=59 => (c, x, 0.0),
+        60..=119 => (x, c, 0.0),
+        120..=179 => (0.0, c, x),
+        180..=239 => (0.0, x, c),
+        240..=299 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
