@@ -9,7 +9,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::hotkey::{Action, Hotkey, Hotkeys};
 use crate::platform::{Bounds, MonitorInfo, Platform, PlatformError, Thumbnail, WindowCandidate};
+use crate::shell::{HotkeyReport, Shell, ShellEvent, Waker};
 
 pub struct MockPlatform {
     windows: RefCell<Vec<WindowCandidate>>,
@@ -58,6 +60,91 @@ impl MockPlatform {
     #[cfg_attr(windows, allow(dead_code))]
     pub fn set_zoom_present(&self, present: bool) {
         *self.zoom_present.borrow_mut() = present;
+    }
+}
+
+/// A fake desktop shell, so the hotkey and tray paths can be walked end to end
+/// without Windows.
+///
+/// It has no thread of its own: events are injected by the debug controls on
+/// the main screen, or directly by tests. The waker is still called on every
+/// injection, since getting that wiring wrong is what would make a real hotkey
+/// press appear to do nothing.
+pub struct MockShell {
+    waker: Waker,
+    queue: RefCell<Vec<ShellEvent>>,
+    /// The bindings that actually took, which is not the same as the ones
+    /// asked for once a combination has been refused.
+    registered: RefCell<Hotkeys>,
+    /// Combinations that will refuse to register, standing in for one already
+    /// owned by another application.
+    unavailable: RefCell<Vec<Hotkey>>,
+}
+
+impl MockShell {
+    pub fn new(waker: Waker) -> Self {
+        Self {
+            waker,
+            queue: RefCell::new(Vec::new()),
+            registered: RefCell::new(Hotkeys::default()),
+            unavailable: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Stand in for a hotkey press.
+    pub fn trigger(&self, action: Action) {
+        self.emit(ShellEvent::Trigger(action));
+    }
+
+    /// Make these combinations refuse to register, so the failure path can be
+    /// exercised without persuading another application to take one.
+    #[cfg(test)]
+    pub fn set_unavailable(&self, hotkeys: Vec<Hotkey>) {
+        *self.unavailable.borrow_mut() = hotkeys;
+    }
+
+    #[cfg(test)]
+    pub fn registered(&self) -> Hotkeys {
+        *self.registered.borrow()
+    }
+
+    fn emit(&self, event: ShellEvent) {
+        self.queue.borrow_mut().push(event);
+        (self.waker)();
+    }
+}
+
+impl Shell for MockShell {
+    fn apply_hotkeys(&self, hotkeys: Hotkeys) {
+        let mut registered = Hotkeys::default();
+        let mut report = HotkeyReport::default();
+
+        for action in Action::ALL {
+            let Some(hotkey) = hotkeys.binding(action) else {
+                continue;
+            };
+            if self.unavailable.borrow().contains(&hotkey) {
+                report.rejected.push((
+                    action,
+                    format!("{hotkey} is already in use by another application"),
+                ));
+                continue;
+            }
+            // Cannot fail: the set being applied already satisfies the rules.
+            let _ = registered.set(action, Some(hotkey));
+        }
+
+        *self.registered.borrow_mut() = registered;
+        self.emit(ShellEvent::HotkeysApplied(report));
+    }
+
+    fn poll(&self) -> Vec<ShellEvent> {
+        self.queue.borrow_mut().drain(..).collect()
+    }
+
+    #[cfg(not(windows))]
+    fn as_mock(&self) -> Option<&MockShell> {
+        Some(self)
     }
 }
 

@@ -8,6 +8,7 @@ mod hotkey;
 mod identity;
 mod mock;
 mod platform;
+mod shell;
 #[cfg(windows)]
 mod win32;
 

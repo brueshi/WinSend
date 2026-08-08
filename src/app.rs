@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::core::{Core, Failure};
+use crate::hotkey::Action;
 use crate::platform::WindowCandidate;
+use crate::shell::{self, Shell, ShellEvent};
 
 /// The utility sits on screen during a broadcast, so it stays small — except
 /// while picking a window, where showing only two entries would force scrolling
@@ -34,6 +36,7 @@ enum Status {
 
 pub struct WinSendApp {
     core: Core,
+    shell: Box<dyn Shell>,
     screen: Screen,
     status: Status,
     /// Picker contents, snapshotted when the screen opens so the list does not
@@ -45,10 +48,19 @@ pub struct WinSendApp {
 impl WinSendApp {
     pub fn new(cc: &eframe::CreationContext<'_>, core: Core) -> Self {
         apply_style(&cc.egui_ctx);
+
+        // The waker is a repaint request against a cloned context. Without it
+        // a hotkey press would sit in the queue until something else woke the
+        // window, which defeats the point of not having to touch the window.
+        let ctx = cc.egui_ctx.clone();
+        let shell = shell::create(Box::new(move || ctx.request_repaint()));
+        shell.apply_hotkeys(core.config.hotkeys);
+
         // Only the debug-only screen override below mutates this.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut app = Self {
             core,
+            shell,
             screen: Screen::Main,
             status: Status::Idle,
             candidates: Vec::new(),
@@ -78,6 +90,30 @@ impl WinSendApp {
                 self.status = Status::Err(failure.message);
                 if needs_selection {
                     self.open_picker(ctx);
+                }
+            }
+        }
+    }
+
+    /// Run an action, however it was asked for. A hotkey press and a button
+    /// click are the same thing by the time they reach here.
+    fn perform(&mut self, ctx: &egui::Context, action: Action) {
+        let outcome = match action {
+            Action::Send => self.core.send(),
+            Action::Retrieve => self.core.retrieve(),
+        };
+        self.report(ctx, outcome);
+    }
+
+    fn handle(&mut self, ctx: &egui::Context, event: ShellEvent) {
+        match event {
+            ShellEvent::Trigger(action) => self.perform(ctx, action),
+            // A refusal is shown the moment it is known. A binding the user
+            // believes is live but which never registered is the one failure
+            // this feature cannot afford.
+            ShellEvent::HotkeysApplied(report) => {
+                if let Some(summary) = report.summary() {
+                    self.status = Status::Err(summary);
                 }
             }
         }
@@ -166,27 +202,30 @@ impl WinSendApp {
         .min_size(egui::vec2(0.0, 38.0))
         .fill(ACCENT);
 
+        let mut triggered = None;
         ui.vertical_centered_justified(|ui| {
             if ui.add(primary).clicked() {
-                let outcome = self.core.send();
-                self.report(ctx, outcome);
+                triggered = Some(Action::Send);
             }
             ui.add_space(6.0);
 
             let can_retrieve = self.core.can_retrieve();
             let response = ui.add_enabled(can_retrieve, button("Retrieve"));
             if response.clicked() {
-                let outcome = self.core.retrieve();
-                self.report(ctx, outcome);
+                triggered = Some(Action::Retrieve);
             }
             if !can_retrieve {
                 response.on_hover_text("Nothing has been sent yet this session");
             }
         });
+        if let Some(action) = triggered {
+            self.perform(ctx, action);
+        }
 
         self.status_bar(ui);
 
-        // Mock-only: exercise the "window vanished" path without needing Zoom.
+        // Mock-only: exercise the "window vanished" path without needing Zoom,
+        // and the hotkey path without a real key registration.
         #[cfg(not(windows))]
         {
             ui.add_space(10.0);
@@ -195,6 +234,25 @@ impl WinSendApp {
                 let mut present = mock.zoom_present();
                 if ui.checkbox(&mut present, "mock: Zoom running").changed() {
                     mock.set_zoom_present(present);
+                }
+            }
+            // Injected rather than performed directly, so the press travels the
+            // same queue-and-wake path a real hotkey would.
+            let mut pressed = None;
+            if let Some(mock) = self.shell.as_mock() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("mock: press").size(10.0));
+                    for action in Action::ALL {
+                        if ui
+                            .small_button(egui::RichText::new(action.label()).size(10.0))
+                            .clicked()
+                        {
+                            pressed = Some(action);
+                        }
+                    }
+                });
+                if let Some(action) = pressed {
+                    mock.trigger(action);
                 }
             }
         }
@@ -393,6 +451,12 @@ impl WinSendApp {
 
 impl eframe::App for WinSendApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drained before anything is drawn, so an action triggered from
+        // outside the window is reflected in this frame rather than the next.
+        for event in self.shell.poll() {
+            self.handle(ctx, event);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| match self.screen {
             Screen::Main => self.main_screen(ui, ctx),
             Screen::Settings => self.settings_screen(ui, ctx),
