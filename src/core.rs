@@ -306,12 +306,18 @@ impl Core {
         self.displaced.push(entry);
     }
 
-    /// Handles of everything currently minimised.
-    fn minimised_now(&self) -> Vec<u64> {
+    /// Handles of everything currently out of the way.
+    ///
+    /// Minimised or cloaked, because applications leave the screen in more than
+    /// one way. A packaged application suspends rather than minimises when it
+    /// loses the display, and its window goes cloaked with the minimised flag
+    /// never being set — so looking only for minimised windows misses exactly
+    /// the full-screen players this exists to notice.
+    fn stowed_now(&self) -> Vec<u64> {
         self.platform
             .candidate_windows()
             .into_iter()
-            .filter(|window| window.minimized)
+            .filter(|window| window.minimized || window.cloaked)
             .map(|window| window.handle)
             .collect()
     }
@@ -353,6 +359,9 @@ impl Core {
         let _ = writeln!(out, "WinSend diagnostics");
         let _ = writeln!(out, "clear_target setting : {}", self.config.clear_target);
         let _ = writeln!(out, "borderless setting   : {}", self.config.borderless);
+        for note in self.platform.diagnostic_notes() {
+            let _ = writeln!(out, "{note}");
+        }
         let _ = writeln!(out);
 
         let _ = writeln!(out, "MONITORS");
@@ -650,16 +659,16 @@ impl Core {
         // clicking another window does by hand. Doing it after positioning
         // meant anything the application re-arranged on being focused happened
         // after the size had been set, and undid it.
-        let minimised_before = self.minimised_now();
+        let stowed_before = self.stowed_now();
         let _ = self.platform.activate(window.handle);
 
-        // A full-screen exclusive window minimises itself rather than being
+        // A full-screen window gives up the display by itself rather than being
         // pushed aside, and that is the only trace it leaves: it was not in the
-        // window list at all, and now it is there and minimised. Without
+        // window list at all, or not stowed, and now it is both. Without
         // noticing, Retrieve has nothing to put back and it stays in the
         // taskbar until someone clicks it.
-        for handle in self.minimised_now() {
-            if handle != window.handle && !minimised_before.contains(&handle) {
+        for handle in self.stowed_now() {
+            if handle != window.handle && !stowed_before.contains(&handle) {
                 self.record_displaced(Displaced {
                     handle,
                     was_topmost: false,
@@ -684,6 +693,12 @@ impl Core {
             )
             .map_err(|e| Failure::plain(format!("Could not move the window: {e}")))?;
 
+        // Whether the window actually ended up filling the display. An
+        // application that resizes itself afterwards, or coordinates scaled on
+        // a display the process was told the wrong DPI for, both show up here,
+        // and neither should be discovered by squinting at the screen.
+        let landed = self.platform.window_bounds(window.handle).ok();
+
         // Only after the move has succeeded. Pushing another application's
         // window aside for a Send that then failed would be interference with
         // nothing to show for it.
@@ -701,6 +716,12 @@ impl Core {
         if still_in_front > 0 {
             return Ok(format!(
                 "Sent to {label}, but {still_in_front} window(s) will not move out of the way"
+            ));
+        }
+        if let Some(landed) = landed.filter(|landed| *landed != destination) {
+            return Ok(format!(
+                "Sent to {label}, but it settled at {}x{} rather than {}x{}",
+                landed.width, landed.height, destination.width, destination.height
             ));
         }
         Ok(format!("Sent to {label}"))
@@ -1114,6 +1135,40 @@ mod tests {
             mock.was_activated(EXCLUSIVE_WINDOW),
             "it needs the foreground back, which is what clicking the taskbar does"
         );
+    }
+
+    /// A packaged media player suspends rather than minimising, so its window
+    /// goes cloaked and the minimised flag is never set. Looking only for
+    /// newly minimised windows leaves it stranded in the taskbar.
+    #[test]
+    fn a_player_that_suspends_rather_than_minimising_is_still_put_back() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "explorer.exe",
+            "ApplicationFrameWindow",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_suspends(EXCLUSIVE_WINDOW);
+
+        core.send().unwrap();
+        assert!(
+            core.platform.as_mock().unwrap().is_cloaked(EXCLUSIVE_WINDOW),
+            "it suspends rather than minimising"
+        );
+        assert!(
+            !core.platform.as_mock().unwrap().is_minimized(EXCLUSIVE_WINDOW),
+            "and the minimised flag is never set, which is the trap"
+        );
+
+        core.retrieve().unwrap();
+
+        let mock = core.platform.as_mock().unwrap();
+        assert!(!mock.is_cloaked(EXCLUSIVE_WINDOW), "it must come back");
+        assert!(mock.was_activated(EXCLUSIVE_WINDOW));
     }
 
     /// Pressing Send twice must not lose what the first press moved aside.

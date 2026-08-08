@@ -188,6 +188,12 @@ pub trait Platform {
     /// Fallback for a window that will not stay demoted.
     fn minimize(&self, handle: u64) -> Result<(), PlatformError>;
 
+    /// Facts about this platform worth putting in the diagnostics report.
+    /// Empty where there is nothing platform-specific to say.
+    fn diagnostic_notes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Give the window the foreground.
     ///
     /// The only lever that reaches a full-screen exclusive window. Those are

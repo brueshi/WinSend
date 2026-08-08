@@ -20,7 +20,9 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
@@ -383,11 +385,47 @@ fn downsample_bgra(source: &[u8], width: u32, height: u32) -> Thumbnail {
     Thumbnail { width: target_width, height: target_height, rgba }
 }
 
+/// What to ask for, given what was asked for and what arrived.
+///
+/// Position is corrected by the difference and size by the ratio, because the
+/// two go wrong in different ways: an offset is added to a position, while a
+/// scale multiplies a size. Asking for the square of the request over the
+/// result cancels a scale factor exactly in one step, where adding the
+/// difference would only close part of the gap.
+fn corrected_request(wanted: Bounds, actual: Bounds) -> Bounds {
+    let scale = |wanted: i32, actual: i32| {
+        if actual <= 0 || wanted <= 0 {
+            wanted
+        } else {
+            ((wanted as i64 * wanted as i64) / actual as i64) as i32
+        }
+    };
+    Bounds::new(
+        wanted.x + (wanted.x - actual.x),
+        wanted.y + (wanted.y - actual.y),
+        scale(wanted.width, actual.width),
+        scale(wanted.height, actual.height),
+    )
+}
+
 fn handle_to_hwnd(handle: u64) -> HWND {
     HWND(handle as *mut c_void)
 }
 
 impl Platform for Win32Platform {
+    /// DPI awareness, because a process that is not per-monitor aware is told
+    /// scaled coordinates and its windows land at the wrong size.
+    fn diagnostic_notes(&self) -> Vec<String> {
+        let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) };
+        let described = match awareness {
+            DPI_AWARENESS_UNAWARE => "unaware (coordinates will be scaled)",
+            DPI_AWARENESS_SYSTEM_AWARE => "system aware (scaled on other displays)",
+            DPI_AWARENESS_PER_MONITOR_AWARE => "per-monitor aware",
+            _ => "invalid or unknown",
+        };
+        vec![format!("process DPI awareness: {described}")]
+    }
+
     fn monitors(&self) -> Vec<MonitorInfo> {
         let mut monitors = Vec::new();
         unsafe {
@@ -581,6 +619,7 @@ impl Platform for Win32Platform {
                 HWND_NOTOPMOST
             };
 
+            let flags = SWP_NOACTIVATE | SWP_FRAMECHANGED;
             SetWindowPos(
                 hwnd,
                 Some(insert_after),
@@ -588,10 +627,8 @@ impl Platform for Win32Platform {
                 placement.bounds.y,
                 placement.bounds.width,
                 placement.bounds.height,
-                // No SWP_NOZORDER: changing the band is the point. SWP_NOACTIVATE
-                // stays, so whatever is playing underneath keeps focus and is
-                // not interrupted by the window arriving over it.
-                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                // No SWP_NOZORDER: changing the band is the point.
+                flags,
             )
             .map_err(|e| {
                 // Moving a window owned by an elevated process from a
@@ -600,6 +637,31 @@ impl Platform for Win32Platform {
                     "{e}. If Zoom is running as administrator, WinSend must be too."
                 ))
             })?;
+
+            // Ask, measure, and correct once.
+            //
+            // A window does not always end up where it was put: coordinates can
+            // be scaled on a display whose DPI differs from the one the process
+            // was told about, and an application can resize itself in response
+            // to the move. Correcting by the observed error puts it right
+            // whichever it was, and one attempt avoids fighting an application
+            // that is determined to have its own way.
+            let mut actual = RECT::default();
+            if GetWindowRect(hwnd, &mut actual).is_ok() {
+                let actual = rect_to_bounds(actual);
+                if actual != placement.bounds {
+                    let corrected = corrected_request(placement.bounds, actual);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(insert_after),
+                        corrected.x,
+                        corrected.y,
+                        corrected.width,
+                        corrected.height,
+                        flags,
+                    );
+                }
+            }
         }
 
         Ok(())

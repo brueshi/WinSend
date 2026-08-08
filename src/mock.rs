@@ -37,6 +37,8 @@ pub struct MockPlatform {
     hidden: RefCell<Vec<u64>>,
     /// Windows that were given the foreground.
     activated: RefCell<Vec<u64>>,
+    /// Windows that suspend rather than minimise when they lose the display.
+    suspends: RefCell<Vec<u64>>,
     /// Windows owning a display exclusively.
     ///
     /// Models what Windows does with a full-screen exclusive window: while it
@@ -64,6 +66,7 @@ impl MockPlatform {
             hidden: RefCell::new(Vec::new()),
             activated: RefCell::new(Vec::new()),
             exclusive: RefCell::new(Vec::new()),
+            suspends: RefCell::new(Vec::new()),
         }
     }
 
@@ -160,6 +163,21 @@ impl MockPlatform {
     #[cfg(test)]
     pub fn set_exclusive(&self, handle: u64) {
         self.exclusive.borrow_mut().push(handle);
+    }
+
+    /// Make a window suspend rather than minimise, the way a packaged
+    /// application does.
+    #[cfg(test)]
+    pub fn set_suspends(&self, handle: u64) {
+        self.suspends.borrow_mut().push(handle);
+    }
+
+    #[cfg(test)]
+    pub fn is_cloaked(&self, handle: u64) -> bool {
+        self.windows
+            .borrow()
+            .iter()
+            .any(|w| w.handle == handle && w.cloaked)
     }
 
     #[cfg(test)]
@@ -447,7 +465,9 @@ impl Platform for MockPlatform {
             .filter(|w| !self.hidden.borrow().contains(&w.handle))
             // Owning a screen exclusively keeps it out of the window list
             // entirely, until it minimises and rejoins the ordinary world.
-            .filter(|w| w.minimized || !self.exclusive.borrow().contains(&w.handle))
+            .filter(|w| {
+                w.minimized || w.cloaked || !self.exclusive.borrow().contains(&w.handle)
+            })
             .enumerate()
             .map(|(depth, window)| WindowCandidate { z_order: depth, ..window.clone() })
             .collect()
@@ -501,6 +521,9 @@ impl Platform for MockPlatform {
         if !self.windows.borrow().iter().any(|w| w.handle == handle) {
             return Err(PlatformError::WindowGone);
         }
+        if let Some(window) = self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle) {
+            window.cloaked = false;
+        }
         self.activated.borrow_mut().push(handle);
 
         // Anything owning a screen exclusively gives it up the moment
@@ -513,6 +536,16 @@ impl Platform for MockPlatform {
             .filter(|owner| *owner != handle)
             .collect();
         for owner in surrendering {
+            if self.suspends.borrow().contains(&owner) {
+                // A packaged application suspends instead, and its window goes
+                // cloaked with the minimised flag never being set.
+                if let Some(window) =
+                    self.windows.borrow_mut().iter_mut().find(|w| w.handle == owner)
+                {
+                    window.cloaked = true;
+                }
+                continue;
+            }
             let _ = self.minimize(owner);
         }
         Ok(())
