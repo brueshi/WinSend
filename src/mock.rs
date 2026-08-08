@@ -7,7 +7,7 @@
 //! "confirmed window is gone" path without needing Zoom to cooperate.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::hotkey::{Action, Hotkey, Hotkeys};
 use crate::platform::{
@@ -22,9 +22,6 @@ pub struct MockPlatform {
     /// Bounds from before a window was minimised, so restoring puts them back
     /// the way Windows does.
     pre_minimize: RefCell<HashMap<u64, Bounds>>,
-    /// Windows currently held above the rest, so the z-order behaviour of Send
-    /// and Retrieve can be asserted without a real desktop.
-    topmost: RefCell<HashSet<u64>>,
 }
 
 impl Default for MockPlatform {
@@ -39,27 +36,37 @@ impl MockPlatform {
             windows: RefCell::new(default_windows()),
             zoom_present: RefCell::new(true),
             pre_minimize: RefCell::new(HashMap::new()),
-            topmost: RefCell::new(HashSet::new()),
-        }
-    }
-
-    /// Minimise a window the way Windows does, including the off-screen bounds
-    /// it reports for iconic windows. Those bounds are the reason Send has to
-    /// un-minimise before capturing a restore point.
-    #[cfg(test)]
-    pub fn minimize(&self, handle: u64) {
-        let mut windows = self.windows.borrow_mut();
-        if let Some(window) = windows.iter_mut().find(|w| w.handle == handle) {
-            self.pre_minimize.borrow_mut().insert(handle, window.bounds);
-            window.minimized = true;
-            window.bounds = Bounds::new(-32000, -32000, 160, 28);
         }
     }
 
     /// Whether the window is being held above everything else.
     #[cfg(test)]
     pub fn is_topmost(&self, handle: u64) -> bool {
-        self.topmost.borrow().contains(&handle)
+        self.windows
+            .borrow()
+            .iter()
+            .any(|w| w.handle == handle && w.topmost)
+    }
+
+    #[cfg(test)]
+    pub fn is_minimized(&self, handle: u64) -> bool {
+        self.windows
+            .borrow()
+            .iter()
+            .any(|w| w.handle == handle && w.minimized)
+    }
+
+    /// Put a window into the always-on-top band, standing in for whatever a
+    /// media player does when it goes full screen.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn set_topmost(&self, handle: u64, topmost: bool) -> Result<(), PlatformError> {
+        let mut windows = self.windows.borrow_mut();
+        let window = windows
+            .iter_mut()
+            .find(|w| w.handle == handle)
+            .ok_or(PlatformError::WindowGone)?;
+        window.topmost = topmost;
+        Ok(())
     }
 
     pub fn zoom_present(&self) -> bool {
@@ -200,6 +207,7 @@ fn window(
         monitor_id: monitor_id.into(),
         likely_zoom,
         minimized: false,
+        topmost: false,
     }
 }
 
@@ -244,6 +252,20 @@ fn default_windows() -> Vec<WindowCandidate> {
             "OBS 30.0.2 - Profile: Live",
             Bounds::new(0, 0, 1200, 760),
             r"\\.\DISPLAY1",
+            false,
+        ),
+        // A media player filling the second display. This is the situation that
+        // makes Send look like it did nothing: full-screen players hold
+        // themselves always-on-top, so the sent window lands in the same band
+        // and behind. Tests turn that flag on, since it is a state the player
+        // enters rather than one it always has.
+        window(
+            0x3001,
+            "vlc.exe",
+            "Qt5152QWindowIcon",
+            "Broadcast roll-in - VLC media player",
+            Bounds::new(2560, 0, 1920, 1080),
+            r"\\.\DISPLAY2",
             false,
         ),
         // Long title, to keep the picker layout honest about overflow.
@@ -323,6 +345,30 @@ impl Platform for MockPlatform {
             .ok_or(PlatformError::WindowGone)
     }
 
+    /// Minimise the way Windows does, including the off-screen bounds it
+    /// reports for iconic windows. Those bounds are the reason Send has to
+    /// un-minimise before capturing a restore point.
+    fn minimize(&self, handle: u64) -> Result<(), PlatformError> {
+        let mut windows = self.windows.borrow_mut();
+        let window = windows
+            .iter_mut()
+            .find(|w| w.handle == handle)
+            .ok_or(PlatformError::WindowGone)?;
+        self.pre_minimize.borrow_mut().insert(handle, window.bounds);
+        window.minimized = true;
+        window.topmost = false;
+        window.bounds = Bounds::new(-32000, -32000, 160, 28);
+        Ok(())
+    }
+
+    fn demote(&self, handle: u64) -> Result<(), PlatformError> {
+        self.set_topmost(handle, false)
+    }
+
+    fn promote(&self, handle: u64) -> Result<(), PlatformError> {
+        self.set_topmost(handle, true)
+    }
+
     fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError> {
         if !self.zoom_present() {
             return Err(PlatformError::WindowGone);
@@ -334,11 +380,7 @@ impl Platform for MockPlatform {
             .ok_or(PlatformError::WindowGone)?;
         window.bounds = placement.bounds;
 
-        if placement.topmost {
-            self.topmost.borrow_mut().insert(handle);
-        } else {
-            self.topmost.borrow_mut().remove(&handle);
-        }
+        window.topmost = placement.topmost;
         Ok(())
     }
 

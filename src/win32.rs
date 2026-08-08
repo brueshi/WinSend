@@ -24,10 +24,10 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST,
-    MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_RESTORE, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
-    WS_THICKFRAME,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, HWND_NOTOPMOST,
+    HWND_TOPMOST, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use crate::platform::{
@@ -238,6 +238,7 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         bounds: rect_to_bounds(rect),
         monitor_id: monitor_id(hwnd),
         minimized: IsIconic(hwnd).as_bool(),
+        topmost: is_topmost(hwnd),
     });
 
     BOOL(1)
@@ -412,6 +413,55 @@ impl Platform for Win32Platform {
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
+        }
+        Ok(())
+    }
+
+    /// Clear always-on-top and drop to the back, without telling the
+    /// application anything. A video playing behind the sent window keeps
+    /// playing, which a minimise could not promise.
+    fn demote(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+            // Two calls rather than one: leaving the topmost band and moving
+            // within the ordinary band are separate placements, and asking for
+            // both at once leaves the window at the top of the wrong one.
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, flags);
+        }
+        Ok(())
+    }
+
+    fn promote(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        Ok(())
+    }
+
+    fn minimize(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
         }
         Ok(())
     }

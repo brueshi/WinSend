@@ -95,6 +95,7 @@ mod tests {
             monitor_id: r"\\.\DISPLAY1".to_string(),
             likely_zoom: true,
             minimized: false,
+            topmost: false,
         }
     }
 

@@ -64,6 +64,32 @@ pub struct WindowCandidate {
     /// found and un-minimised, but they are kept out of the picker: their
     /// bounds are meaningless and they cannot be identified visually.
     pub minimized: bool,
+    /// Whether the window holds itself above ordinary windows.
+    ///
+    /// This is what decides whether a window covering the target monitor has to
+    /// be moved out of the way. Anything not in this band already loses to the
+    /// sent window and can be left alone.
+    pub topmost: bool,
+}
+
+impl Bounds {
+    /// How much of `monitor` this rectangle covers, from 0 to 1.
+    ///
+    /// Used to tell a full-screen video from a window that merely happens to
+    /// sit on the same display.
+    pub fn coverage_of(&self, monitor: Bounds) -> f32 {
+        let overlap_width = (self.x + self.width).min(monitor.x + monitor.width) - self.x.max(monitor.x);
+        let overlap_height =
+            (self.y + self.height).min(monitor.y + monitor.height) - self.y.max(monitor.y);
+        if overlap_width <= 0 || overlap_height <= 0 {
+            return 0.0;
+        }
+        let monitor_area = (monitor.width as f32) * (monitor.height as f32);
+        if monitor_area <= 0.0 {
+            return 0.0;
+        }
+        (overlap_width as f32 * overlap_height as f32) / monitor_area
+    }
 }
 
 /// How a window should be placed.
@@ -132,6 +158,22 @@ pub trait Platform {
 
     /// Move and resize a window according to `placement`.
     fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError>;
+
+    /// Drop a window out of the always-on-top band and to the back.
+    ///
+    /// Deliberately not a minimise: the window keeps rendering and the
+    /// application never learns it was covered, so a video playing behind the
+    /// sent window carries on and is genuinely still there afterwards.
+    fn demote(&self, handle: u64) -> Result<(), PlatformError>;
+
+    /// Put a window back into the always-on-top band.
+    ///
+    /// Only ever called on windows that were there to begin with, which is why
+    /// it needs no record of what to restore.
+    fn promote(&self, handle: u64) -> Result<(), PlatformError>;
+
+    /// Last resort for a window that will not stay demoted.
+    fn minimize(&self, handle: u64) -> Result<(), PlatformError>;
 
     /// Escape hatch for the mock-only debug controls. Absent from Windows
     /// builds entirely, so it cannot leak into the shipped binary.
