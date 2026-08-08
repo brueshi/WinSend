@@ -69,6 +69,9 @@ pub struct WindowCandidate {
     /// Recorded so a window pushed aside can be put back in the band it came
     /// from, rather than assumed into the wrong one.
     pub topmost: bool,
+    /// True when the window belongs to WinSend itself. Never something to
+    /// move, hide or offer in the picker.
+    pub own_process: bool,
     /// Position in the front-to-back stacking order: 0 is frontmost.
     ///
     /// This is measured, not inferred. Whether one window is in front of

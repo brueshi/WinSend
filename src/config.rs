@@ -119,6 +119,11 @@ impl Config {
     }
 }
 
+/// Beside the config, so one folder holds everything worth looking at.
+pub fn diagnostics_path() -> Option<PathBuf> {
+    Some(config_path()?.with_file_name("diagnostics.txt"))
+}
+
 pub fn config_path() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         PathBuf::from(std::env::var("APPDATA").ok()?)

@@ -45,6 +45,39 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// Window classes belonging to the shell rather than to any application.
+///
+/// These span whole displays without being anything a person would call a
+/// window, and they became visible to this code the moment untitled windows
+/// started being enumerated. Minimising one is pointless; hiding one takes the
+/// desktop apart and makes Windows reshuffle everything else, which is not a
+/// thing to do while a broadcast is running.
+const SHELL_CLASSES: &[&str] = &[
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "SysShadow",
+    "Windows.UI.Core.CoreWindow",
+    "ForegroundStaging",
+    "MultitaskingViewFrame",
+    "XamlExplorerHostIslandWindow",
+    "Static",
+    "Button",
+];
+
+/// Whether a window is something an application owns and a person could
+/// reasonably expect to be moved out of the way.
+fn is_movable(window: &WindowCandidate) -> bool {
+    !window.own_process
+        && !window.minimized
+        && window.bounds.width > 0
+        && window.bounds.height > 0
+        && !SHELL_CLASSES
+            .iter()
+            .any(|shell| window.class_name.eq_ignore_ascii_case(shell))
+}
+
 /// How much of the target monitor a window must cover before it counts as
 /// being in the way. A full-screen video clears this comfortably; a window that
 /// merely happens to sit on the same display does not.
@@ -109,7 +142,7 @@ impl Core {
             .into_iter()
             .filter(|window| {
                 window.handle != sent
-                    && !window.minimized
+                    && is_movable(window)
                     && window.bounds.coverage_of(monitor) >= COVERING
             })
             .collect();
@@ -146,7 +179,7 @@ impl Core {
             .iter()
             .filter(|window| {
                 window.handle != sent
-                    && !window.minimized
+                    && is_movable(window)
                     && window.z_order < depth
                     && window.bounds.coverage_of(monitor) >= COVERING
             })
@@ -259,6 +292,112 @@ impl Core {
         }
     }
 
+    /// Everything this code can see, in the terms it reasons about.
+    ///
+    /// Exists because five attempts at getting the sent window in front of
+    /// full-screen media were each built on a guess about what was there. A
+    /// separate diagnostic tool answers a slightly different question; this one
+    /// reports the same list, the same filters and the same verdicts that Send
+    /// actually acts on, so a disagreement can be settled instead of theorised
+    /// about.
+    pub fn diagnostics(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        let monitors = self.platform.monitors();
+        let target = self.config.resolve_monitor(&monitors).map(|m| m.bounds);
+
+        let _ = writeln!(out, "WinSend diagnostics");
+        let _ = writeln!(out, "clear_target setting : {}", self.config.clear_target);
+        let _ = writeln!(out, "borderless setting   : {}", self.config.borderless);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "MONITORS");
+        for monitor in &monitors {
+            let chosen = if Some(monitor.bounds) == target { " <- TARGET" } else { "" };
+            let _ = writeln!(out, "  {} {}{}", monitor.id, monitor.label(), chosen);
+        }
+        if target.is_none() {
+            let _ = writeln!(out, "  (no target monitor resolved)");
+        }
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "CONFIRMED ZOOM WINDOW");
+        match &self.config.zoom_window {
+            Some(identity) => {
+                let _ = writeln!(
+                    out,
+                    "  {} / {} / {:?}",
+                    identity.process_name, identity.class_name, identity.title
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  none");
+            }
+        }
+        let located = self.locate();
+        let _ = match &located {
+            Ok(window) => writeln!(out, "  located now: handle 0x{:X}", window.handle),
+            Err(failure) => writeln!(out, "  located now: NO ({})", failure.message),
+        };
+        let _ = writeln!(out);
+
+        // The verdicts, computed exactly as Send computes them.
+        let sent = located.as_ref().map(|w| w.handle).unwrap_or(0);
+        let covering: Vec<u64> = target
+            .map(|bounds| self.covering(bounds, sent).into_iter().map(|(h, _)| h).collect())
+            .unwrap_or_default();
+        let blocking: Vec<u64> = target
+            .map(|bounds| self.blocking(bounds, sent).into_iter().map(|(h, _)| h).collect())
+            .unwrap_or_default();
+
+        let _ = writeln!(
+            out,
+            "VERDICT: {} window(s) cover the target, {} of them in front of the sent window",
+            covering.len(),
+            blocking.len()
+        );
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "WINDOWS, FRONT TO BACK");
+        let _ = writeln!(
+            out,
+            "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>6}  {:<18} {:<26} {:<24} {}",
+            "Z", "TOP", "MIN", "OWN", "MOVE", "COVER", "PROCESS", "CLASS", "BOUNDS", "TITLE"
+        );
+        for window in self.platform.candidate_windows() {
+            let coverage = target.map(|b| window.bounds.coverage_of(b)).unwrap_or(0.0);
+            let mark = if blocking.contains(&window.handle) {
+                "BLOCKING"
+            } else if covering.contains(&window.handle) {
+                "covering"
+            } else if window.handle == sent {
+                "<- SENT"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>5.0}%  {:<18} {:<26} {:<24} {:?} {}",
+                window.z_order,
+                if window.topmost { "yes" } else { "-" },
+                if window.minimized { "yes" } else { "-" },
+                if window.own_process { "yes" } else { "-" },
+                if is_movable(&window) { "yes" } else { "-" },
+                coverage * 100.0,
+                window.process_name,
+                window.class_name,
+                format!(
+                    "{},{} {}x{}",
+                    window.bounds.x, window.bounds.y, window.bounds.width, window.bounds.height
+                ),
+                window.title,
+                mark,
+            );
+        }
+        out
+    }
+
     pub fn can_retrieve(&self) -> bool {
         self.saved_bounds.is_some()
     }
@@ -277,7 +416,7 @@ impl Core {
         self.platform
             .candidate_windows()
             .into_iter()
-            .filter(|window| !window.title.is_empty())
+            .filter(|window| !window.title.is_empty() && !window.own_process)
             .collect()
     }
 
@@ -321,6 +460,19 @@ impl Core {
     pub fn set_borderless(&mut self, borderless: bool) -> Result<(), String> {
         self.config.borderless = borderless;
         self.config.save()
+    }
+
+    /// Write the report next to the config and say where it went.
+    pub fn save_diagnostics(&self) -> Result<String, Failure> {
+        let path = crate::config::diagnostics_path()
+            .ok_or_else(|| Failure::plain("Could not work out where to write the report."))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Failure::plain(format!("Could not create the folder: {e}")))?;
+        }
+        std::fs::write(&path, self.diagnostics())
+            .map_err(|e| Failure::plain(format!("Could not write the report: {e}")))?;
+        Ok(format!("Diagnostics written to {}", path.display()))
     }
 
     pub fn set_clear_target(&mut self, clear_target: bool) -> Result<(), String> {
@@ -503,6 +655,8 @@ mod tests {
     const VIDEO_WINDOW: u64 = 0x1002;
     /// The full-screen media player on the target display.
     const MEDIA_WINDOW: u64 = 0x3001;
+    const SHELL_WINDOW: u64 = 0x4001;
+    const OWN_WINDOW: u64 = 0x4002;
 
     fn window(core: &Core, handle: u64) -> WindowCandidate {
         core.candidates()
@@ -669,6 +823,54 @@ mod tests {
         core.retrieve().unwrap();
 
         assert!(!core.platform.as_mock().unwrap().is_topmost(MEDIA_WINDOW));
+    }
+
+    /// Hiding the desktop host takes the desktop apart and makes Windows
+    /// reshuffle every other window, which is not something to discover during
+    /// a broadcast. These became reachable the moment untitled windows started
+    /// being enumerated.
+    #[test]
+    fn shell_windows_are_never_moved_however_much_they_cover() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.clear_target = true;
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(SHELL_WINDOW, "explorer.exe", "WorkerW", "", Bounds::new(2560, 0, 1920, 1080));
+        mock.bring_to_front(SHELL_WINDOW);
+
+        core.send().unwrap();
+
+        let mock = core.platform.as_mock().unwrap();
+        assert!(!mock.is_minimized(SHELL_WINDOW), "the desktop host must be left alone");
+        assert!(!mock.is_hidden(SHELL_WINDOW));
+    }
+
+    #[test]
+    fn our_own_window_is_never_moved() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.clear_target = true;
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(OWN_WINDOW, "winsend.exe", "Winit", "WinSend", Bounds::new(2560, 0, 1920, 1080));
+        mock.set_own_process(OWN_WINDOW);
+        mock.bring_to_front(OWN_WINDOW);
+
+        core.send().unwrap();
+
+        assert!(!core.platform.as_mock().unwrap().is_minimized(OWN_WINDOW));
+    }
+
+    /// The report is what settles a disagreement about what is on screen, so
+    /// it has to name the things the disagreement is about.
+    #[test]
+    fn the_diagnostics_report_names_what_it_acts_on() {
+        let core = core_with_confirmed_video_window();
+        core.platform.as_mock().unwrap().bring_to_front(MEDIA_WINDOW);
+
+        let report = core.diagnostics();
+
+        assert!(report.contains("TARGET"), "the chosen monitor must be marked");
+        assert!(report.contains("VERDICT"), "the counts it acted on must be stated");
+        assert!(report.contains("vlc.exe"), "every window must be listed");
+        assert!(report.contains("WINDOWS, FRONT TO BACK"));
     }
 
     /// The regression that made four attempts at the z-order problem all fail

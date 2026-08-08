@@ -93,6 +93,35 @@ impl MockPlatform {
         self.unminimisable.borrow_mut().push(handle);
     }
 
+    /// Add a window to the fake desktop, for cases the default set does not
+    /// model.
+    #[cfg(test)]
+    pub fn add_window(
+        &self,
+        handle: u64,
+        process_name: &str,
+        class_name: &str,
+        title: &str,
+        bounds: Bounds,
+    ) {
+        self.windows.borrow_mut().push(window(
+            handle,
+            process_name,
+            class_name,
+            title,
+            bounds,
+            r"\\.\DISPLAY2",
+            false,
+        ));
+    }
+
+    #[cfg(test)]
+    pub fn set_own_process(&self, handle: u64) {
+        if let Some(window) = self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle) {
+            window.own_process = true;
+        }
+    }
+
     #[cfg(test)]
     pub fn title_of(&self, handle: u64) -> String {
         self.windows
@@ -286,6 +315,7 @@ fn window(
         likely_zoom,
         minimized: false,
         topmost: false,
+        own_process: false,
         // Overwritten from the vector's order on every enumeration.
         z_order: 0,
     }

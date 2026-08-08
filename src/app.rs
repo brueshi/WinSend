@@ -546,6 +546,21 @@ impl WinSendApp {
         ui.add_space(6.0);
         self.hotkey_settings(ui, ctx);
 
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        if ui
+            .button(egui::RichText::new("Write diagnostics report").size(11.0))
+            .on_hover_text(
+                "Saves what WinSend can currently see — every window, which monitor it covers, \
+                 and which ones it considers to be in the way — next to the config file.",
+            )
+            .clicked()
+        {
+            let outcome = self.core.save_diagnostics();
+            self.report(ctx, outcome);
+        }
+
         self.status_bar(ui);
     }
 
