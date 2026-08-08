@@ -21,6 +21,20 @@ const PICKER_SIZE: egui::Vec2 = egui::vec2(460.0, 640.0);
 /// afford the room.
 const SETTINGS_SIZE: egui::Vec2 = egui::vec2(360.0, 470.0);
 
+/// Closing hides to the tray only where there is a tray to hide to. On macOS
+/// the notification area does not exist and the mock has no icon to click, so
+/// a hidden window would be unreachable; there, closing still quits.
+const CLOSE_HIDES_TO_TRAY: bool = cfg!(windows);
+
+/// How often to wake while hidden.
+///
+/// The waker already asks for a repaint on every shell event, but a window that
+/// is not visible is not guaranteed to be told to redraw, and a hotkey that
+/// only works while the window is on screen would defeat the point of both
+/// features. This is the floor under that: a trivial frame ten times a second,
+/// only while hidden, in exchange for the guarantee.
+const HIDDEN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(78, 142, 240);
 const OK: egui::Color32 = egui::Color32::from_rgb(102, 187, 122);
 const ERR: egui::Color32 = egui::Color32::from_rgb(226, 106, 106);
@@ -64,6 +78,10 @@ pub struct WinSendApp {
     /// Which bindings the shell refused, so the offending row can say so
     /// rather than the reason living only in the status bar.
     hotkey_report: HotkeyReport,
+    /// Hidden to the tray. The process is still running and still listening.
+    hidden: bool,
+    /// Set only by Quit, and the only thing that lets a close request through.
+    quitting: bool,
 }
 
 impl WinSendApp {
@@ -88,6 +106,8 @@ impl WinSendApp {
             thumbnails: HashMap::new(),
             capturing: None,
             hotkey_report: HotkeyReport::default(),
+            hidden: false,
+            quitting: false,
         };
 
         // Debug builds only: open straight onto a screen so it can be inspected
@@ -140,16 +160,43 @@ impl WinSendApp {
                 }
                 self.hotkey_report = report;
             }
-            // Focus rather than raise-and-restore for now; hiding to the tray,
-            // and so the notion of a window that is not currently shown, lands
-            // with the close-to-tray behaviour.
-            ShellEvent::ShowWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+            // A left click on the icon toggles, which is what makes the icon a
+            // way to get the window back rather than only a way to lose it.
+            ShellEvent::ShowWindow => self.set_hidden(ctx, !self.hidden),
             ShellEvent::ShowSettings => {
                 self.go_to(ctx, Screen::Settings);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.set_hidden(ctx, false);
             }
-            ShellEvent::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            // The only path that actually exits. Everything else, including
+            // the window's own close button, hides instead.
+            ShellEvent::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
+    }
+
+    fn set_hidden(&mut self, ctx: &egui::Context, hidden: bool) {
+        self.hidden = hidden;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!hidden));
+        if !hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
+    /// Turn the window's close button into hide-to-tray.
+    ///
+    /// The request has to be cancelled rather than ignored: eframe treats an
+    /// unanswered close as a close, and the process would go with it.
+    fn intercept_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.quitting || !CLOSE_HIDES_TO_TRAY {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.set_hidden(ctx, true);
     }
 
     /// Keep the tray icon in step with the window. Cheap to call every frame:
@@ -683,6 +730,14 @@ impl eframe::App for WinSendApp {
         // every press for itself.
         self.capture_step(ctx);
         self.refresh_tray();
+        self.intercept_close(ctx);
+
+        // Nothing below is worth drawing for a window nobody can see, but the
+        // frame still has to happen so the next shell event is picked up.
+        if self.hidden {
+            ctx.request_repaint_after(HIDDEN_POLL);
+            return;
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| match self.screen {
             Screen::Main => self.main_screen(ui, ctx),
