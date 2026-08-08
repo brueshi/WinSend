@@ -55,7 +55,10 @@ const COVERING: f32 = 0.7;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Displaced {
     handle: u64,
-    /// Dropped out of the always-on-top band.
+    /// Which band it came from, so it goes back into that one and not the
+    /// always-on-top band it never belonged to.
+    was_topmost: bool,
+    /// Dropped to the back of the stacking order.
     demoted: bool,
     /// Minimised, because demoting alone did not move it.
     minimized: bool,
@@ -93,22 +96,41 @@ impl Core {
         }
     }
 
-    /// Windows that would sit in front of the sent window on `monitor`.
+    /// Windows actually in front of the sent window and covering `monitor`.
     ///
-    /// Only always-on-top windows qualify. Anything else already loses to the
-    /// sent window, which is raised into that same band, so moving it would be
-    /// interfering with the desktop for no benefit.
-    fn blocking(&self, monitor: Bounds, sent: u64) -> Vec<u64> {
-        self.platform
-            .candidate_windows()
-            .into_iter()
+    /// Measured from the stacking order rather than inferred from window
+    /// styles. Two earlier attempts guessed at the mechanism — first that
+    /// raising the sent window would be enough, then that anything in the way
+    /// would be marked always-on-top — and both were wrong about how a
+    /// full-screen player actually behaves. Asking which window is in front is
+    /// the question itself, and it does not depend on the answer.
+    ///
+    /// Returns them front-first, so the one most in the way is dealt with
+    /// first and the order can be reversed to put them back.
+    fn blocking(&self, monitor: Bounds, sent: u64) -> Vec<(u64, bool)> {
+        let windows = self.platform.candidate_windows();
+
+        let Some(depth) = windows
+            .iter()
+            .find(|window| window.handle == sent)
+            .map(|window| window.z_order)
+        else {
+            return Vec::new();
+        };
+
+        let mut blocking: Vec<&WindowCandidate> = windows
+            .iter()
             .filter(|window| {
                 window.handle != sent
-                    && window.topmost
                     && !window.minimized
+                    && window.z_order < depth
                     && window.bounds.coverage_of(monitor) >= COVERING
             })
-            .map(|window| window.handle)
+            .collect();
+        blocking.sort_by_key(|window| window.z_order);
+        blocking
+            .into_iter()
+            .map(|window| (window.handle, window.topmost))
             .collect()
     }
 
@@ -118,26 +140,41 @@ impl Core {
     /// and unaware. A full-screen media player that re-asserts always-on-top
     /// the moment it is demoted will still be in the way on the second look,
     /// and only minimising will shift it.
-    fn clear_the_way(&mut self, monitor: Bounds, sent: u64) {
+    /// Returns how many windows are still in front once it has finished, which
+    /// is zero unless something is refusing to move.
+    fn clear_the_way(&mut self, monitor: Bounds, sent: u64) -> usize {
         let mut displaced: Vec<Displaced> = Vec::new();
 
-        for handle in self.blocking(monitor, sent) {
+        for (handle, was_topmost) in self.blocking(monitor, sent) {
             if self.platform.demote(handle).is_ok() {
-                displaced.push(Displaced { handle, demoted: true, minimized: false });
+                displaced.push(Displaced {
+                    handle,
+                    was_topmost,
+                    demoted: true,
+                    minimized: false,
+                });
             }
         }
 
-        for handle in self.blocking(monitor, sent) {
+        // Anything still in front after being pushed to the back is holding
+        // itself there, and only minimising will move it.
+        for (handle, was_topmost) in self.blocking(monitor, sent) {
             if self.platform.minimize(handle).is_err() {
                 continue;
             }
             match displaced.iter_mut().find(|d| d.handle == handle) {
                 Some(already) => already.minimized = true,
-                None => displaced.push(Displaced { handle, demoted: false, minimized: true }),
+                None => displaced.push(Displaced {
+                    handle,
+                    was_topmost,
+                    demoted: false,
+                    minimized: true,
+                }),
             }
         }
 
         self.displaced = displaced;
+        self.blocking(monitor, sent).len()
     }
 
     /// Put back everything moved aside, in reverse order so the window that was
@@ -148,7 +185,7 @@ impl Core {
                 let _ = self.platform.unminimize(window.handle);
             }
             if window.demoted {
-                let _ = self.platform.promote(window.handle);
+                let _ = self.platform.raise(window.handle, window.was_topmost);
             }
         }
     }
@@ -314,7 +351,7 @@ impl Core {
         // Only after the move has succeeded. Pushing another application's
         // window aside for a Send that then failed would be interference with
         // nothing to show for it.
-        self.clear_the_way(destination, window.handle);
+        let still_in_front = self.clear_the_way(destination, window.handle);
 
         // Commit the restore point only once the move has actually succeeded,
         // so a failed Send does not leave Retrieve pointing somewhere wrong.
@@ -322,6 +359,14 @@ impl Core {
             self.saved_bounds = Some(bounds);
         }
 
+        // Said plainly rather than silently tolerated. A Send that appears to
+        // do nothing, with no explanation, is what took three attempts to get
+        // to the bottom of.
+        if still_in_front > 0 {
+            return Ok(format!(
+                "Sent to {label}, but {still_in_front} window(s) will not move out of the way"
+            ));
+        }
         Ok(format!("Sent to {label}"))
     }
 
@@ -470,50 +515,87 @@ mod tests {
         assert!(!core.platform.as_mock().unwrap().is_topmost(VIDEO_WINDOW));
     }
 
-    /// The regression this whole mechanism exists for: a full-screen media
-    /// player holds itself always-on-top, so raising the sent window into the
-    /// same band is not enough to get in front of it.
+    /// The regression this whole mechanism exists for: something already
+    /// filling the target display and sitting in front of what gets sent
+    /// there, which looks exactly like Send doing nothing.
     #[test]
-    fn a_fullscreen_player_on_the_target_is_pushed_out_of_the_way() {
+    fn whatever_is_in_front_on_the_target_is_pushed_behind() {
         let mut core = core_with_confirmed_video_window();
         let mock = core.platform.as_mock().unwrap();
         mock.set_topmost(MEDIA_WINDOW, true).unwrap();
+        mock.bring_to_front(MEDIA_WINDOW);
 
-        core.send().unwrap();
+        let message = core.send().unwrap();
 
+        assert!(
+            !message.contains("will not move"),
+            "nothing should be left in front: {message}"
+        );
         let mock = core.platform.as_mock().unwrap();
         assert!(!mock.is_topmost(MEDIA_WINDOW), "it must lose always-on-top");
         assert!(
             !mock.is_minimized(MEDIA_WINDOW),
-            "demoting is enough here, so it must not be minimised as well"
+            "pushing it behind was enough, so it must not be minimised as well"
         );
     }
 
+    /// Demoting leaves the player running, which minimising cannot promise, so
+    /// minimising is only for a window that will not stay put.
     #[test]
-    fn retrieve_puts_the_player_back_on_top() {
+    fn a_window_that_refuses_to_move_is_minimised_instead() {
         let mut core = core_with_confirmed_video_window();
-        core.platform.as_mock().unwrap().set_topmost(MEDIA_WINDOW, true).unwrap();
+        let mock = core.platform.as_mock().unwrap();
+        mock.bring_to_front(MEDIA_WINDOW);
+        mock.set_sticky(MEDIA_WINDOW);
+
+        let message = core.send().unwrap();
+
+        assert!(!message.contains("will not move"), "got: {message}");
+        assert!(core.platform.as_mock().unwrap().is_minimized(MEDIA_WINDOW));
+    }
+
+    #[test]
+    fn retrieve_puts_the_player_back_in_front() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.set_topmost(MEDIA_WINDOW, true).unwrap();
+        mock.bring_to_front(MEDIA_WINDOW);
 
         core.send().unwrap();
         core.retrieve().unwrap();
 
-        assert!(core.platform.as_mock().unwrap().is_topmost(MEDIA_WINDOW));
+        assert!(
+            core.platform.as_mock().unwrap().is_topmost(MEDIA_WINDOW),
+            "it was always-on-top before, so it must be again"
+        );
     }
 
-    /// An ordinary window already loses to the sent window, so touching it
-    /// would be interfering with the desktop for nothing.
+    /// The band it came from, not the band that happens to be convenient.
+    /// Restoring an ordinary window as always-on-top would pin it over
+    /// everything the user owns.
     #[test]
-    fn a_window_that_is_not_always_on_top_is_left_alone() {
+    fn an_ordinary_window_is_not_restored_as_always_on_top() {
+        let mut core = core_with_confirmed_video_window();
+        core.platform.as_mock().unwrap().bring_to_front(MEDIA_WINDOW);
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        assert!(!core.platform.as_mock().unwrap().is_topmost(MEDIA_WINDOW));
+    }
+
+    /// Already behind the sent window, so moving it would be interfering with
+    /// the desktop for nothing.
+    #[test]
+    fn a_window_already_behind_is_left_alone() {
         let mut core = core_with_confirmed_video_window();
 
         core.send().unwrap();
 
         let mock = core.platform.as_mock().unwrap();
         assert!(!mock.is_minimized(MEDIA_WINDOW));
-        assert!(!mock.is_topmost(MEDIA_WINDOW));
     }
 
-    /// Windows on other displays are none of our business, however big.
     /// Windows on other displays are none of our business, however big.
     #[test]
     fn a_fullscreen_player_on_a_different_monitor_is_left_alone() {
@@ -528,6 +610,7 @@ mod tests {
                 },
             )
             .unwrap();
+        core.platform.as_mock().unwrap().bring_to_front(MEDIA_WINDOW);
 
         core.send().unwrap();
 

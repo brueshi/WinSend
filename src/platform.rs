@@ -66,10 +66,15 @@ pub struct WindowCandidate {
     pub minimized: bool,
     /// Whether the window holds itself above ordinary windows.
     ///
-    /// This is what decides whether a window covering the target monitor has to
-    /// be moved out of the way. Anything not in this band already loses to the
-    /// sent window and can be left alone.
+    /// Recorded so a window pushed aside can be put back in the band it came
+    /// from, rather than assumed into the wrong one.
     pub topmost: bool,
+    /// Position in the front-to-back stacking order: 0 is frontmost.
+    ///
+    /// This is measured, not inferred. Whether one window is in front of
+    /// another is exactly what this answers, and it needs no theory about how
+    /// any particular application implements full screen.
+    pub z_order: usize,
 }
 
 impl Bounds {
@@ -166,11 +171,12 @@ pub trait Platform {
     /// sent window carries on and is genuinely still there afterwards.
     fn demote(&self, handle: u64) -> Result<(), PlatformError>;
 
-    /// Put a window back into the always-on-top band.
+    /// Bring a window back to the front of the band it belongs in.
     ///
-    /// Only ever called on windows that were there to begin with, which is why
-    /// it needs no record of what to restore.
-    fn promote(&self, handle: u64) -> Result<(), PlatformError>;
+    /// `topmost` is what the window was before it was pushed aside, not a
+    /// choice: restoring an ordinary window into the always-on-top band would
+    /// leave it pinned over everything the user owns.
+    fn raise(&self, handle: u64, topmost: bool) -> Result<(), PlatformError>;
 
     /// Last resort for a window that will not stay demoted.
     fn minimize(&self, handle: u64) -> Result<(), PlatformError>;

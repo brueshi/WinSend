@@ -24,7 +24,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE,
-    GWL_STYLE, GW_OWNER, MONITORINFOF_PRIMARY,
+    GWL_STYLE, GW_OWNER, MONITORINFOF_PRIMARY, WS_EX_TOPMOST,
 };
 
 /// Style bits worth naming in the dump. Chrome-related ones matter most: they
@@ -313,6 +313,35 @@ fn main() {
         for (index, window) in visible.iter().enumerate() {
             window.print(index);
         }
+
+        // The compact view. EnumWindows walks the stacking order from the
+        // front, so this row order is literally what is in front of what —
+        // which is the one question three attempts at the z-order problem kept
+        // having to guess at.
+        println!("=== STACKING ORDER, FRONT TO BACK ===\n");
+        println!(
+            "{:>3}  {:<7}  {:<7}  {:<14}  {:<24}  {:<16}  {}",
+            "#", "TOPMOST", "STATE", "MONITOR", "BOUNDS", "PROCESS", "TITLE"
+        );
+        for (index, window) in visible.iter().enumerate() {
+            let RECT { left, top, right, bottom } = window.rect;
+            let state = if window.minimized {
+                "min"
+            } else if window.maximized {
+                "max"
+            } else {
+                "-"
+            };
+            println!(
+                "{index:>3}  {:<7}  {state:<7}  {:<14}  {:<24}  {:<16}  {}",
+                if window.exstyle & WS_EX_TOPMOST.0 != 0 { "yes" } else { "no" },
+                window.monitor,
+                format!("{},{} {}x{}", left, top, right - left, bottom - top),
+                window.process_name(),
+                window.title,
+            );
+        }
+        println!();
 
         println!("=== TOTAL TOP-LEVEL WINDOWS ENUMERATED: {} ===", all.len());
     }

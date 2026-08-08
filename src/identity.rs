@@ -96,6 +96,7 @@ mod tests {
             likely_zoom: true,
             minimized: false,
             topmost: false,
+            z_order: 0,
         }
     }
 

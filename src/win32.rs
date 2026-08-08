@@ -24,7 +24,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, HWND_NOTOPMOST,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP,
     HWND_TOPMOST, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
     WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
@@ -239,6 +239,9 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         monitor_id: monitor_id(hwnd),
         minimized: IsIconic(hwnd).as_bool(),
         topmost: is_topmost(hwnd),
+        // EnumWindows walks the stacking order from the front, so the position
+        // a window arrives in is its depth.
+        z_order: out.len(),
     });
 
     BOOL(1)
@@ -436,7 +439,7 @@ impl Platform for Win32Platform {
         Ok(())
     }
 
-    fn promote(&self, handle: u64) -> Result<(), PlatformError> {
+    fn raise(&self, handle: u64, topmost: bool) -> Result<(), PlatformError> {
         let hwnd = handle_to_hwnd(handle);
         unsafe {
             if !IsWindow(Some(hwnd)).as_bool() {
@@ -444,7 +447,7 @@ impl Platform for Win32Platform {
             }
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                Some(if topmost { HWND_TOPMOST } else { HWND_TOP }),
                 0,
                 0,
                 0,

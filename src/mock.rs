@@ -15,6 +15,12 @@ use crate::platform::{
 };
 use crate::shell::{HotkeyReport, Shell, ShellEvent, TrayState, Waker};
 
+/// Which end of the stacking order to move a window to.
+enum Depth {
+    Front,
+    Back,
+}
+
 pub struct MockPlatform {
     windows: RefCell<Vec<WindowCandidate>>,
     /// Flips the Zoom windows out of existence to test the reconfirm prompt.
@@ -22,6 +28,8 @@ pub struct MockPlatform {
     /// Bounds from before a window was minimised, so restoring puts them back
     /// the way Windows does.
     pre_minimize: RefCell<HashMap<u64, Bounds>>,
+    /// Windows that ignore being demoted.
+    sticky: RefCell<Vec<u64>>,
 }
 
 impl Default for MockPlatform {
@@ -36,6 +44,7 @@ impl MockPlatform {
             windows: RefCell::new(default_windows()),
             zoom_present: RefCell::new(true),
             pre_minimize: RefCell::new(HashMap::new()),
+            sticky: RefCell::new(Vec::new()),
         }
     }
 
@@ -54,6 +63,35 @@ impl MockPlatform {
             .borrow()
             .iter()
             .any(|w| w.handle == handle && w.minimized)
+    }
+
+    /// Put a window at the front of the stacking order, standing in for
+    /// whatever already owns the display.
+    #[cfg(test)]
+    pub fn bring_to_front(&self, handle: u64) {
+        let _ = self.restack(handle, Depth::Front);
+    }
+
+    /// Make a window refuse to be pushed back, the way a player that re-asserts
+    /// itself does, so the minimise fallback can be exercised.
+    #[cfg(test)]
+    pub fn set_sticky(&self, handle: u64) {
+        self.sticky.borrow_mut().push(handle);
+    }
+
+    /// Move a window to one end of the stacking order.
+    fn restack(&self, handle: u64, depth: Depth) -> Result<(), PlatformError> {
+        let mut windows = self.windows.borrow_mut();
+        let at = windows
+            .iter()
+            .position(|w| w.handle == handle)
+            .ok_or(PlatformError::WindowGone)?;
+        let window = windows.remove(at);
+        match depth {
+            Depth::Front => windows.insert(0, window),
+            Depth::Back => windows.push(window),
+        }
+        Ok(())
     }
 
     /// Put a window into the always-on-top band, standing in for whatever a
@@ -208,6 +246,8 @@ fn window(
         likely_zoom,
         minimized: false,
         topmost: false,
+        // Overwritten from the vector's order on every enumeration.
+        z_order: 0,
     }
 }
 
@@ -299,13 +339,18 @@ impl Platform for MockPlatform {
         ]
     }
 
+    /// The vector's order is the stacking order, front first, mirroring what
+    /// EnumWindows gives on Windows. Demoting and raising move a window within
+    /// it, so the z-order logic above is exercised against something that
+    /// actually behaves like a desktop.
     fn candidate_windows(&self) -> Vec<WindowCandidate> {
         let present = self.zoom_present();
         self.windows
             .borrow()
             .iter()
             .filter(|w| present || w.process_name != "Zoom.exe")
-            .cloned()
+            .enumerate()
+            .map(|(depth, window)| WindowCandidate { z_order: depth, ..window.clone() })
             .collect()
     }
 
@@ -358,15 +403,23 @@ impl Platform for MockPlatform {
         window.minimized = true;
         window.topmost = false;
         window.bounds = Bounds::new(-32000, -32000, 160, 28);
-        Ok(())
+        drop(windows);
+        self.restack(handle, Depth::Back)
     }
 
     fn demote(&self, handle: u64) -> Result<(), PlatformError> {
-        self.set_topmost(handle, false)
+        if self.sticky.borrow().contains(&handle) {
+            // Reports success and stays exactly where it was, which is the
+            // failure mode the minimise fallback exists for.
+            return Ok(());
+        }
+        self.set_topmost(handle, false)?;
+        self.restack(handle, Depth::Back)
     }
 
-    fn promote(&self, handle: u64) -> Result<(), PlatformError> {
-        self.set_topmost(handle, true)
+    fn raise(&self, handle: u64, topmost: bool) -> Result<(), PlatformError> {
+        self.set_topmost(handle, topmost)?;
+        self.restack(handle, Depth::Front)
     }
 
     fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError> {
@@ -381,6 +434,10 @@ impl Platform for MockPlatform {
         window.bounds = placement.bounds;
 
         window.topmost = placement.topmost;
+        // Deliberately no restack. Whether placing a window actually brings it
+        // in front of full-screen media is the thing that keeps turning out
+        // not to be true, so the mock does not assume it either; the logic
+        // above has to measure and react rather than trust the placement.
         Ok(())
     }
 
