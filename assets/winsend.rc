@@ -1,0 +1,7 @@
+// Windows resource script. Compiled into the executable so Explorer, the
+// taskbar's pinned entry and Alt-Tab have an icon for the file itself, which
+// the runtime window icon cannot provide.
+//
+// Resource id 1: Windows uses the lowest-numbered icon resource as the
+// application icon, so this must stay the lowest if others are ever added.
+1 ICON "winsend.ico"
