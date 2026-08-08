@@ -31,6 +31,10 @@ serde_json = "1"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # RegisterHotKey and the MOD_ modifier constants.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # GetModuleHandleW, for the message-only window's class registration.
+    "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_Threading",

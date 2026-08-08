@@ -93,8 +93,14 @@ pub trait Shell {
 /// Mirrors `select_platform`, including honouring `WINSEND_MOCK=1`, so the UI
 /// can be worked on without taking real hotkeys off the machine running it.
 pub fn create(waker: Waker) -> Box<dyn Shell> {
-    // The Win32 implementation lands with the message-only window; until then
-    // every target gets the mock, which keeps the app runnable throughout.
+    let forced_mock = std::env::var("WINSEND_MOCK").is_ok_and(|v| v == "1");
+
+    #[cfg(windows)]
+    if !forced_mock {
+        return Box::new(crate::win32_shell::Win32Shell::new(waker));
+    }
+
+    let _ = forced_mock;
     Box::new(crate::mock::MockShell::new(waker))
 }
 

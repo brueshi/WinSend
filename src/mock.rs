@@ -91,7 +91,10 @@ impl MockShell {
         }
     }
 
-    /// Stand in for a hotkey press.
+    /// Stand in for a hotkey press. Driven by the mock-only debug buttons,
+    /// which are compiled out on Windows even though the mock shell itself
+    /// remains reachable there via `WINSEND_MOCK=1`.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn trigger(&self, action: Action) {
         self.emit(ShellEvent::Trigger(action));
     }

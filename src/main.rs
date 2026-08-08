@@ -11,6 +11,8 @@ mod platform;
 mod shell;
 #[cfg(windows)]
 mod win32;
+#[cfg(windows)]
+mod win32_shell;
 
 use app::WinSendApp;
 use config::Config;
