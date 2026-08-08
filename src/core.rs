@@ -96,6 +96,28 @@ impl Core {
         }
     }
 
+    /// Every window covering `monitor`, front-first, whatever its depth.
+    ///
+    /// The blunt list. Used only when the user has asked for the monitor to be
+    /// cleared, where "is it actually in front" stops being the question.
+    fn covering(&self, monitor: Bounds, sent: u64) -> Vec<(u64, bool)> {
+        let mut windows: Vec<WindowCandidate> = self
+            .platform
+            .candidate_windows()
+            .into_iter()
+            .filter(|window| {
+                window.handle != sent
+                    && !window.minimized
+                    && window.bounds.coverage_of(monitor) >= COVERING
+            })
+            .collect();
+        windows.sort_by_key(|window| window.z_order);
+        windows
+            .into_iter()
+            .map(|window| (window.handle, window.topmost))
+            .collect()
+    }
+
     /// Windows actually in front of the sent window and covering `monitor`.
     ///
     /// Measured from the stacking order rather than inferred from window
@@ -144,6 +166,25 @@ impl Core {
     /// is zero unless something is refusing to move.
     fn clear_the_way(&mut self, monitor: Bounds, sent: u64) -> usize {
         let mut displaced: Vec<Displaced> = Vec::new();
+
+        // Asked for explicitly, so it is blunt on purpose: everything covering
+        // the monitor is minimised whether or not it is currently in front.
+        // Deciding what is in the way is the part that keeps being wrong, and
+        // this setting exists to not have to decide.
+        if self.config.clear_target {
+            for (handle, was_topmost) in self.covering(monitor, sent) {
+                if self.platform.minimize(handle).is_ok() {
+                    displaced.push(Displaced {
+                        handle,
+                        was_topmost,
+                        demoted: false,
+                        minimized: true,
+                    });
+                }
+            }
+            self.displaced = displaced;
+            return self.blocking(monitor, sent).len();
+        }
 
         for (handle, was_topmost) in self.blocking(monitor, sent) {
             if self.platform.demote(handle).is_ok() {
@@ -238,6 +279,11 @@ impl Core {
 
     pub fn set_borderless(&mut self, borderless: bool) -> Result<(), String> {
         self.config.borderless = borderless;
+        self.config.save()
+    }
+
+    pub fn set_clear_target(&mut self, clear_target: bool) -> Result<(), String> {
+        self.config.clear_target = clear_target;
         self.config.save()
     }
 
@@ -582,6 +628,43 @@ mod tests {
         core.retrieve().unwrap();
 
         assert!(!core.platform.as_mock().unwrap().is_topmost(MEDIA_WINDOW));
+    }
+
+    /// The escape hatch, for when working out what is in the way keeps being
+    /// wrong: clear the monitor and stop deciding.
+    #[test]
+    fn clearing_the_target_minimises_even_what_is_already_behind() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.clear_target = true;
+
+        core.send().unwrap();
+
+        assert!(
+            core.platform.as_mock().unwrap().is_minimized(MEDIA_WINDOW),
+            "the setting exists precisely so depth stops mattering"
+        );
+    }
+
+    #[test]
+    fn clearing_the_target_puts_everything_back_on_retrieve() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.clear_target = true;
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        assert!(!core.platform.as_mock().unwrap().is_minimized(MEDIA_WINDOW));
+    }
+
+    #[test]
+    fn clearing_the_target_leaves_other_monitors_alone() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.clear_target = true;
+
+        core.send().unwrap();
+
+        // The main Zoom window fills part of DISPLAY1, not the target.
+        assert!(!core.platform.as_mock().unwrap().is_minimized(MAIN_WINDOW));
     }
 
     /// Already behind the sent window, so moving it would be interfering with

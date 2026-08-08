@@ -489,6 +489,23 @@ impl WinSendApp {
             self.report(ctx, outcome);
         }
 
+        ui.add_space(8.0);
+
+        let mut clear_target = self.core.config.clear_target;
+        if ui
+            .checkbox(&mut clear_target, "Minimise other windows on this monitor")
+            .on_hover_text(
+                "Minimises anything filling the target monitor when sending, and restores it on Retrieve. \
+                 Use this when something full screen refuses to give up the display. \
+                 Some players pause while minimised.",
+            )
+            .changed()
+        {
+            if let Err(message) = self.core.set_clear_target(clear_target) {
+                self.status = Status::Err(message);
+            }
+        }
+
         ui.add_space(10.0);
 
         let mut borderless = self.core.config.borderless;

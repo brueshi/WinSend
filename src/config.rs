@@ -29,6 +29,13 @@ pub struct Config {
     /// this is needed depends on how Zoom frames its video window, which we
     /// cannot know until it is tested against a real session.
     pub borderless: bool,
+    /// Minimise everything else on the target monitor when sending, and put it
+    /// back on Retrieve.
+    ///
+    /// Off by default because minimising can pause or throttle a media player,
+    /// which the automatic behaviour goes out of its way to avoid. As a
+    /// deliberate choice it is the blunt instrument that always works.
+    pub clear_target: bool,
     #[serde(with = "hotkeys_as_text")]
     pub hotkeys: Hotkeys,
 }
@@ -206,6 +213,13 @@ mod tests {
 
         assert_eq!(loaded.hotkeys.send, Some("Ctrl+Alt+F9".parse().unwrap()));
         assert_eq!(loaded.hotkeys.retrieve, None);
+    }
+
+    #[test]
+    fn clearing_the_target_is_off_unless_asked_for() {
+        assert!(!Config::default().clear_target);
+        let loaded: Config = serde_json::from_str(r#"{"borderless": true}"#).unwrap();
+        assert!(!loaded.clear_target, "an existing config must not gain it");
     }
 
     #[test]
