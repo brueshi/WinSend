@@ -46,7 +46,7 @@ impl MockPlatform {
     /// Minimise a window the way Windows does, including the off-screen bounds
     /// it reports for iconic windows. Those bounds are the reason Send has to
     /// un-minimise before capturing a restore point.
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg(test)]
     pub fn minimize(&self, handle: u64) {
         let mut windows = self.windows.borrow_mut();
         if let Some(window) = windows.iter_mut().find(|w| w.handle == handle) {
