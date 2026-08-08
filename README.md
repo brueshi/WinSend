@@ -11,15 +11,17 @@ someone is pinned. WinSend does it in one press, without leaving Zoom.
 
 ## Status
 
-Send and Retrieve work end to end against a real Zoom session on Windows,
-including thumbnail capture. The UI, configuration, window-identity matching,
-binding rules and the Send/Retrieve logic are covered by tests that run on any
-platform.
+Confirmed working against a real Zoom session on Windows: Send and Retrieve,
+thumbnail capture, global hotkeys, the tray icon and its menu, the application
+icons, and getting the sent window in front of a full-screen media player on the
+target display.
 
-Global hotkeys are confirmed working on Windows. The tray icon appears, and its
-menu is fixed but not yet re-tested: `Shell_NotifyIcon` sends its callback
-rather than posting it, so the first attempt handled it in the message loop
-where it could never arrive. Hide-to-tray is still unverified.
+Not yet verified: hide-to-tray, and whether a media player that gives up the
+display on losing focus is reliably restored on Retrieve.
+
+Everything above the platform seam — the UI, configuration, window identity,
+binding rules, and the whole of Send and Retrieve including which windows are in
+the way — is covered by tests that run on any platform.
 
 Known limitation: Zoom's main and video windows are identical in process, class
 and title, so after restarting WinSend the window has to be picked again. Within
@@ -52,7 +54,7 @@ directions. A platform call is a question with an immediate answer. The shell
 delivers events when the OS decides to, from a thread of its own, and that
 difference shapes the whole of `shell.rs`.
 
-Four decisions worth knowing:
+Five decisions worth knowing:
 
 - **The picked window's handle is remembered, but re-validated on every use.**
   Zoom's main meeting window and its video window share process, class and
@@ -77,14 +79,33 @@ Four decisions worth knowing:
   they press it. Pressing Send twice is already a no-op, where double-tapping a
   toggle would bounce the window mid-broadcast.
 
-- **A sent window is held above everything else, and put back afterwards.**
-  Moving it onto a monitor that already has something full-screen on it would
-  otherwise leave it behind that content, which looks identical to nothing
-  happening. Raising this window is the only way in front without touching the
-  other application, so whatever is playing keeps playing and is still there on
-  Retrieve. The original z-order is recorded rather than assumed, since Zoom has
-  an always-on-top option of its own that must not be silently cleared. This
-  cannot beat true exclusive-fullscreen content, where nothing can draw above.
+- **Getting in front of full-screen media is a focus problem, not a z-order
+  one.** This took six attempts to learn and is the least obvious thing in the
+  codebase. A full-screen media player is managed outside the normal stacking
+  order: it does not appear in `EnumWindows` at all, so nothing done to other
+  windows reaches it, and every rule about raising or demoting windows was
+  selecting from a list it had never been in. It gives way to exactly one thing,
+  which is something else taking the foreground — which is why clicking any
+  other application makes it minimise. So Send takes the foreground, and the
+  z-order work below it only ever mattered for ordinary windows.
+- **A placement is measured, not assumed.** A window does not always end up
+  where it was put: coordinates can be scaled on a display whose DPI differs
+  from the one the process was told about, and an application can resize itself
+  in response to being moved. The result is read back and corrected once, by the
+  difference for position and by the ratio for size, so the correction carries no
+  assumption about any resolution or scale factor.
+
+Ordinary windows in the way are still handled, because not everything on a
+display is a full-screen player. A window counts as in the way when it is in
+front of the sent window and covers at least 15% of it — both measured, one from
+the stacking order and one from the two rectangles. It is dropped out of the
+always-on-top band and to the back rather than minimised, so anything playing
+carries on; a window that will not stay put is minimised instead. Everything
+moved is put back on Retrieve, into the band it came from.
+
+Settings also offers minimising everything on the target display outright. It is
+off by default, since minimising can pause a player, but it is the blunt
+instrument for when working out what is in the way gets it wrong.
 
 Restore points are captured only on the first Send, so pressing it twice cannot
 overwrite the original position, and are cleared once Retrieve consumes them.
@@ -139,22 +160,20 @@ shows on the file needs `assets/winsend.rc` and the resource step in `build.rs`.
 That step is a no-op for non-Windows targets and only ever a warning when a
 resource compiler is missing, so it cannot break either build above.
 
-## The probe
+## Diagnostics
 
-`src/bin/probe.rs` is a throwaway diagnostic that dumps the monitor layout and
-every visible top-level window with its class, title, owning process, bounds and
-style bits. It exists to identify Zoom's video window with certainty before any
-detection logic is trusted, and should be deleted once that is settled.
+Settings has a **Copy diagnostics** button. It reports every window with its
+depth in the stacking order, whether it is always-on-top, minimised, cloaked or
+ours, how much of the target monitor and of the Zoom window it covers, and the
+verdict Send would reach about it — the same list and the same filters that Send
+acts on, not a separate tool answering a nearby question.
 
-It deliberately dumps every window rather than only processes matching "zoom",
-because Zoom has historically hosted windows under process names that give
-nothing away.
+That distinction matters. Six attempts at getting in front of full-screen media
+were each built on a guess about what was on screen, and a standalone probe that
+applied its own filters could not have settled it. The report is what showed the
+window in question was not being enumerated at all.
 
-```
-cargo xwin build --release --target x86_64-pc-windows-msvc \
-  --features probe --bin probe
-probe.exe > windows.txt
-```
+It goes to the clipboard and to `%APPDATA%\WinSend\diagnostics.txt`.
 
 ## Known risk
 
@@ -164,6 +183,11 @@ well be one. A failed capture is treated as normal rather than as an error: the
 picker falls back to a placeholder and the window is identified by title, size
 and monitor instead. If previews do come back black, the alternative is
 Windows.Graphics.Capture, which is considerably more involved.
+
+Getting in front of a full-screen player works by taking the foreground, which
+means the player gives up the display and, being suspended or minimised, stops
+playing. There is no way to be in front of such a window and leave it running:
+those are the same thing from its point of view.
 
 A window hidden to the tray is not guaranteed to be told to redraw, and eframe
 only runs a frame when it is. A hotkey that worked only while the window was on

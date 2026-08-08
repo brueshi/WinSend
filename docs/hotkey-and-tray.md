@@ -1,7 +1,9 @@
 # Feature brief: global hotkey and tray icon
 
-Hand this file to a fresh session as the starting prompt. It is written to be
-self-contained.
+**Delivered.** Kept as a record of what was asked for and why. It describes the
+codebase as it was before the work, so parts of it are now out of date — the
+probe it refers to has been removed, and its job is done better by the
+diagnostics report in Settings. See `README.md` for how things actually stand.
 
 ## Context
 

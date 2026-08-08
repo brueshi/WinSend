@@ -5,19 +5,9 @@ edition = "2021"
 authors = ["brueshi"]
 description = "Sends Zoom's dual-monitor video window to a chosen display and back"
 
-[features]
-# The throwaway window-enumeration tool. Windows-only, and excluded from the
-# default build so `cargo test` works natively on macOS.
-probe = []
-
 [[bin]]
 name = "winsend"
 path = "src/main.rs"
-
-[[bin]]
-name = "probe"
-path = "src/bin/probe.rs"
-required-features = ["probe"]
 
 [dependencies]
 eframe = "0.33.3"
