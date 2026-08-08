@@ -23,9 +23,10 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, GWL_STYLE, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_RESTORE, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, GWL_STYLE, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_SYSMENU, WS_THICKFRAME,
 };
 
 use crate::platform::{
@@ -60,6 +61,36 @@ impl Win32Platform {
 impl Default for Win32Platform {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Win32Platform {
+    /// Put back any window frame that was stripped for a borderless fill.
+    ///
+    /// Retrieve already restores styles, but quitting while a window is still
+    /// sent would otherwise leave Zoom frameless until it is restarted — a
+    /// change to another application that outlives this process.
+    fn drop(&mut self) {
+        for (handle, style) in self.stripped_styles.borrow().iter() {
+            let hwnd = handle_to_hwnd(*handle);
+            unsafe {
+                if !IsWindow(Some(hwnd)).as_bool() {
+                    continue;
+                }
+                SetWindowLongPtrW(hwnd, GWL_STYLE, *style);
+                // The frame does not come back until the window is told to
+                // recalculate it.
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
     }
 }
 
@@ -137,9 +168,10 @@ unsafe fn is_cloaked(hwnd: HWND) -> bool {
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let out = &mut *(lparam.0 as *mut Vec<WindowCandidate>);
 
-    // Minimised windows have meaningless rects and cloaked ones are not really
-    // on screen, so neither belongs in a visual picker.
-    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || is_cloaked(hwnd) {
+    // Cloaked windows are not really on screen. Minimised ones are still
+    // reported, flagged, so the confirmed window can be found and restored
+    // rather than looking like it vanished; the picker filters them out.
+    if !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
         return BOOL(1);
     }
 
@@ -171,6 +203,7 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         title,
         bounds: rect_to_bounds(rect),
         monitor_id: monitor_id(hwnd),
+        minimized: IsIconic(hwnd).as_bool(),
     });
 
     BOOL(1)
@@ -334,6 +367,19 @@ impl Platform for Win32Platform {
 
     fn thumbnail(&self, handle: u64) -> Option<Thumbnail> {
         unsafe { capture(handle_to_hwnd(handle)) }
+    }
+
+    fn unminimize(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
+        Ok(())
     }
 
     fn window_bounds(&self, handle: u64) -> Result<Bounds, PlatformError> {

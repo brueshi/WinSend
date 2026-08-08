@@ -60,6 +60,10 @@ pub struct WindowCandidate {
     /// True when the process or class looked Zoom-ish. Only used to sort the
     /// picker so likely candidates surface first, never to exclude anything.
     pub likely_zoom: bool,
+    /// Minimised windows are still enumerated so the confirmed window can be
+    /// found and un-minimised, but they are kept out of the picker: their
+    /// bounds are meaningless and they cannot be identified visually.
+    pub minimized: bool,
 }
 
 /// RGBA8 preview of a window, sized by the platform layer.
@@ -100,6 +104,11 @@ pub trait Platform {
     fn thumbnail(&self, handle: u64) -> Option<Thumbnail>;
 
     fn window_bounds(&self, handle: u64) -> Result<Bounds, PlatformError>;
+
+    /// Bring a minimised window back so its real bounds can be read. Called
+    /// before capturing a restore point, since a minimised window reports
+    /// off-screen coordinates that would make Retrieve useless.
+    fn unminimize(&self, handle: u64) -> Result<(), PlatformError>;
 
     /// Move and resize, optionally stripping the window's frame so it fills the
     /// target monitor edge to edge.

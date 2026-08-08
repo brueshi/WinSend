@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
-use crate::core::Core;
+use crate::core::{Core, Failure};
 use crate::platform::WindowCandidate;
 
 /// The utility sits on screen during a broadcast, so it stays small — except
@@ -67,11 +67,20 @@ impl WinSendApp {
         app
     }
 
-    fn report(&mut self, outcome: Result<String, String>) {
-        self.status = match outcome {
-            Ok(message) => Status::Ok(message),
-            Err(message) => Status::Err(message),
-        };
+    /// Show the outcome, and when the window needs picking again, go straight
+    /// to the picker instead of leaving the user to decode an error and find
+    /// their own way to Settings.
+    fn report(&mut self, ctx: &egui::Context, outcome: Result<String, Failure>) {
+        match outcome {
+            Ok(message) => self.status = Status::Ok(message),
+            Err(failure) => {
+                let needs_selection = failure.needs_selection;
+                self.status = Status::Err(failure.message);
+                if needs_selection {
+                    self.open_picker(ctx);
+                }
+            }
+        }
     }
 
     fn open_picker(&mut self, ctx: &egui::Context) {
@@ -160,7 +169,7 @@ impl WinSendApp {
         ui.vertical_centered_justified(|ui| {
             if ui.add(primary).clicked() {
                 let outcome = self.core.send();
-                self.report(outcome);
+                self.report(ctx, outcome);
             }
             ui.add_space(6.0);
 
@@ -168,7 +177,7 @@ impl WinSendApp {
             let response = ui.add_enabled(can_retrieve, button("Retrieve"));
             if response.clicked() {
                 let outcome = self.core.retrieve();
-                self.report(outcome);
+                self.report(ctx, outcome);
             }
             if !can_retrieve {
                 response.on_hover_text("Nothing has been sent yet this session");
@@ -189,8 +198,6 @@ impl WinSendApp {
                 }
             }
         }
-
-        let _ = ctx;
     }
 
     fn settings_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -224,7 +231,7 @@ impl WinSendApp {
         }
         if let Some(monitor) = chosen {
             let outcome = self.core.set_target_monitor(&monitor);
-            self.report(outcome);
+            self.report(ctx, outcome);
         }
 
         ui.add_space(10.0);
@@ -376,7 +383,7 @@ impl WinSendApp {
 
         if let Some(candidate) = confirmed {
             let outcome = self.core.confirm_window(&candidate);
-            self.report(outcome);
+            self.report(ctx, outcome);
             self.leave_picker(ctx, Screen::Main);
         } else if going_back {
             self.leave_picker(ctx, Screen::Settings);

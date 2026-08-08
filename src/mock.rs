@@ -7,6 +7,7 @@
 //! "confirmed window is gone" path without needing Zoom to cooperate.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::platform::{Bounds, MonitorInfo, Platform, PlatformError, Thumbnail, WindowCandidate};
 
@@ -14,6 +15,9 @@ pub struct MockPlatform {
     windows: RefCell<Vec<WindowCandidate>>,
     /// Flips the Zoom windows out of existence to test the reconfirm prompt.
     zoom_present: RefCell<bool>,
+    /// Bounds from before a window was minimised, so restoring puts them back
+    /// the way Windows does.
+    pre_minimize: RefCell<HashMap<u64, Bounds>>,
 }
 
 impl Default for MockPlatform {
@@ -27,6 +31,20 @@ impl MockPlatform {
         Self {
             windows: RefCell::new(default_windows()),
             zoom_present: RefCell::new(true),
+            pre_minimize: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Minimise a window the way Windows does, including the off-screen bounds
+    /// it reports for iconic windows. Those bounds are the reason Send has to
+    /// un-minimise before capturing a restore point.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn minimize(&self, handle: u64) {
+        let mut windows = self.windows.borrow_mut();
+        if let Some(window) = windows.iter_mut().find(|w| w.handle == handle) {
+            self.pre_minimize.borrow_mut().insert(handle, window.bounds);
+            window.minimized = true;
+            window.bounds = Bounds::new(-32000, -32000, 160, 28);
         }
     }
 
@@ -43,59 +61,80 @@ impl MockPlatform {
     }
 }
 
+fn window(
+    handle: u64,
+    process_name: &str,
+    class_name: &str,
+    title: &str,
+    bounds: Bounds,
+    monitor_id: &str,
+    likely_zoom: bool,
+) -> WindowCandidate {
+    WindowCandidate {
+        handle,
+        process_name: process_name.into(),
+        class_name: class_name.into(),
+        title: title.into(),
+        bounds,
+        monitor_id: monitor_id.into(),
+        likely_zoom,
+        minimized: false,
+    }
+}
+
 fn default_windows() -> Vec<WindowCandidate> {
     vec![
         // The main meeting window and the video window are indistinguishable by
         // description: same process, same class, same title. Observed on real
         // Windows, and the reason a remembered handle is needed to tell them
         // apart at all.
-        WindowCandidate {
-            handle: 0x1001,
-            process_name: "Zoom.exe".into(),
-            class_name: "ZPContentViewWndClass".into(),
-            title: "Zoom Workplace".into(),
-            bounds: Bounds::new(120, 80, 1280, 800),
-            monitor_id: r"\\.\DISPLAY1".into(),
-            likely_zoom: true,
-        },
+        window(
+            0x1001,
+            "Zoom.exe",
+            "ZPContentViewWndClass",
+            "Zoom Workplace",
+            Bounds::new(120, 80, 1280, 800),
+            r"\\.\DISPLAY1",
+            true,
+        ),
         // The target.
-        WindowCandidate {
-            handle: 0x1002,
-            process_name: "Zoom.exe".into(),
-            class_name: "ZPContentViewWndClass".into(),
-            title: "Zoom Workplace".into(),
-            bounds: Bounds::new(2700, 200, 960, 540),
-            monitor_id: r"\\.\DISPLAY2".into(),
-            likely_zoom: true,
-        },
-        WindowCandidate {
-            handle: 0x2001,
-            process_name: "chrome.exe".into(),
-            class_name: "Chrome_WidgetWin_1".into(),
-            title: "Production runsheet - Google Docs".into(),
-            bounds: Bounds::new(300, 150, 1440, 900),
-            monitor_id: r"\\.\DISPLAY1".into(),
-            likely_zoom: false,
-        },
-        WindowCandidate {
-            handle: 0x2002,
-            process_name: "obs64.exe".into(),
-            class_name: "Qt5152QWindowIcon".into(),
-            title: "OBS 30.0.2 - Profile: Live".into(),
-            bounds: Bounds::new(0, 0, 1200, 760),
-            monitor_id: r"\\.\DISPLAY1".into(),
-            likely_zoom: false,
-        },
+        window(
+            0x1002,
+            "Zoom.exe",
+            "ZPContentViewWndClass",
+            "Zoom Workplace",
+            Bounds::new(2700, 200, 960, 540),
+            r"\\.\DISPLAY2",
+            true,
+        ),
+        window(
+            0x2001,
+            "chrome.exe",
+            "Chrome_WidgetWin_1",
+            "Production runsheet - Google Docs",
+            Bounds::new(300, 150, 1440, 900),
+            r"\\.\DISPLAY1",
+            false,
+        ),
+        window(
+            0x2002,
+            "obs64.exe",
+            "Qt5152QWindowIcon",
+            "OBS 30.0.2 - Profile: Live",
+            Bounds::new(0, 0, 1200, 760),
+            r"\\.\DISPLAY1",
+            false,
+        ),
         // Long title, to keep the picker layout honest about overflow.
-        WindowCandidate {
-            handle: 0x2003,
-            process_name: "explorer.exe".into(),
-            class_name: "CabinetWClass".into(),
-            title: "Q3 Broadcast Assets — Final — Approved — Do Not Move Or Rename".into(),
-            bounds: Bounds::new(400, 300, 1100, 700),
-            monitor_id: r"\\.\DISPLAY1".into(),
-            likely_zoom: false,
-        },
+        window(
+            0x2003,
+            "explorer.exe",
+            "CabinetWClass",
+            "Q3 Broadcast Assets — Final — Approved — Do Not Move Or Rename",
+            Bounds::new(400, 300, 1100, 700),
+            r"\\.\DISPLAY1",
+            false,
+        ),
     ]
 }
 
@@ -131,6 +170,24 @@ impl Platform for MockPlatform {
         let windows = self.windows.borrow();
         let window = windows.iter().find(|w| w.handle == handle)?;
         Some(synthetic_thumbnail(window))
+    }
+
+    fn unminimize(&self, handle: u64) -> Result<(), PlatformError> {
+        if !self.zoom_present() {
+            return Err(PlatformError::WindowGone);
+        }
+        let mut windows = self.windows.borrow_mut();
+        let window = windows
+            .iter_mut()
+            .find(|w| w.handle == handle)
+            .ok_or(PlatformError::WindowGone)?;
+        if window.minimized {
+            window.minimized = false;
+            if let Some(bounds) = self.pre_minimize.borrow_mut().remove(&handle) {
+                window.bounds = bounds;
+            }
+        }
+        Ok(())
     }
 
     fn window_bounds(&self, handle: u64) -> Result<Bounds, PlatformError> {

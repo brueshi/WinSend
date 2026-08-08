@@ -10,9 +10,13 @@ someone is pinned. WinSend does it in one press.
 
 ## Status
 
-The UI, configuration, window-identity matching and the Send/Retrieve logic are
-implemented and covered by tests. The Win32 platform layer is written and
-compiles, but is **unverified against a real Zoom session**.
+Working end to end against a real Zoom session on Windows, including thumbnail
+capture. The UI, configuration, window-identity matching and the Send/Retrieve
+logic are covered by tests that run on any platform.
+
+Known limitation: Zoom's main and video windows are identical in process, class
+and title, so after restarting WinSend the window has to be picked again. Within
+a session the remembered handle separates them.
 
 ## Design
 
@@ -35,15 +39,22 @@ adapter.
 
 Two decisions worth knowing:
 
-- **Every Send and Retrieve re-resolves the window from scratch.** Zoom can
-  close and reopen the video window mid-meeting, so a cached handle may by then
-  refer to something else entirely. Full-screening the wrong window during a
-  live broadcast is the failure this guards against.
-- **Process name and window class are the identity; the title is only a
-  tie-breaker.** Zoom reuses titles across its main meeting window and the
-  dual-monitor video window. If a Zoom update changes the class, resolution
-  reports "not found" and asks the user to reconfirm rather than falling back to
-  some other Zoom window.
+- **The picked window's handle is remembered, but re-validated on every use.**
+  Zoom's main meeting window and its video window share process, class and
+  title, so nothing in the persisted description separates them — only the
+  handle does. A handle alone cannot be trusted either, since Zoom can close and
+  reopen the video window and the OS can reissue a dead handle to something
+  else, so before each use it is checked against the live window list for both
+  existence and a matching process and class.
+- **When the window genuinely cannot be identified, the app asks rather than
+  guesses.** Full-screening the main meeting window mid-broadcast is the failure
+  worth avoiding, and it is worse than a prompt. Ambiguity opens the picker
+  instead of reporting an error the user has to decode.
+
+Restore points are captured only on the first Send, so pressing it twice cannot
+overwrite the original position, and are cleared once Retrieve consumes them.
+Minimised windows are un-minimised before their bounds are read, because Windows
+reports off-screen coordinates for iconic windows.
 
 ## Building
 

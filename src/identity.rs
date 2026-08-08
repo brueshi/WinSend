@@ -94,6 +94,7 @@ mod tests {
             bounds: Bounds::new(0, 0, 1920, 1080),
             monitor_id: r"\\.\DISPLAY1".to_string(),
             likely_zoom: true,
+            minimized: false,
         }
     }
 
