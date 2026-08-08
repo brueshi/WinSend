@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::hotkey::{Action, Hotkey, Hotkeys};
 use crate::platform::{Bounds, MonitorInfo, Platform, PlatformError, Thumbnail, WindowCandidate};
-use crate::shell::{HotkeyReport, Shell, ShellEvent, Waker};
+use crate::shell::{HotkeyReport, Shell, ShellEvent, TrayState, Waker};
 
 pub struct MockPlatform {
     windows: RefCell<Vec<WindowCandidate>>,
@@ -79,6 +79,7 @@ pub struct MockShell {
     /// Combinations that will refuse to register, standing in for one already
     /// owned by another application.
     unavailable: RefCell<Vec<Hotkey>>,
+    tray: RefCell<TrayState>,
 }
 
 impl MockShell {
@@ -88,7 +89,21 @@ impl MockShell {
             queue: RefCell::new(Vec::new()),
             registered: RefCell::new(Hotkeys::default()),
             unavailable: RefCell::new(Vec::new()),
+            tray: RefCell::new(TrayState::default()),
         }
+    }
+
+    /// Stand in for choosing an item from the tray menu.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn choose(&self, event: ShellEvent) {
+        self.emit(event);
+    }
+
+    /// What the tray icon would be showing, so the debug controls can display
+    /// it and tests can assert on it.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn tray(&self) -> TrayState {
+        self.tray.borrow().clone()
     }
 
     /// Stand in for a hotkey press. Driven by the mock-only debug buttons,
@@ -139,6 +154,10 @@ impl Shell for MockShell {
 
         *self.registered.borrow_mut() = registered;
         self.emit(ShellEvent::HotkeysApplied(report));
+    }
+
+    fn set_tray_state(&self, state: TrayState) {
+        *self.tray.borrow_mut() = state;
     }
 
     fn poll(&self) -> Vec<ShellEvent> {

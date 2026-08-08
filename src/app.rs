@@ -7,7 +7,7 @@ use eframe::egui;
 use crate::core::{Core, Failure};
 use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::WindowCandidate;
-use crate::shell::{self, HotkeyReport, Shell, ShellEvent};
+use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
 
 /// The utility sits on screen during a broadcast, so it stays small — except
 /// while picking a window, where showing only two entries would force scrolling
@@ -140,7 +140,22 @@ impl WinSendApp {
                 }
                 self.hotkey_report = report;
             }
+            // Focus rather than raise-and-restore for now; hiding to the tray,
+            // and so the notion of a window that is not currently shown, lands
+            // with the close-to-tray behaviour.
+            ShellEvent::ShowWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+            ShellEvent::ShowSettings => {
+                self.go_to(ctx, Screen::Settings);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            ShellEvent::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
+    }
+
+    /// Keep the tray icon in step with the window. Cheap to call every frame:
+    /// the shell drops it when nothing has changed.
+    fn refresh_tray(&mut self) {
+        self.shell.set_tray_state(tray_state(&self.core));
     }
 
     /// Begin capturing a combination for `action`.
@@ -342,9 +357,10 @@ impl WinSendApp {
             // Injected rather than performed directly, so the press travels the
             // same queue-and-wake path a real hotkey would.
             let mut pressed = None;
+            let mut chosen = None;
             if let Some(mock) = self.shell.as_mock() {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("mock: press").size(10.0));
+                    ui.label(egui::RichText::new("mock: hotkey").size(10.0));
                     for action in Action::ALL {
                         if ui
                             .small_button(egui::RichText::new(action.label()).size(10.0))
@@ -354,8 +370,34 @@ impl WinSendApp {
                         }
                     }
                 });
+                let tray = mock.tray();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("mock: tray").size(10.0));
+                    for (label, event) in [
+                        ("Show", ShellEvent::ShowWindow),
+                        ("Settings", ShellEvent::ShowSettings),
+                        ("Quit", ShellEvent::Quit),
+                    ] {
+                        if ui
+                            .small_button(egui::RichText::new(label).size(10.0))
+                            .clicked()
+                        {
+                            chosen = Some(event.clone());
+                        }
+                    }
+                    if !tray.can_retrieve {
+                        ui.label(
+                            egui::RichText::new("Retrieve greyed").size(9.0).color(SUBDUED),
+                        );
+                    }
+                });
+                ui.label(egui::RichText::new(tray.tooltip).size(9.0).color(SUBDUED));
+
                 if let Some(action) = pressed {
                     mock.trigger(action);
+                }
+                if let Some(event) = chosen {
+                    mock.choose(event);
                 }
             }
         }
@@ -640,6 +682,7 @@ impl eframe::App for WinSendApp {
         // Before any widget sees the keyboard, so a capture in progress takes
         // every press for itself.
         self.capture_step(ctx);
+        self.refresh_tray();
 
         egui::CentralPanel::default().show(ctx, |ui| match self.screen {
             Screen::Main => self.main_screen(ui, ctx),
@@ -652,6 +695,18 @@ impl eframe::App for WinSendApp {
             Screen::SelectWindow => self.select_window_screen(ui, ctx),
         });
     }
+}
+
+/// What the tray icon should show for the current state.
+///
+/// The tooltip carries the target monitor because that is the one setting worth
+/// confirming without opening the window, which is the whole point of the icon.
+fn tray_state(core: &Core) -> TrayState {
+    let tooltip = match core.config.resolve_monitor(&core.monitors()) {
+        Some(monitor) => format!("WinSend — sends to {}", monitor.label()),
+        None => "WinSend — no target monitor selected".to_string(),
+    };
+    TrayState { can_retrieve: core.can_retrieve(), tooltip }
 }
 
 /// Translate an egui key into one that can be registered with Windows.
@@ -687,9 +742,41 @@ fn key_from_egui(key: egui::Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::mock::MockPlatform;
+    use crate::platform::Platform;
 
     fn key(name: &str) -> Option<Key> {
         name.parse().ok()
+    }
+
+    fn core_targeting_second_monitor() -> Core {
+        let platform = MockPlatform::new();
+        let monitors = platform.monitors();
+        let mut config = Config::default();
+        config.set_target(&monitors[1]);
+        Core::new(Box::new(platform), config)
+    }
+
+    #[test]
+    fn the_tray_tooltip_names_the_target_monitor() {
+        let tooltip = tray_state(&core_targeting_second_monitor()).tooltip;
+        assert!(tooltip.contains("1920x1080"), "got: {tooltip}");
+    }
+
+    #[test]
+    fn the_tray_tooltip_says_when_no_monitor_is_chosen() {
+        let core = Core::new(Box::new(MockPlatform::new()), Config::default());
+        let tooltip = tray_state(&core).tooltip;
+        assert!(tooltip.contains("no target monitor"), "got: {tooltip}");
+    }
+
+    /// Mirrors the Retrieve button. The menu must not offer a restore that
+    /// could only produce an error.
+    #[test]
+    fn the_tray_offers_retrieve_only_once_there_is_something_to_restore() {
+        let core = core_targeting_second_monitor();
+        assert!(!tray_state(&core).can_retrieve);
     }
 
     #[test]

@@ -20,10 +20,26 @@ pub type Waker = Box<dyn Fn() + Send + Sync>;
 /// Something the user asked for from outside the main window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellEvent {
-    /// A bound combination was pressed.
+    /// A bound combination was pressed, or the matching tray item chosen.
     Trigger(Action),
     /// The outcome of the most recent [`Shell::apply_hotkeys`].
     HotkeysApplied(HotkeyReport),
+    /// The tray icon was clicked, or Show chosen from its menu.
+    ShowWindow,
+    ShowSettings,
+    /// Quit was chosen. Reachable only from the tray menu, and it means it.
+    Quit,
+}
+
+/// What the tray icon should currently say and offer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrayState {
+    /// Mirrors the Retrieve button, so the menu never offers a restore that
+    /// would only produce an error.
+    pub can_retrieve: bool,
+    /// Hover text. Carries the target monitor, which is the setting most worth
+    /// confirming without opening the window at all.
+    pub tooltip: String,
 }
 
 /// Which bindings the OS refused, and why.
@@ -75,6 +91,11 @@ pub trait Shell {
     /// is swallowed by the OS and never reaches the UI, so rebinding a key to
     /// itself would otherwise appear to do nothing at all.
     fn apply_hotkeys(&self, hotkeys: Hotkeys);
+
+    /// Update what the tray icon shows. Safe to call every frame: an
+    /// implementation that talks to the OS compares against what it last sent
+    /// and does nothing when the state has not moved.
+    fn set_tray_state(&self, state: TrayState);
 
     /// Everything that has happened since the last call.
     fn poll(&self) -> Vec<ShellEvent>;

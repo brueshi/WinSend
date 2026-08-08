@@ -35,6 +35,8 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     # GetModuleHandleW, for the message-only window's class registration.
     "Win32_System_LibraryLoader",
+    # Shell_NotifyIcon and NOTIFYICONDATAW, for the notification area.
+    "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_Threading",
