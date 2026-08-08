@@ -1,6 +1,6 @@
 [package]
 name = "winsend"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 authors = ["brueshi"]
 description = "Sends Zoom's dual-monitor video window to a chosen display and back"
