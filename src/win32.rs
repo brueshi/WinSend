@@ -24,9 +24,10 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWL_STYLE, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_SYSMENU, WS_THICKFRAME,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST,
+    MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_RESTORE, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
 use crate::platform::{
@@ -44,6 +45,14 @@ pub struct Win32Platform {
     /// Held here rather than in `Core` because it is a detail of how this
     /// platform achieves a borderless fill, not something the app logic needs.
     stripped_styles: RefCell<HashMap<u64, isize>>,
+    /// Whether a window was already topmost before we raised it, so putting it
+    /// back does not quietly clear an always-on-top the user set themselves.
+    was_topmost: RefCell<HashMap<u64, bool>>,
+}
+
+/// Whether the window currently sits in the always-on-top band.
+unsafe fn is_topmost(hwnd: HWND) -> bool {
+    GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0
 }
 
 impl Win32Platform {
@@ -54,7 +63,10 @@ impl Win32Platform {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
-        Self { stripped_styles: RefCell::new(HashMap::new()) }
+        Self {
+            stripped_styles: RefCell::new(HashMap::new()),
+            was_topmost: RefCell::new(HashMap::new()),
+        }
     }
 }
 
@@ -65,12 +77,34 @@ impl Default for Win32Platform {
 }
 
 impl Drop for Win32Platform {
-    /// Put back any window frame that was stripped for a borderless fill.
+    /// Undo everything done to another application's window.
     ///
-    /// Retrieve already restores styles, but quitting while a window is still
-    /// sent would otherwise leave Zoom frameless until it is restarted — a
-    /// change to another application that outlives this process.
+    /// Retrieve already does this, but quitting while a window is still sent
+    /// would otherwise leave Zoom frameless and pinned above everything until
+    /// it is restarted — changes to another application that outlive this
+    /// process.
     fn drop(&mut self) {
+        for (handle, was_topmost) in self.was_topmost.borrow().iter() {
+            if *was_topmost {
+                continue;
+            }
+            let hwnd = handle_to_hwnd(*handle);
+            unsafe {
+                if !IsWindow(Some(hwnd)).as_bool() {
+                    continue;
+                }
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_NOTOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+
         for (handle, style) in self.stripped_styles.borrow().iter() {
             let hwnd = handle_to_hwnd(*handle);
             unsafe {
@@ -414,14 +448,34 @@ impl Platform for Win32Platform {
                 SetWindowLongPtrW(hwnd, GWL_STYLE, original);
             }
 
+            // Which band to place the window in, and what to put back.
+            //
+            // Retrieve must not assume the window started out ordinary: Zoom
+            // has its own always-on-top option, and clearing it silently would
+            // be changing a setting the user made in another application.
+            let insert_after = if placement.topmost {
+                self.was_topmost
+                    .borrow_mut()
+                    .entry(handle)
+                    .or_insert_with(|| is_topmost(hwnd));
+                HWND_TOPMOST
+            } else if self.was_topmost.borrow_mut().remove(&handle).unwrap_or(false) {
+                HWND_TOPMOST
+            } else {
+                HWND_NOTOPMOST
+            };
+
             SetWindowPos(
                 hwnd,
-                None,
+                Some(insert_after),
                 placement.bounds.x,
                 placement.bounds.y,
                 placement.bounds.width,
                 placement.bounds.height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                // No SWP_NOZORDER: changing the band is the point. SWP_NOACTIVATE
+                // stays, so whatever is playing underneath keeps focus and is
+                // not interrupted by the window arriving over it.
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
             .map_err(|e| {
                 // Moving a window owned by an elevated process from a

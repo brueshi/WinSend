@@ -7,7 +7,7 @@
 //! "confirmed window is gone" path without needing Zoom to cooperate.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::hotkey::{Action, Hotkey, Hotkeys};
 use crate::platform::{
@@ -22,6 +22,9 @@ pub struct MockPlatform {
     /// Bounds from before a window was minimised, so restoring puts them back
     /// the way Windows does.
     pre_minimize: RefCell<HashMap<u64, Bounds>>,
+    /// Windows currently held above the rest, so the z-order behaviour of Send
+    /// and Retrieve can be asserted without a real desktop.
+    topmost: RefCell<HashSet<u64>>,
 }
 
 impl Default for MockPlatform {
@@ -36,6 +39,7 @@ impl MockPlatform {
             windows: RefCell::new(default_windows()),
             zoom_present: RefCell::new(true),
             pre_minimize: RefCell::new(HashMap::new()),
+            topmost: RefCell::new(HashSet::new()),
         }
     }
 
@@ -50,6 +54,12 @@ impl MockPlatform {
             window.minimized = true;
             window.bounds = Bounds::new(-32000, -32000, 160, 28);
         }
+    }
+
+    /// Whether the window is being held above everything else.
+    #[cfg(test)]
+    pub fn is_topmost(&self, handle: u64) -> bool {
+        self.topmost.borrow().contains(&handle)
     }
 
     pub fn zoom_present(&self) -> bool {
@@ -323,6 +333,12 @@ impl Platform for MockPlatform {
             .find(|w| w.handle == handle)
             .ok_or(PlatformError::WindowGone)?;
         window.bounds = placement.bounds;
+
+        if placement.topmost {
+            self.topmost.borrow_mut().insert(handle);
+        } else {
+            self.topmost.borrow_mut().remove(&handle);
+        }
         Ok(())
     }
 

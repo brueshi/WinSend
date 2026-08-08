@@ -215,7 +215,13 @@ impl Core {
         self.platform
             .place_window(
                 window.handle,
-                Placement { bounds: destination, borderless: self.config.borderless },
+                Placement {
+                    bounds: destination,
+                    borderless: self.config.borderless,
+                    // The window is being put on a monitor that may already
+                    // have something full-screen on it.
+                    topmost: true,
+                },
             )
             .map_err(|e| Failure::plain(format!("Could not move the window: {e}")))?;
 
@@ -237,7 +243,7 @@ impl Core {
         self.ensure_visible(&window)?;
 
         self.platform
-            .place_window(window.handle, Placement { bounds, borderless: false })
+            .place_window(window.handle, Placement { bounds, borderless: false, topmost: false })
             .map_err(|e| Failure::plain(format!("Could not restore the window: {e}")))?;
 
         // Consumed: the next Send captures a fresh restore point rather than
@@ -331,6 +337,31 @@ mod tests {
         assert_eq!(window(&core, VIDEO_WINDOW).bounds, original);
     }
 
+    /// The regression for sending onto a monitor that already has something
+    /// full-screen on it: without raising the window, it lands behind the
+    /// media and looks like nothing happened.
+    #[test]
+    fn send_raises_the_window_above_whatever_is_already_there() {
+        let mut core = core_with_confirmed_video_window();
+        core.send().unwrap();
+
+        assert!(
+            core.platform.as_mock().unwrap().is_topmost(VIDEO_WINDOW),
+            "a window sent behind full-screen media is a window that did not move"
+        );
+    }
+
+    /// Raising it is only acceptable because it is undone. Otherwise Zoom
+    /// stays pinned over everything long after it was retrieved.
+    #[test]
+    fn retrieve_puts_the_window_back_in_the_ordinary_order() {
+        let mut core = core_with_confirmed_video_window();
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        assert!(!core.platform.as_mock().unwrap().is_topmost(VIDEO_WINDOW));
+    }
+
     #[test]
     fn retrieve_clears_the_restore_point() {
         let mut core = core_with_confirmed_video_window();
@@ -349,7 +380,7 @@ mod tests {
 
         let moved_by_hand = Bounds::new(300, 300, 640, 360);
         core.platform
-            .place_window(VIDEO_WINDOW, Placement { bounds: moved_by_hand, borderless: false })
+            .place_window(VIDEO_WINDOW, Placement { bounds: moved_by_hand, borderless: false, topmost: false })
             .unwrap();
 
         core.send().unwrap();

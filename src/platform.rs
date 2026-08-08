@@ -76,6 +76,14 @@ pub struct Placement {
     pub bounds: Bounds,
     /// Strip the window's frame so it fills the monitor edge to edge.
     pub borderless: bool,
+    /// Hold the window above ordinary windows.
+    ///
+    /// Moving a window onto a monitor that already has something full-screen on
+    /// it otherwise leaves it behind that content. Raising this window is the
+    /// only way to fix that without touching the other application, which
+    /// matters: whatever is playing underneath should keep playing, and still
+    /// be there when the window is retrieved.
+    pub topmost: bool,
 }
 
 /// RGBA8 preview of a window, sized by the platform layer.
