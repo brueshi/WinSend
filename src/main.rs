@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod core;
+mod hotkey;
 mod identity;
 mod mock;
 mod platform;

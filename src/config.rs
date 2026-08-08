@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::hotkey::{Action, Hotkeys};
 use crate::identity::WindowIdentity;
 use crate::platform::{Bounds, MonitorInfo};
 
@@ -28,6 +29,47 @@ pub struct Config {
     /// this is needed depends on how Zoom frames its video window, which we
     /// cannot know until it is tested against a real session.
     pub borderless: bool,
+    #[serde(with = "hotkeys_as_text")]
+    pub hotkeys: Hotkeys,
+}
+
+/// Hotkeys persist as the text they display as — `"Ctrl+Alt+F9"` — rather than
+/// as a record of flags and a virtual-key code. The file is meant to be
+/// readable, and `0x78` tells nobody anything.
+///
+/// Reading is deliberately lenient. A binding that no longer parses, or one
+/// hand-edited to collide with the other action, drops just that binding;
+/// returning an error would fail the whole file, and `Config::load` turns a
+/// failed parse into a reset of every other setting.
+mod hotkeys_as_text {
+    use super::{Action, Deserialize, Hotkeys, Serialize};
+    use serde::{Deserializer, Serializer};
+
+    #[derive(Serialize, Deserialize, Default)]
+    #[serde(default)]
+    struct Stored {
+        send: Option<String>,
+        retrieve: Option<String>,
+    }
+
+    pub fn serialize<S: Serializer>(hotkeys: &Hotkeys, serializer: S) -> Result<S::Ok, S::Error> {
+        Stored {
+            send: hotkeys.send.map(|h| h.to_string()),
+            retrieve: hotkeys.retrieve.map(|h| h.to_string()),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Hotkeys, D::Error> {
+        let stored = Stored::deserialize(deserializer)?;
+
+        // Routed through `set` rather than assigned, so the no-duplicates rule
+        // holds however the file came to be written.
+        let mut hotkeys = Hotkeys::default();
+        let _ = hotkeys.set(Action::Send, stored.send.and_then(|t| t.parse().ok()));
+        let _ = hotkeys.set(Action::Retrieve, stored.retrieve.and_then(|t| t.parse().ok()));
+        Ok(hotkeys)
+    }
 }
 
 impl Config {
@@ -126,6 +168,50 @@ mod tests {
     fn unconfigured_resolves_to_none() {
         let monitors = vec![monitor(r"\\.\DISPLAY1", 0, true)];
         assert!(Config::default().resolve_monitor(&monitors).is_none());
+    }
+
+    #[test]
+    fn hotkeys_persist_as_readable_text() {
+        let mut config = Config::default();
+        config
+            .hotkeys
+            .set(Action::Send, Some("Ctrl+Alt+F9".parse().unwrap()))
+            .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""send":"Ctrl+Alt+F9""#), "got: {json}");
+
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.hotkeys, config.hotkeys);
+    }
+
+    /// A hand-edited typo must cost the user their hotkey, not their monitor.
+    #[test]
+    fn an_unparseable_hotkey_does_not_take_the_rest_of_the_config_with_it() {
+        let loaded: Config = serde_json::from_str(
+            r#"{"borderless": true, "hotkeys": {"send": "Ctrl+Alt+F99"}}"#,
+        )
+        .expect("the file must still load");
+
+        assert_eq!(loaded.hotkeys.send, None, "the bad binding is dropped");
+        assert!(loaded.borderless, "everything else survives");
+    }
+
+    #[test]
+    fn a_hand_edited_collision_keeps_only_the_first_binding() {
+        let loaded: Config = serde_json::from_str(
+            r#"{"hotkeys": {"send": "Ctrl+Alt+F9", "retrieve": "Ctrl+Alt+F9"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.hotkeys.send, Some("Ctrl+Alt+F9".parse().unwrap()));
+        assert_eq!(loaded.hotkeys.retrieve, None);
+    }
+
+    #[test]
+    fn a_config_written_before_hotkeys_existed_still_loads() {
+        let loaded: Config = serde_json::from_str(r#"{"borderless": true}"#).unwrap();
+        assert_eq!(loaded.hotkeys, Hotkeys::default());
     }
 
     #[test]
