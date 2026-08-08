@@ -78,10 +78,19 @@ fn is_movable(window: &WindowCandidate) -> bool {
             .any(|shell| window.class_name.eq_ignore_ascii_case(shell))
 }
 
-/// How much of the target monitor a window must cover before it counts as
-/// being in the way. A full-screen video clears this comfortably; a window that
-/// merely happens to sit on the same display does not.
+/// How much of the target monitor a window must cover before clearing the
+/// monitor will minimise it. Only used for the explicit setting, where the
+/// question really is about the display rather than about one window.
 const COVERING: f32 = 0.7;
+
+/// How much of the sent window something must obscure before it counts as
+/// being in the way.
+///
+/// Measured against the sent window rather than the monitor. Covering most of
+/// a display was only ever a proxy, and a poor one: a window taking up half the
+/// screen in front of the video feed is in the way whatever fraction of the
+/// monitor it happens to occupy.
+const OBSCURING: f32 = 0.15;
 
 /// What was done to a window that was blocking the target monitor, so it can be
 /// put back exactly as it was.
@@ -153,27 +162,24 @@ impl Core {
             .collect()
     }
 
-    /// Windows actually in front of the sent window and covering `monitor`.
+    /// Windows actually in front of the sent window and obscuring it.
     ///
-    /// Measured from the stacking order rather than inferred from window
-    /// styles. Two earlier attempts guessed at the mechanism — first that
-    /// raising the sent window would be enough, then that anything in the way
-    /// would be marked always-on-top — and both were wrong about how a
-    /// full-screen player actually behaves. Asking which window is in front is
-    /// the question itself, and it does not depend on the answer.
+    /// Both halves are measured rather than inferred. Earlier attempts guessed
+    /// at the mechanism — that raising the sent window would be enough, then
+    /// that anything in the way would be marked always-on-top — and both were
+    /// wrong about how a full-screen player behaves. Depth comes from the
+    /// stacking order and overlap comes from the two rectangles, so neither
+    /// depends on a theory about the other application.
     ///
     /// Returns them front-first, so the one most in the way is dealt with
     /// first and the order can be reversed to put them back.
-    fn blocking(&self, monitor: Bounds, sent: u64) -> Vec<(u64, bool)> {
+    fn blocking(&self, sent: u64) -> Vec<(u64, bool)> {
         let windows = self.platform.candidate_windows();
 
-        let Some(depth) = windows
-            .iter()
-            .find(|window| window.handle == sent)
-            .map(|window| window.z_order)
-        else {
+        let Some(target) = windows.iter().find(|window| window.handle == sent) else {
             return Vec::new();
         };
+        let (depth, area) = (target.z_order, target.bounds);
 
         let mut blocking: Vec<&WindowCandidate> = windows
             .iter()
@@ -181,7 +187,7 @@ impl Core {
                 window.handle != sent
                     && is_movable(window)
                     && window.z_order < depth
-                    && window.bounds.coverage_of(monitor) >= COVERING
+                    && window.bounds.coverage_of(area) >= OBSCURING
             })
             .collect();
         blocking.sort_by_key(|window| window.z_order);
@@ -242,7 +248,7 @@ impl Core {
             return self.covering(monitor, sent).len();
         }
 
-        for (handle, was_topmost) in self.blocking(monitor, sent) {
+        for (handle, was_topmost) in self.blocking(sent) {
             if self.platform.demote(handle).is_ok() {
                 displaced.push(Displaced {
                     handle,
@@ -256,7 +262,7 @@ impl Core {
 
         // Anything still in front after being pushed to the back is holding
         // itself there, and only minimising will move it.
-        for (handle, was_topmost) in self.blocking(monitor, sent) {
+        for (handle, was_topmost) in self.blocking(sent) {
             if self.platform.minimize(handle).is_err() {
                 continue;
             }
@@ -273,7 +279,7 @@ impl Core {
         }
 
         self.displaced = displaced;
-        self.blocking(monitor, sent).len()
+        self.blocking(sent).len()
     }
 
     /// Put back everything moved aside, in reverse order so the window that was
@@ -337,9 +343,23 @@ impl Core {
         }
         let located = self.locate();
         let _ = match &located {
-            Ok(window) => writeln!(out, "  located now: handle 0x{:X}", window.handle),
+            Ok(window) => writeln!(
+                out,
+                "  located now: handle 0x{:X} at {},{} {}x{}{}",
+                window.handle,
+                window.bounds.x,
+                window.bounds.y,
+                window.bounds.width,
+                window.bounds.height,
+                match target {
+                    Some(bounds) if window.bounds == bounds => "  (filling the target)",
+                    Some(_) => "  (NOT on the target)",
+                    None => "",
+                }
+            ),
             Err(failure) => writeln!(out, "  located now: NO ({})", failure.message),
         };
+        let _ = writeln!(out, "  restore point held: {}", self.can_retrieve());
         let _ = writeln!(out);
 
         // The verdicts, computed exactly as Send computes them.
@@ -347,44 +367,53 @@ impl Core {
         let covering: Vec<u64> = target
             .map(|bounds| self.covering(bounds, sent).into_iter().map(|(h, _)| h).collect())
             .unwrap_or_default();
-        let blocking: Vec<u64> = target
-            .map(|bounds| self.blocking(bounds, sent).into_iter().map(|(h, _)| h).collect())
-            .unwrap_or_default();
+        let blocking: Vec<u64> = self.blocking(sent).into_iter().map(|(h, _)| h).collect();
 
         let _ = writeln!(
             out,
-            "VERDICT: {} window(s) cover the target, {} of them in front of the sent window",
-            covering.len(),
-            blocking.len()
+            "VERDICT: {} window(s) obscure the Zoom window from in front (>= {:.0}% of it)",
+            blocking.len(),
+            OBSCURING * 100.0
         );
+        let _ = writeln!(
+            out,
+            "         {} window(s) cover the target monitor (>= {:.0}% of it), which is what",
+            covering.len(),
+            COVERING * 100.0
+        );
+        let _ = writeln!(out, "         the clear-the-monitor setting would minimise");
         let _ = writeln!(out);
 
         let _ = writeln!(out, "WINDOWS, FRONT TO BACK");
         let _ = writeln!(
             out,
-            "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>6}  {:<18} {:<26} {:<24} {}",
-            "Z", "TOP", "MIN", "OWN", "MOVE", "COVER", "PROCESS", "CLASS", "BOUNDS", "TITLE"
+            "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>7} {:>7}  {:<18} {:<26} {:<24} {}",
+            "Z", "TOP", "MIN", "OWN", "MOVE", "OF-WIN", "OF-MON", "PROCESS", "CLASS", "BOUNDS",
+            "TITLE"
         );
+        let zoom_area = located.as_ref().ok().map(|window| window.bounds);
         for window in self.platform.candidate_windows() {
-            let coverage = target.map(|b| window.bounds.coverage_of(b)).unwrap_or(0.0);
+            let of_monitor = target.map(|b| window.bounds.coverage_of(b)).unwrap_or(0.0);
+            let of_window = zoom_area.map(|b| window.bounds.coverage_of(b)).unwrap_or(0.0);
             let mark = if blocking.contains(&window.handle) {
                 "BLOCKING"
             } else if covering.contains(&window.handle) {
                 "covering"
             } else if window.handle == sent {
-                "<- SENT"
+                "<- THE ZOOM WINDOW"
             } else {
                 ""
             };
             let _ = writeln!(
                 out,
-                "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>5.0}%  {:<18} {:<26} {:<24} {:?} {}",
+                "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>6.0}% {:>6.0}%  {:<18} {:<26} {:<24} {:?} {}",
                 window.z_order,
                 if window.topmost { "yes" } else { "-" },
                 if window.minimized { "yes" } else { "-" },
                 if window.own_process { "yes" } else { "-" },
                 if is_movable(&window) { "yes" } else { "-" },
-                coverage * 100.0,
+                of_window * 100.0,
+                of_monitor * 100.0,
                 window.process_name,
                 window.class_name,
                 format!(
@@ -656,6 +685,7 @@ mod tests {
     /// The full-screen media player on the target display.
     const MEDIA_WINDOW: u64 = 0x3001;
     const SHELL_WINDOW: u64 = 0x4001;
+    const PARTIAL_WINDOW: u64 = 0x4003;
     const OWN_WINDOW: u64 = 0x4002;
 
     fn window(core: &Core, handle: u64) -> WindowCandidate {
@@ -975,6 +1005,55 @@ mod tests {
 
         let mock = core.platform.as_mock().unwrap();
         assert!(!mock.is_minimized(MEDIA_WINDOW));
+    }
+
+    /// A window covering a third of the video feed is in the way, even though
+    /// it is nowhere near filling the monitor. Measuring against the display
+    /// was a proxy, and it let exactly this case through.
+    #[test]
+    fn something_obscuring_part_of_the_sent_window_still_counts() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        // Half the target display, so nowhere near the covering threshold.
+        mock.add_window(
+            PARTIAL_WINDOW,
+            "chrome.exe",
+            "Chrome_WidgetWin_1",
+            "Something in the way",
+            Bounds::new(2560, 0, 960, 1080),
+        );
+        mock.bring_to_front(PARTIAL_WINDOW);
+
+        core.send().unwrap();
+
+        assert!(
+            !core.platform.as_mock().unwrap().is_in_front_of(PARTIAL_WINDOW, VIDEO_WINDOW),
+            "half the video feed is obscured, so it has to move"
+        );
+    }
+
+    /// Something in front but barely touching it is not worth disturbing the
+    /// desktop over.
+    #[test]
+    fn a_window_barely_touching_the_sent_one_is_left_alone() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            PARTIAL_WINDOW,
+            "chrome.exe",
+            "Chrome_WidgetWin_1",
+            "Just a corner",
+            Bounds::new(2560, 0, 160, 120),
+        );
+        mock.bring_to_front(PARTIAL_WINDOW);
+
+        core.send().unwrap();
+
+        assert!(core
+            .platform
+            .as_mock()
+            .unwrap()
+            .is_in_front_of(PARTIAL_WINDOW, VIDEO_WINDOW));
     }
 
     /// Windows on other displays are none of our business, however big.
