@@ -16,14 +16,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextW, SetForegroundWindow,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP,
     HWND_TOPMOST, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -213,7 +214,7 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // out what is covering a monitor — which is exactly the window that needed
     // moving. The picker still hides them, since a window with no title cannot
     // be identified in a list.
-    if !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
+    if !IsWindowVisible(hwnd).as_bool() {
         return BOOL(1);
     }
 
@@ -246,6 +247,7 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         minimized: IsIconic(hwnd).as_bool(),
         topmost: is_topmost(hwnd),
         own_process,
+        cloaked: is_cloaked(hwnd),
         // EnumWindows walks the stacking order from the front, so the position
         // a window arrives in is its depth.
         z_order: out.len(),
@@ -472,6 +474,38 @@ impl Platform for Win32Platform {
                 return Err(PlatformError::WindowGone);
             }
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        Ok(())
+    }
+
+    /// Take the foreground, the way clicking a window does.
+    ///
+    /// Windows refuses `SetForegroundWindow` to a process that does not
+    /// already own the foreground. Attaching to the foreground thread's input
+    /// queue is the documented way round that, and pressing Send is precisely
+    /// the explicit user request the restriction exists to distinguish from an
+    /// application grabbing attention on its own.
+    fn activate(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+
+            let foreground = GetForegroundWindow();
+            let foreground_thread = GetWindowThreadProcessId(foreground, None);
+            let ours = GetCurrentThreadId();
+
+            let attached = foreground_thread != 0
+                && foreground_thread != ours
+                && AttachThreadInput(ours, foreground_thread, true).as_bool();
+
+            let _ = SetForegroundWindow(hwnd);
+            let _ = BringWindowToTop(hwnd);
+
+            if attached {
+                let _ = AttachThreadInput(ours, foreground_thread, false);
+            }
         }
         Ok(())
     }

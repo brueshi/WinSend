@@ -97,6 +97,7 @@ mod tests {
             minimized: false,
             topmost: false,
             own_process: false,
+            cloaked: false,
             z_order: 0,
         }
     }

@@ -69,6 +69,10 @@ pub struct WindowCandidate {
     /// Recorded so a window pushed aside can be put back in the band it came
     /// from, rather than assumed into the wrong one.
     pub topmost: bool,
+    /// Cloaked windows are composed by the shell but not shown. Reported so
+    /// the diagnostics can say a window exists and is being skipped, never
+    /// acted on, since it is not on screen to be in anyone's way.
+    pub cloaked: bool,
     /// True when the window belongs to WinSend itself. Never something to
     /// move, hide or offer in the picker.
     pub own_process: bool,
@@ -183,6 +187,15 @@ pub trait Platform {
 
     /// Fallback for a window that will not stay demoted.
     fn minimize(&self, handle: u64) -> Result<(), PlatformError>;
+
+    /// Give the window the foreground.
+    ///
+    /// The only lever that reaches a full-screen exclusive window. Those are
+    /// managed outside the normal stacking order, so they never appear in
+    /// `candidate_windows` and nothing done to other windows affects them —
+    /// but they give way when something else takes focus, which is exactly
+    /// what clicking another window does by hand.
+    fn activate(&self, handle: u64) -> Result<(), PlatformError>;
 
     /// Take a window off screen entirely, and put it back.
     ///

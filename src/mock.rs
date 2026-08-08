@@ -35,6 +35,8 @@ pub struct MockPlatform {
     unminimisable: RefCell<Vec<u64>>,
     /// Windows taken off screen.
     hidden: RefCell<Vec<u64>>,
+    /// Windows that were given the foreground.
+    activated: RefCell<Vec<u64>>,
 }
 
 impl Default for MockPlatform {
@@ -52,6 +54,7 @@ impl MockPlatform {
             sticky: RefCell::new(Vec::new()),
             unminimisable: RefCell::new(Vec::new()),
             hidden: RefCell::new(Vec::new()),
+            activated: RefCell::new(Vec::new()),
         }
     }
 
@@ -141,6 +144,11 @@ impl MockPlatform {
             (Some(front), Some(back)) => front < back,
             _ => false,
         }
+    }
+
+    #[cfg(test)]
+    pub fn was_activated(&self, handle: u64) -> bool {
+        self.activated.borrow().contains(&handle)
     }
 
     #[cfg(test)]
@@ -316,6 +324,7 @@ fn window(
         minimized: false,
         topmost: false,
         own_process: false,
+        cloaked: false,
         // Overwritten from the vector's order on every enumeration.
         z_order: 0,
     }
@@ -464,6 +473,19 @@ impl Platform for MockPlatform {
     /// Minimise the way Windows does, including the off-screen bounds it
     /// reports for iconic windows. Those bounds are the reason Send has to
     /// un-minimise before capturing a restore point.
+    /// Recorded rather than acted on. Activation's real effect is on the
+    /// foreground, and the thing it exists for — a full-screen exclusive
+    /// window that gives way when something else takes focus — is precisely
+    /// what a fake desktop cannot model. Pretending otherwise would give
+    /// false confidence about the one case it is there to handle.
+    fn activate(&self, handle: u64) -> Result<(), PlatformError> {
+        if !self.windows.borrow().iter().any(|w| w.handle == handle) {
+            return Err(PlatformError::WindowGone);
+        }
+        self.activated.borrow_mut().push(handle);
+        Ok(())
+    }
+
     fn hide(&self, handle: u64) -> Result<(), PlatformError> {
         if !self.windows.borrow().iter().any(|w| w.handle == handle) {
             return Err(PlatformError::WindowGone);

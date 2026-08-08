@@ -71,6 +71,7 @@ const SHELL_CLASSES: &[&str] = &[
 fn is_movable(window: &WindowCandidate) -> bool {
     !window.own_process
         && !window.minimized
+        && !window.cloaked
         && window.bounds.width > 0
         && window.bounds.height > 0
         && !SHELL_CLASSES
@@ -387,9 +388,9 @@ impl Core {
         let _ = writeln!(out, "WINDOWS, FRONT TO BACK");
         let _ = writeln!(
             out,
-            "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>7} {:>7}  {:<18} {:<26} {:<24} {}",
-            "Z", "TOP", "MIN", "OWN", "MOVE", "OF-WIN", "OF-MON", "PROCESS", "CLASS", "BOUNDS",
-            "TITLE"
+            "  {:>3} {:<5} {:<5} {:<5} {:<5} {:<5} {:>7} {:>7}  {:<18} {:<26} {:<24} {}",
+            "Z", "TOP", "MIN", "CLOAK", "OWN", "MOVE", "OF-WIN", "OF-MON", "PROCESS", "CLASS",
+            "BOUNDS", "TITLE"
         );
         let zoom_area = located.as_ref().ok().map(|window| window.bounds);
         for window in self.platform.candidate_windows() {
@@ -406,10 +407,11 @@ impl Core {
             };
             let _ = writeln!(
                 out,
-                "  {:>3} {:<5} {:<5} {:<5} {:<5} {:>6.0}% {:>6.0}%  {:<18} {:<26} {:<24} {:?} {}",
+                "  {:>3} {:<5} {:<5} {:<5} {:<5} {:<5} {:>6.0}% {:>6.0}%  {:<18} {:<26} {:<24} {:?} {}",
                 window.z_order,
                 if window.topmost { "yes" } else { "-" },
                 if window.minimized { "yes" } else { "-" },
+                if window.cloaked { "yes" } else { "-" },
                 if window.own_process { "yes" } else { "-" },
                 if is_movable(&window) { "yes" } else { "-" },
                 of_window * 100.0,
@@ -445,7 +447,9 @@ impl Core {
         self.platform
             .candidate_windows()
             .into_iter()
-            .filter(|window| !window.title.is_empty() && !window.own_process)
+            .filter(|window| {
+                !window.title.is_empty() && !window.own_process && !window.cloaked
+            })
             .collect()
     }
 
@@ -615,6 +619,14 @@ impl Core {
                 },
             )
             .map_err(|e| Failure::plain(format!("Could not move the window: {e}")))?;
+
+        // Taking the foreground is the one lever that reaches a full-screen
+        // exclusive window: it is managed outside the stacking order, never
+        // appears in the window list, and gives way only when something else
+        // is activated — which is exactly what clicking another window does by
+        // hand. Failure here is not worth reporting, since the window has
+        // already moved and Windows may simply have declined the focus change.
+        let _ = self.platform.activate(window.handle);
 
         // Only after the move has succeeded. Pushing another application's
         // window aside for a Send that then failed would be interference with
@@ -1005,6 +1017,20 @@ mod tests {
 
         let mock = core.platform.as_mock().unwrap();
         assert!(!mock.is_minimized(MEDIA_WINDOW));
+    }
+
+    /// The only lever that reaches a full-screen exclusive window, which never
+    /// appears in the window list at all and so cannot be pushed aside.
+    #[test]
+    fn send_takes_the_foreground() {
+        let mut core = core_with_confirmed_video_window();
+
+        core.send().unwrap();
+
+        assert!(
+            core.platform.as_mock().unwrap().was_activated(VIDEO_WINDOW),
+            "an exclusive full-screen window gives way to focus and nothing else"
+        );
     }
 
     /// A window covering a third of the video feed is in the way, even though
