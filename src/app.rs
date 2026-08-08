@@ -550,15 +550,23 @@ impl WinSendApp {
         ui.separator();
         ui.add_space(6.0);
         if ui
-            .button(egui::RichText::new("Write diagnostics report").size(11.0))
+            .button(egui::RichText::new("Copy diagnostics").size(11.0))
             .on_hover_text(
-                "Saves what WinSend can currently see — every window, which monitor it covers, \
-                 and which ones it considers to be in the way — next to the config file.",
+                "Copies what WinSend can currently see — every window, which monitor it covers, \
+                 and which ones it considers to be in the way — ready to paste. Also saved next \
+                 to the config file.",
             )
             .clicked()
         {
-            let outcome = self.core.save_diagnostics();
-            self.report(ctx, outcome);
+            // The clipboard first, because the file lands in AppData, which
+            // Explorer hides by default. A report nobody can find is a report
+            // that may as well not exist.
+            ctx.copy_text(self.core.diagnostics());
+            let saved = self.core.save_diagnostics();
+            self.report(
+                ctx,
+                saved.map(|where_to| format!("Copied to the clipboard. {where_to}")),
+            );
         }
 
         self.status_bar(ui);
