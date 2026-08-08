@@ -323,7 +323,9 @@ fn main() {
             "{:>3}  {:<7}  {:<7}  {:<14}  {:<24}  {:<16}  {}",
             "#", "TOPMOST", "STATE", "MONITOR", "BOUNDS", "PROCESS", "TITLE"
         );
-        for (index, window) in visible.iter().enumerate() {
+        let on_screen: Vec<&WindowInfo> =
+            all.iter().filter(|w| w.visible && !w.cloaked).collect();
+        for (index, window) in on_screen.iter().enumerate() {
             let RECT { left, top, right, bottom } = window.rect;
             let state = if window.minimized {
                 "min"
@@ -338,7 +340,10 @@ fn main() {
                 window.monitor,
                 format!("{},{} {}x{}", left, top, right - left, bottom - top),
                 window.process_name(),
-                window.title,
+                // Untitled windows are listed rather than skipped: a
+                // full-screen video output window usually has no caption, and
+                // it is exactly the one worth finding here.
+                if window.title.is_empty() { "<untitled>" } else { &window.title },
             );
         }
         println!();

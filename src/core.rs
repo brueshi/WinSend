@@ -62,6 +62,8 @@ struct Displaced {
     demoted: bool,
     /// Minimised, because demoting alone did not move it.
     minimized: bool,
+    /// Taken off screen, because it would not minimise either.
+    hidden: bool,
 }
 
 pub struct Core {
@@ -179,11 +181,32 @@ impl Core {
                         was_topmost,
                         demoted: false,
                         minimized: true,
+                        hidden: false,
                     });
                 }
             }
+
+            // A borderless full-screen popup often has no minimise behaviour,
+            // so the call above can report success and change nothing. Whatever
+            // is still covering the monitor is taken off screen instead.
+            for (handle, was_topmost) in self.covering(monitor, sent) {
+                if self.platform.hide(handle).is_err() {
+                    continue;
+                }
+                match displaced.iter_mut().find(|d| d.handle == handle) {
+                    Some(already) => already.hidden = true,
+                    None => displaced.push(Displaced {
+                        handle,
+                        was_topmost,
+                        demoted: false,
+                        minimized: false,
+                        hidden: true,
+                    }),
+                }
+            }
+
             self.displaced = displaced;
-            return self.blocking(monitor, sent).len();
+            return self.covering(monitor, sent).len();
         }
 
         for (handle, was_topmost) in self.blocking(monitor, sent) {
@@ -193,6 +216,7 @@ impl Core {
                     was_topmost,
                     demoted: true,
                     minimized: false,
+                    hidden: false,
                 });
             }
         }
@@ -210,6 +234,7 @@ impl Core {
                     was_topmost,
                     demoted: false,
                     minimized: true,
+                    hidden: false,
                 }),
             }
         }
@@ -222,6 +247,9 @@ impl Core {
     /// on top ends up on top again.
     fn put_back_displaced(&mut self) {
         for window in std::mem::take(&mut self.displaced).into_iter().rev() {
+            if window.hidden {
+                let _ = self.platform.show(window.handle);
+            }
             if window.minimized {
                 let _ = self.platform.unminimize(window.handle);
             }
@@ -239,13 +267,26 @@ impl Core {
         self.platform.monitors()
     }
 
+    /// Windows a person could actually recognise and confirm.
+    ///
+    /// Untitled windows are excluded here rather than during enumeration.
+    /// They matter enormously for working out what is covering a monitor — a
+    /// full-screen video output window typically has no title — but they
+    /// cannot be picked from a list or matched against a saved identity.
+    fn identifiable(&self) -> Vec<WindowCandidate> {
+        self.platform
+            .candidate_windows()
+            .into_iter()
+            .filter(|window| !window.title.is_empty())
+            .collect()
+    }
+
     /// Picker contents, with the Zoom-ish windows first so the likely target is
     /// near the top without anything being hidden. Minimised windows are left
     /// out: they cannot be identified visually and their bounds are nonsense.
     pub fn candidates(&self) -> Vec<WindowCandidate> {
         let mut candidates: Vec<WindowCandidate> = self
-            .platform
-            .candidate_windows()
+            .identifiable()
             .into_iter()
             .filter(|c| !c.minimized)
             .collect();
@@ -296,7 +337,7 @@ impl Core {
             Failure::needs_selection("No Zoom window confirmed yet. Pick the video window.")
         })?;
 
-        let candidates = self.platform.candidate_windows();
+        let candidates = self.identifiable();
 
         // The window the user clicked, if it is still around and still matches
         // what they picked. This is what makes Zoom's identical main and video
@@ -628,6 +669,61 @@ mod tests {
         core.retrieve().unwrap();
 
         assert!(!core.platform.as_mock().unwrap().is_topmost(MEDIA_WINDOW));
+    }
+
+    /// The regression that made four attempts at the z-order problem all fail
+    /// the same silent way: the window that needed moving has no title, so
+    /// anything filtering on having one never saw it.
+    #[test]
+    fn an_untitled_full_screen_window_is_still_found_and_moved() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        assert_eq!(
+            mock.title_of(MEDIA_WINDOW),
+            "",
+            "the fixture must model the untitled output window"
+        );
+        mock.bring_to_front(MEDIA_WINDOW);
+
+        core.send().unwrap();
+
+        assert!(
+            !core.platform.as_mock().unwrap().is_in_front_of(MEDIA_WINDOW, VIDEO_WINDOW),
+            "an untitled window is still a window that is in the way"
+        );
+    }
+
+    /// It has to be enumerated, and it still cannot be offered to a person who
+    /// would have nothing to recognise it by.
+    #[test]
+    fn an_untitled_window_stays_out_of_the_picker() {
+        let core = core_with_confirmed_video_window();
+        assert!(core.candidates().iter().all(|c| c.handle != MEDIA_WINDOW));
+    }
+
+    /// A borderless popup can report a successful minimise and not move.
+    #[test]
+    fn clearing_the_target_hides_what_will_not_minimise() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.clear_target = true;
+        core.platform.as_mock().unwrap().set_unminimisable(MEDIA_WINDOW);
+
+        let message = core.send().unwrap();
+
+        assert!(!message.contains("will not move"), "got: {message}");
+        assert!(core.platform.as_mock().unwrap().is_hidden(MEDIA_WINDOW));
+    }
+
+    #[test]
+    fn a_hidden_window_comes_back_on_retrieve() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.clear_target = true;
+        core.platform.as_mock().unwrap().set_unminimisable(MEDIA_WINDOW);
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        assert!(!core.platform.as_mock().unwrap().is_hidden(MEDIA_WINDOW));
     }
 
     /// The escape hatch, for when working out what is in the way keeps being

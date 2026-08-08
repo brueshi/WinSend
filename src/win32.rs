@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP,
     HWND_TOPMOST, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
+    SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
     WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
@@ -202,9 +202,16 @@ unsafe fn is_cloaked(hwnd: HWND) -> bool {
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let out = &mut *(lparam.0 as *mut Vec<WindowCandidate>);
 
-    // Cloaked windows are not really on screen. Minimised ones are still
-    // reported, flagged, so the confirmed window can be found and restored
-    // rather than looking like it vanished; the picker filters them out.
+    // Cloaked windows are not really on screen. Everything else is reported
+    // and flagged, and the filtering happens above this layer, because
+    // different callers want different subsets.
+    //
+    // Untitled windows in particular must be here. A media player putting
+    // video on a second display does it with a bare popup that has no caption
+    // text at all, and dropping those made it invisible to the code that works
+    // out what is covering a monitor — which is exactly the window that needed
+    // moving. The picker still hides them, since a window with no title cannot
+    // be identified in a list.
     if !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
         return BOOL(1);
     }
@@ -212,9 +219,6 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let mut title_buffer = [0u16; 512];
     let title_len = GetWindowTextW(hwnd, &mut title_buffer);
     let title = wide_to_string(&title_buffer[..title_len.max(0) as usize]);
-    if title.is_empty() {
-        return BOOL(1);
-    }
 
     let mut class_buffer = [0u16; 256];
     let class_len = GetClassNameW(hwnd, &mut class_buffer);
@@ -465,6 +469,28 @@ impl Platform for Win32Platform {
                 return Err(PlatformError::WindowGone);
             }
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        Ok(())
+    }
+
+    fn hide(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        Ok(())
+    }
+
+    fn show(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+            let _ = ShowWindow(hwnd, SW_SHOW);
         }
         Ok(())
     }

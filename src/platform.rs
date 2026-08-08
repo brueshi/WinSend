@@ -178,8 +178,19 @@ pub trait Platform {
     /// leave it pinned over everything the user owns.
     fn raise(&self, handle: u64, topmost: bool) -> Result<(), PlatformError>;
 
-    /// Last resort for a window that will not stay demoted.
+    /// Fallback for a window that will not stay demoted.
     fn minimize(&self, handle: u64) -> Result<(), PlatformError>;
+
+    /// Take a window off screen entirely, and put it back.
+    ///
+    /// The genuine last resort. A borderless full-screen popup often has no
+    /// minimise behaviour at all, so `minimize` can report success and leave it
+    /// exactly where it was. Only reached when the user has explicitly asked
+    /// for the monitor to be cleared, because hiding another application's
+    /// window is more than it is reasonable to do uninvited.
+    fn hide(&self, handle: u64) -> Result<(), PlatformError>;
+
+    fn show(&self, handle: u64) -> Result<(), PlatformError>;
 
     /// Escape hatch for the mock-only debug controls. Absent from Windows
     /// builds entirely, so it cannot leak into the shipped binary.

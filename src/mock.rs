@@ -30,6 +30,11 @@ pub struct MockPlatform {
     pre_minimize: RefCell<HashMap<u64, Bounds>>,
     /// Windows that ignore being demoted.
     sticky: RefCell<Vec<u64>>,
+    /// Windows that ignore being minimised, the way a borderless popup with no
+    /// minimise behaviour does.
+    unminimisable: RefCell<Vec<u64>>,
+    /// Windows taken off screen.
+    hidden: RefCell<Vec<u64>>,
 }
 
 impl Default for MockPlatform {
@@ -45,6 +50,8 @@ impl MockPlatform {
             zoom_present: RefCell::new(true),
             pre_minimize: RefCell::new(HashMap::new()),
             sticky: RefCell::new(Vec::new()),
+            unminimisable: RefCell::new(Vec::new()),
+            hidden: RefCell::new(Vec::new()),
         }
     }
 
@@ -77,6 +84,39 @@ impl MockPlatform {
     #[cfg(test)]
     pub fn set_sticky(&self, handle: u64) {
         self.sticky.borrow_mut().push(handle);
+    }
+
+    /// Make a window ignore being minimised, the way a borderless popup does,
+    /// so the hide fallback can be exercised.
+    #[cfg(test)]
+    pub fn set_unminimisable(&self, handle: u64) {
+        self.unminimisable.borrow_mut().push(handle);
+    }
+
+    #[cfg(test)]
+    pub fn title_of(&self, handle: u64) -> String {
+        self.windows
+            .borrow()
+            .iter()
+            .find(|w| w.handle == handle)
+            .map(|w| w.title.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `front` sits above `back` in the stacking order.
+    #[cfg(test)]
+    pub fn is_in_front_of(&self, front: u64, back: u64) -> bool {
+        let windows = self.windows.borrow();
+        let at = |handle| windows.iter().position(|w| w.handle == handle);
+        match (at(front), at(back)) {
+            (Some(front), Some(back)) => front < back,
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_hidden(&self, handle: u64) -> bool {
+        self.hidden.borrow().contains(&handle)
     }
 
     /// Move a window to one end of the stacking order.
@@ -294,16 +334,16 @@ fn default_windows() -> Vec<WindowCandidate> {
             r"\\.\DISPLAY1",
             false,
         ),
-        // A media player filling the second display. This is the situation that
-        // makes Send look like it did nothing: full-screen players hold
-        // themselves always-on-top, so the sent window lands in the same band
-        // and behind. Tests turn that flag on, since it is a state the player
-        // enters rather than one it always has.
+        // A media player's full-screen output filling the second display, and
+        // deliberately untitled. This is what makes Send look like it did
+        // nothing: the window that has to move is a bare popup with no caption
+        // text, so anything that filtered on having a title never saw it at
+        // all. It must be enumerated and must stay out of the picker.
         window(
             0x3001,
             "vlc.exe",
             "Qt5152QWindowIcon",
-            "Broadcast roll-in - VLC media player",
+            "",
             Bounds::new(2560, 0, 1920, 1080),
             r"\\.\DISPLAY2",
             false,
@@ -349,6 +389,7 @@ impl Platform for MockPlatform {
             .borrow()
             .iter()
             .filter(|w| present || w.process_name != "Zoom.exe")
+            .filter(|w| !self.hidden.borrow().contains(&w.handle))
             .enumerate()
             .map(|(depth, window)| WindowCandidate { z_order: depth, ..window.clone() })
             .collect()
@@ -393,7 +434,25 @@ impl Platform for MockPlatform {
     /// Minimise the way Windows does, including the off-screen bounds it
     /// reports for iconic windows. Those bounds are the reason Send has to
     /// un-minimise before capturing a restore point.
+    fn hide(&self, handle: u64) -> Result<(), PlatformError> {
+        if !self.windows.borrow().iter().any(|w| w.handle == handle) {
+            return Err(PlatformError::WindowGone);
+        }
+        self.hidden.borrow_mut().push(handle);
+        Ok(())
+    }
+
+    fn show(&self, handle: u64) -> Result<(), PlatformError> {
+        self.hidden.borrow_mut().retain(|hidden| *hidden != handle);
+        Ok(())
+    }
+
     fn minimize(&self, handle: u64) -> Result<(), PlatformError> {
+        if self.unminimisable.borrow().contains(&handle) {
+            // Reports success and stays exactly where it was, which is the
+            // failure mode the hide fallback exists for.
+            return Ok(());
+        }
         let mut windows = self.windows.borrow_mut();
         let window = windows
             .iter_mut()
