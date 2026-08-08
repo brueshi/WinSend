@@ -37,6 +37,14 @@ pub struct MockPlatform {
     hidden: RefCell<Vec<u64>>,
     /// Windows that were given the foreground.
     activated: RefCell<Vec<u64>>,
+    /// Windows owning a display exclusively.
+    ///
+    /// Models what Windows does with a full-screen exclusive window: while it
+    /// owns the screen it is not in the window list at all, and it minimises
+    /// itself the moment something else takes the foreground. Both halves
+    /// matter — the first is why nothing could ever be found to push aside,
+    /// the second is the only trace it leaves behind.
+    exclusive: RefCell<Vec<u64>>,
 }
 
 impl Default for MockPlatform {
@@ -55,6 +63,7 @@ impl MockPlatform {
             unminimisable: RefCell::new(Vec::new()),
             hidden: RefCell::new(Vec::new()),
             activated: RefCell::new(Vec::new()),
+            exclusive: RefCell::new(Vec::new()),
         }
     }
 
@@ -144,6 +153,13 @@ impl MockPlatform {
             (Some(front), Some(back)) => front < back,
             _ => false,
         }
+    }
+
+    /// Give a window the screen exclusively, the way a full-screen media
+    /// player does.
+    #[cfg(test)]
+    pub fn set_exclusive(&self, handle: u64) {
+        self.exclusive.borrow_mut().push(handle);
     }
 
     #[cfg(test)]
@@ -429,6 +445,9 @@ impl Platform for MockPlatform {
             .iter()
             .filter(|w| present || w.process_name != "Zoom.exe")
             .filter(|w| !self.hidden.borrow().contains(&w.handle))
+            // Owning a screen exclusively keeps it out of the window list
+            // entirely, until it minimises and rejoins the ordinary world.
+            .filter(|w| w.minimized || !self.exclusive.borrow().contains(&w.handle))
             .enumerate()
             .map(|(depth, window)| WindowCandidate { z_order: depth, ..window.clone() })
             .collect()
@@ -483,6 +502,19 @@ impl Platform for MockPlatform {
             return Err(PlatformError::WindowGone);
         }
         self.activated.borrow_mut().push(handle);
+
+        // Anything owning a screen exclusively gives it up the moment
+        // something else is focused, and minimises itself doing so.
+        let surrendering: Vec<u64> = self
+            .exclusive
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|owner| *owner != handle)
+            .collect();
+        for owner in surrendering {
+            let _ = self.minimize(owner);
+        }
         Ok(())
     }
 

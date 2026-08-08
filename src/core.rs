@@ -107,6 +107,10 @@ struct Displaced {
     minimized: bool,
     /// Taken off screen, because it would not minimise either.
     hidden: bool,
+    /// Give it the foreground again when putting it back. A window that
+    /// minimised itself on losing focus needs focus to come back, which is
+    /// what clicking it in the taskbar does by hand.
+    refocus: bool,
 }
 
 pub struct Core {
@@ -222,6 +226,7 @@ impl Core {
                         demoted: false,
                         minimized: true,
                         hidden: false,
+                        refocus: false,
                     });
                 }
             }
@@ -241,11 +246,14 @@ impl Core {
                         demoted: false,
                         minimized: false,
                         hidden: true,
+                        refocus: false,
                     }),
                 }
             }
 
-            self.displaced = displaced;
+            for entry in displaced {
+                self.record_displaced(entry);
+            }
             return self.covering(monitor, sent).len();
         }
 
@@ -257,6 +265,7 @@ impl Core {
                     demoted: true,
                     minimized: false,
                     hidden: false,
+                    refocus: false,
                 });
             }
         }
@@ -275,12 +284,36 @@ impl Core {
                     demoted: false,
                     minimized: true,
                     hidden: false,
+                    refocus: false,
                 }),
             }
         }
 
-        self.displaced = displaced;
+        for entry in displaced {
+            self.record_displaced(entry);
+        }
         self.blocking(sent).len()
+    }
+
+    /// Record a window as moved aside, unless it already is.
+    ///
+    /// Pressing Send twice must not lose track of what the first press moved,
+    /// which would leave it stranded with nothing to put it back.
+    fn record_displaced(&mut self, entry: Displaced) {
+        if self.displaced.iter().any(|held| held.handle == entry.handle) {
+            return;
+        }
+        self.displaced.push(entry);
+    }
+
+    /// Handles of everything currently minimised.
+    fn minimised_now(&self) -> Vec<u64> {
+        self.platform
+            .candidate_windows()
+            .into_iter()
+            .filter(|window| window.minimized)
+            .map(|window| window.handle)
+            .collect()
     }
 
     /// Put back everything moved aside, in reverse order so the window that was
@@ -295,6 +328,9 @@ impl Core {
             }
             if window.demoted {
                 let _ = self.platform.raise(window.handle, window.was_topmost);
+            }
+            if window.refocus {
+                let _ = self.platform.activate(window.handle);
             }
         }
     }
@@ -607,6 +643,34 @@ impl Core {
             None
         };
 
+        // Focus first, geometry last. Taking the foreground is the one lever
+        // that reaches a full-screen exclusive window — it is managed outside
+        // the stacking order, never appears in the window list, and gives way
+        // only when something else is activated, which is exactly what
+        // clicking another window does by hand. Doing it after positioning
+        // meant anything the application re-arranged on being focused happened
+        // after the size had been set, and undid it.
+        let minimised_before = self.minimised_now();
+        let _ = self.platform.activate(window.handle);
+
+        // A full-screen exclusive window minimises itself rather than being
+        // pushed aside, and that is the only trace it leaves: it was not in the
+        // window list at all, and now it is there and minimised. Without
+        // noticing, Retrieve has nothing to put back and it stays in the
+        // taskbar until someone clicks it.
+        for handle in self.minimised_now() {
+            if handle != window.handle && !minimised_before.contains(&handle) {
+                self.record_displaced(Displaced {
+                    handle,
+                    was_topmost: false,
+                    demoted: false,
+                    minimized: true,
+                    hidden: false,
+                    refocus: true,
+                });
+            }
+        }
+
         self.platform
             .place_window(
                 window.handle,
@@ -619,14 +683,6 @@ impl Core {
                 },
             )
             .map_err(|e| Failure::plain(format!("Could not move the window: {e}")))?;
-
-        // Taking the foreground is the one lever that reaches a full-screen
-        // exclusive window: it is managed outside the stacking order, never
-        // appears in the window list, and gives way only when something else
-        // is activated — which is exactly what clicking another window does by
-        // hand. Failure here is not worth reporting, since the window has
-        // already moved and Windows may simply have declined the focus change.
-        let _ = self.platform.activate(window.handle);
 
         // Only after the move has succeeded. Pushing another application's
         // window aside for a Send that then failed would be interference with
@@ -698,6 +754,8 @@ mod tests {
     const MEDIA_WINDOW: u64 = 0x3001;
     const SHELL_WINDOW: u64 = 0x4001;
     const PARTIAL_WINDOW: u64 = 0x4003;
+    /// A media player owning the second display exclusively.
+    const EXCLUSIVE_WINDOW: u64 = 0x5001;
     const OWN_WINDOW: u64 = 0x4002;
 
     fn window(core: &Core, handle: u64) -> WindowCandidate {
@@ -1017,6 +1075,66 @@ mod tests {
 
         let mock = core.platform.as_mock().unwrap();
         assert!(!mock.is_minimized(MEDIA_WINDOW));
+    }
+
+    /// The whole shape of the real problem, end to end: a window that owns the
+    /// display exclusively, is absent from the window list entirely, minimises
+    /// itself when something else takes focus, and has to be given focus back.
+    #[test]
+    fn a_full_screen_exclusive_window_is_noticed_and_put_back() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "wmplayer.exe",
+            "WMPlayerApp",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+
+        // Nothing can push aside a window that is not there to be found. This
+        // is why six attempts at rearranging the stacking order changed
+        // nothing at all.
+        assert!(
+            core.candidates().iter().all(|c| c.handle != EXCLUSIVE_WINDOW),
+            "it is invisible to enumeration while it owns the screen"
+        );
+
+        core.send().unwrap();
+        assert!(
+            core.platform.as_mock().unwrap().is_minimized(EXCLUSIVE_WINDOW),
+            "taking the foreground is what moves it"
+        );
+
+        core.retrieve().unwrap();
+        let mock = core.platform.as_mock().unwrap();
+        assert!(!mock.is_minimized(EXCLUSIVE_WINDOW), "it must come back");
+        assert!(
+            mock.was_activated(EXCLUSIVE_WINDOW),
+            "it needs the foreground back, which is what clicking the taskbar does"
+        );
+    }
+
+    /// Pressing Send twice must not lose what the first press moved aside.
+    #[test]
+    fn a_second_send_does_not_forget_the_first() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "wmplayer.exe",
+            "WMPlayerApp",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+
+        core.send().unwrap();
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        assert!(!core.platform.as_mock().unwrap().is_minimized(EXCLUSIVE_WINDOW));
     }
 
     /// The only lever that reaches a full-screen exclusive window, which never
