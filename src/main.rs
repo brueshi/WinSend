@@ -57,11 +57,11 @@ fn main() -> eframe::Result {
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("WinSend")
-        .with_inner_size([340.0, 260.0])
+        .with_inner_size([app::DEFAULT_WIDTH, app::COMPACT_HEIGHT])
         .with_min_inner_size([300.0, 200.0])
-        // Explicit rather than relying on the default: the window is resized
-        // programmatically when the picker opens, and a non-resizable window
-        // would leave the user stuck with whatever size it chose.
+        // Explicit rather than relying on the default: disclosing the
+        // configuration grows the window, and a non-resizable window would
+        // leave the user stuck with whatever height that chose.
         .with_resizable(true)
         .with_always_on_top()
         .with_icon(window_icon());

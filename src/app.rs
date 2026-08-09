@@ -9,17 +9,38 @@ use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::WindowCandidate;
 use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
 
-/// The utility sits on screen during a broadcast, so it stays small — except
-/// while picking a window, where showing only two entries would force scrolling
-/// through a list the user is trying to compare visually.
-const COMPACT_SIZE: egui::Vec2 = egui::vec2(340.0, 260.0);
-/// Tall enough to compare several candidates without scrolling. The user can
-/// still resize from here; this is only the starting size.
+/// The height of the surface with the configuration folded away.
+///
+/// This is the shape that matters: it sits on screen during a broadcast, so it
+/// stays as small as two large buttons and a line of status allow.
+pub const COMPACT_HEIGHT: f32 = 260.0 + MOCK_CONTROLS_HEIGHT;
+
+/// Room for the mock-only debug controls, where they are compiled in.
+///
+/// They are real content and need real room, but adding it unconditionally
+/// would make the window that sits over a live broadcast taller for the sake of
+/// controls that never ship. Without it the disclosure falls below the fold on
+/// macOS, which is the one machine the interface is developed on.
+#[cfg(windows)]
+const MOCK_CONTROLS_HEIGHT: f32 = 0.0;
+#[cfg(not(windows))]
+const MOCK_CONTROLS_HEIGHT: f32 = 56.0;
+/// The height with the configuration disclosed. The window grows to this and
+/// shrinks back, and only ever because the user asked it to — which is the
+/// whole difference between a response and a surprise.
+const EXPANDED_HEIGHT: f32 = 690.0 + MOCK_CONTROLS_HEIGHT;
+/// The width the window opens at, and what a resize falls back to when the
+/// current width cannot be read.
+pub const DEFAULT_WIDTH: f32 = 340.0;
+
+/// The picker's own window.
+///
+/// It needs room to compare thumbnails, and the surface it opens from is a
+/// quarter of that tall, so it cannot be a panel inside it: an `egui::Window`
+/// would be clamped to a viewport far smaller than the content. A viewport of
+/// its own is sized on its own terms and leaves the surface behind it alone.
 const PICKER_SIZE: egui::Vec2 = egui::vec2(460.0, 640.0);
-/// Settings outgrew the compact height once hotkeys were added. It is a
-/// transient screen rather than the one that sits over a broadcast, so it can
-/// afford the room.
-const SETTINGS_SIZE: egui::Vec2 = egui::vec2(360.0, 470.0);
+const PICKER_VIEWPORT: &str = "winsend-picker";
 
 /// Closing hides to the tray only where there is a tray to hide to. On macOS
 /// the notification area does not exist and the mock has no icon to click, so
@@ -40,23 +61,6 @@ const OK: egui::Color32 = egui::Color32::from_rgb(102, 187, 122);
 const ERR: egui::Color32 = egui::Color32::from_rgb(226, 106, 106);
 const SUBDUED: egui::Color32 = egui::Color32::from_gray(150);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Screen {
-    Main,
-    Settings,
-    SelectWindow,
-}
-
-impl Screen {
-    fn size(self) -> egui::Vec2 {
-        match self {
-            Screen::Main => COMPACT_SIZE,
-            Screen::Settings => SETTINGS_SIZE,
-            Screen::SelectWindow => PICKER_SIZE,
-        }
-    }
-}
-
 enum Status {
     Idle,
     Ok(String),
@@ -66,9 +70,13 @@ enum Status {
 pub struct WinSendApp {
     core: Core,
     shell: Box<dyn Shell>,
-    screen: Screen,
+    /// Whether the configuration section is disclosed. The one thing that
+    /// changes the window's size, and only when clicked.
+    configuring: bool,
+    /// Whether the picker's viewport is open.
+    picking: bool,
     status: Status,
-    /// Picker contents, snapshotted when the screen opens so the list does not
+    /// Picker contents, snapshotted when it opens so the list does not
     /// reshuffle under the cursor while the user is reading it.
     candidates: Vec<WindowCandidate>,
     thumbnails: HashMap<u64, egui::TextureHandle>,
@@ -100,7 +108,8 @@ impl WinSendApp {
         let mut app = Self {
             core,
             shell,
-            screen: Screen::Main,
+            configuring: false,
+            picking: false,
             status: Status::Idle,
             candidates: Vec::new(),
             thumbnails: HashMap::new(),
@@ -110,11 +119,11 @@ impl WinSendApp {
             quitting: false,
         };
 
-        // Debug builds only: open straight onto a screen so it can be inspected
-        // without clicking through. Compiled out of release entirely.
+        // Debug builds only: open straight onto a section so it can be
+        // inspected without clicking through. Compiled out of release entirely.
         #[cfg(debug_assertions)]
         match std::env::var("WINSEND_SCREEN").as_deref() {
-            Ok("settings") => app.go_to(&cc.egui_ctx, Screen::Settings),
+            Ok("settings") => app.set_configuring(&cc.egui_ctx, true),
             Ok("select") => app.open_picker(&cc.egui_ctx),
             _ => {}
         }
@@ -164,7 +173,7 @@ impl WinSendApp {
             // way to get the window back rather than only a way to lose it.
             ShellEvent::ShowWindow => self.set_hidden(ctx, !self.hidden),
             ShellEvent::ShowSettings => {
-                self.go_to(ctx, Screen::Settings);
+                self.set_configuring(ctx, true);
                 self.set_hidden(ctx, false);
             }
             // The only path that actually exits. Everything else, including
@@ -272,7 +281,36 @@ impl WinSendApp {
         }
     }
 
+    /// Disclose or fold away the configuration, growing and shrinking the
+    /// window to suit.
+    ///
+    /// Only the height moves. The width is whatever the window currently is,
+    /// so a user who has widened it keeps that; clobbering it here would be the
+    /// same unasked-for resize this replaced.
+    fn set_configuring(&mut self, ctx: &egui::Context, configuring: bool) {
+        if self.configuring == configuring {
+            return;
+        }
+        self.configuring = configuring;
+
+        // Folding the configuration away takes the hotkey rows with it, so any
+        // capture in progress has to end properly rather than just stop. Ending
+        // it is what re-registers the bindings that `start_capture` dropped —
+        // without that, walking away mid-capture leaves every hotkey dead until
+        // something else happens to re-apply them.
+        if !configuring {
+            self.end_capture();
+        }
+
+        let width = ctx
+            .input(|input| input.viewport().inner_rect.map(|rect| rect.width()))
+            .unwrap_or(DEFAULT_WIDTH);
+        let height = if configuring { EXPANDED_HEIGHT } else { COMPACT_HEIGHT };
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
+    }
+
     fn open_picker(&mut self, ctx: &egui::Context) {
+        self.picking = true;
         self.candidates = self.core.candidates();
         self.thumbnails.clear();
         for candidate in &self.candidates {
@@ -289,22 +327,12 @@ impl WinSendApp {
                 self.thumbnails.insert(candidate.handle, texture);
             }
         }
-        self.go_to(ctx, Screen::SelectWindow);
     }
 
-    fn leave_picker(&mut self, ctx: &egui::Context, to: Screen) {
+    fn close_picker(&mut self) {
+        self.picking = false;
         self.thumbnails.clear();
         self.candidates.clear();
-        self.go_to(ctx, to);
-    }
-
-    /// Switch screens and resize to suit. Also ends any capture in progress,
-    /// so a half-finished binding cannot keep swallowing keys from a screen
-    /// that has no way to finish it.
-    fn go_to(&mut self, ctx: &egui::Context, screen: Screen) {
-        self.capturing = None;
-        self.screen = screen;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(screen.size()));
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -320,7 +348,10 @@ impl WinSendApp {
         ui.label(egui::RichText::new(text).color(colour).size(11.5));
     }
 
-    fn main_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The whole interface: the live controls, then the configuration when it
+    /// has been asked for. One surface, so nothing is ever a screen away and
+    /// nothing resizes unbidden.
+    fn surface(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // No in-app title: the OS title bar already carries the app name, and
         // vertical space is scarce in a window this small.
         let target = self
@@ -330,26 +361,11 @@ impl WinSendApp {
             .map(|m| m.label())
             .unwrap_or_else(|| "no target monitor selected".to_string());
 
-        let mut opening_settings = false;
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Target: {target}"))
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(150)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(egui::RichText::new("Settings").size(11.0))
-                    .clicked()
-                {
-                    opening_settings = true;
-                }
-            });
-        });
-        if opening_settings {
-            self.go_to(ctx, Screen::Settings);
-            return;
-        }
+        ui.label(
+            egui::RichText::new(format!("Target: {target}"))
+                .size(11.0)
+                .color(egui::Color32::from_gray(150)),
+        );
 
         ui.add_space(12.0);
 
@@ -448,22 +464,41 @@ impl WinSendApp {
                 }
             }
         }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(2.0);
+
+        // egui's own header rather than a button with a caret in its label:
+        // it paints the triangle with the painter, where a glyph like U+25BE
+        // falls outside the bundled fonts and comes out as a missing-glyph box.
+        //
+        // Driven from `configuring` rather than from egui's remembered state,
+        // because the same flag has to be settable from the tray's Settings
+        // item and is what decides the window's height.
+        let disclosure = egui::CollapsingHeader::new(
+            egui::RichText::new("Settings").size(12.0).strong(),
+        )
+        .open(Some(self.configuring))
+        .show(ui, |ui| {
+            // Scrollable as a safety net rather than as the plan. The window
+            // grows to fit this, but it is user-resizable, and configuration
+            // clipped with no way to reach it would be worse than a scrollbar
+            // nobody needs.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| self.configuration(ui, ctx));
+        });
+
+        if disclosure.header_response.clicked() {
+            self.set_configuring(ctx, !self.configuring);
+        }
     }
 
-    fn settings_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mut going_back = false;
-        ui.horizontal(|ui| {
-            if ui.button(egui::RichText::new("Back").size(11.0)).clicked() {
-                going_back = true;
-            }
-            ui.label(egui::RichText::new("Settings").size(14.0).strong());
-        });
-        if going_back {
-            self.go_to(ctx, Screen::Main);
-            return;
-        }
-        ui.add_space(8.0);
-
+    /// Everything that used to be the Settings screen, minus its title and its
+    /// way back: it is part of the surface now, and the disclosure it sits in
+    /// is the way back.
+    fn configuration(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label(egui::RichText::new("Target monitor").size(12.0).strong());
         ui.add_space(4.0);
 
@@ -640,14 +675,42 @@ impl WinSendApp {
         }
     }
 
-    fn select_window_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mut going_back = false;
-        ui.horizontal(|ui| {
-            if ui.button(egui::RichText::new("Back").size(11.0)).clicked() {
-                going_back = true;
-            }
-            ui.label(egui::RichText::new("Select Zoom Window").size(14.0).strong());
-        });
+    /// The picker, in a window of its own over the surface.
+    ///
+    /// An immediate viewport rather than a deferred one: it needs `&mut self`
+    /// for the candidate list and the textures, and a deferred viewport's
+    /// closure has to be `Send + Sync + 'static`, which that is not.
+    fn picker_viewport(&mut self, ctx: &egui::Context) {
+        if !self.picking {
+            return;
+        }
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Select Zoom Window")
+            .with_inner_size(PICKER_SIZE)
+            .with_min_inner_size([360.0, 320.0])
+            // The surface it opens from is always on top, and a picker behind
+            // it would be a window asking for an answer from out of sight.
+            .with_always_on_top();
+
+        let mut closing = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(PICKER_VIEWPORT),
+            builder,
+            |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| self.picker(ui, ctx));
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    closing = true;
+                }
+            },
+        );
+
+        if closing {
+            self.close_picker();
+        }
+    }
+
+    fn picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label(
             egui::RichText::new(
                 "Pin someone in Zoom first, then pick the window showing only that video feed.",
@@ -752,9 +815,7 @@ impl WinSendApp {
         if let Some(candidate) = confirmed {
             let outcome = self.core.confirm_window(&candidate);
             self.report(ctx, outcome);
-            self.leave_picker(ctx, Screen::Main);
-        } else if going_back {
-            self.leave_picker(ctx, Screen::Settings);
+            self.close_picker();
         }
     }
 }
@@ -779,16 +840,10 @@ impl eframe::App for WinSendApp {
             return;
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.screen {
-            Screen::Main => self.main_screen(ui, ctx),
-            // Scrollable as a safety net: the window is user-resizable, and
-            // settings content clipped with no way to reach it would be worse
-            // than a scrollbar that is usually not needed.
-            Screen::Settings => {
-                egui::ScrollArea::vertical().show(ui, |ui| self.settings_screen(ui, ctx));
-            }
-            Screen::SelectWindow => self.select_window_screen(ui, ctx),
-        });
+        egui::CentralPanel::default().show(ctx, |ui| self.surface(ui, ctx));
+        // After the surface, so a Send that could not identify the window has
+        // already asked for the picker and it opens in the same frame.
+        self.picker_viewport(ctx);
     }
 }
 
