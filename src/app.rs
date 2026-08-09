@@ -8,6 +8,7 @@ use crate::core::{Core, Failure};
 use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::WindowCandidate;
 use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
+use crate::update::{self, Release, UpdateEvent, Updater};
 
 /// The height of the surface with the configuration folded away.
 ///
@@ -34,7 +35,7 @@ const MOCK_CONTROLS_HEIGHT: f32 = 56.0;
 /// The height with the configuration disclosed. The window grows to this and
 /// shrinks back, and only ever because the user asked it to — which is the
 /// whole difference between a response and a surprise.
-const EXPANDED_HEIGHT: f32 = 690.0 + STATUS_HEIGHT + MOCK_CONTROLS_HEIGHT;
+const EXPANDED_HEIGHT: f32 = 724.0 + STATUS_HEIGHT + MOCK_CONTROLS_HEIGHT;
 /// The width the window opens at, and what a resize falls back to when the
 /// current width cannot be read.
 pub const DEFAULT_WIDTH: f32 = 340.0;
@@ -178,6 +179,25 @@ impl Fade {
     }
 }
 
+/// What the updater has found, and how far the user has got with it.
+///
+/// Nothing here happens on its own. The check makes an indicator appear and
+/// that is the whole of its effect; every step after it is a click, because
+/// the one thing this feature must never do is restart the application in the
+/// middle of a broadcast.
+enum UpdateState {
+    /// Nothing to say. Either the check found nothing newer, or it never
+    /// answered at all — which look the same on purpose.
+    Quiet,
+    /// A newer release is waiting to be asked for.
+    Available(Release),
+    /// Asked for while a window was still sent, so the warning is up.
+    Confirming(Release),
+    /// Downloading and swapping. The release is kept so a failure can put the
+    /// offer back rather than losing it.
+    Installing(Release),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Ok,
@@ -233,6 +253,11 @@ pub struct WinSendApp {
     picking: bool,
     /// A Retrieve fading the window out, if one is running.
     fading: Option<Fade>,
+    updater: Box<dyn Updater>,
+    update: UpdateState,
+    /// Set when an update has been installed, so `main` can start the new
+    /// executable after this one has finished putting the desktop back.
+    relaunch: std::sync::Arc<std::sync::atomic::AtomicBool>,
     status: StatusLog,
     /// Picker contents, snapshotted when it opens so the list does not
     /// reshuffle under the cursor while the user is reading it.
@@ -251,7 +276,11 @@ pub struct WinSendApp {
 }
 
 impl WinSendApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, core: Core) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        core: Core,
+        relaunch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         apply_style(&cc.egui_ctx);
 
         // Once, here, because the window exists by the time this runs and the
@@ -264,8 +293,20 @@ impl WinSendApp {
         // a hotkey press would sit in the queue until something else woke the
         // window, which defeats the point of not having to touch the window.
         let ctx = cc.egui_ctx.clone();
-        let shell = shell::create(std::sync::Arc::new(move || ctx.request_repaint()));
+        let waker: crate::shell::Waker = std::sync::Arc::new(move || ctx.request_repaint());
+        let shell = shell::create(std::sync::Arc::clone(&waker));
         shell.apply_hotkeys(core.config.hotkeys);
+
+        // The same waker: the updater answers from a thread of its own too, and
+        // an indicator that only appeared once the mouse moved over the window
+        // would be no better than no indicator.
+        let updater = update::create(waker);
+        // Once per launch, and only if the user has not turned it off. Never
+        // blocking: this returns immediately and the answer arrives later or
+        // not at all.
+        if core.config.check_for_updates {
+            updater.check();
+        }
 
         // Only the debug-only screen override below mutates this.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
@@ -275,6 +316,9 @@ impl WinSendApp {
             configuring: false,
             picking: false,
             fading: None,
+            updater,
+            update: UpdateState::Quiet,
+            relaunch,
             status: StatusLog::default(),
             candidates: Vec::new(),
             thumbnails: HashMap::new(),
@@ -569,6 +613,142 @@ impl WinSendApp {
         self.candidates.clear();
     }
 
+    /// Take in whatever the updater has found.
+    fn handle_update(&mut self, ctx: &egui::Context, event: UpdateEvent) {
+        match event {
+            UpdateEvent::Available(release) => self.update = UpdateState::Available(release),
+            // The executable on disk is the new one now, so this process has
+            // to give way to it. `main` starts the replacement once this one
+            // has finished putting the desktop back.
+            UpdateEvent::Installed => {
+                self.relaunch.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            // The old executable is still the one on disk, so the offer goes
+            // back up rather than disappearing with the explanation.
+            UpdateEvent::Failed(why) => {
+                self.status.push(Outcome::Err, why);
+                if let UpdateState::Installing(release) = std::mem::replace(
+                    &mut self.update,
+                    UpdateState::Quiet,
+                ) {
+                    self.update = UpdateState::Available(release);
+                }
+            }
+        }
+    }
+
+    /// Ask for the update, or warn first when warning is the point.
+    ///
+    /// `Core` holds the restore point in memory and it is session-scoped by
+    /// design, so restarting while a window is still sent leaves Zoom on the
+    /// wrong monitor with nothing left able to put it back. That is the sort
+    /// of thing that is obvious in hindsight at three in the morning.
+    fn ask_to_install(&mut self, release: Release) {
+        if self.core.can_retrieve() {
+            self.update = UpdateState::Confirming(release);
+            return;
+        }
+        self.install(release);
+    }
+
+    fn install(&mut self, release: Release) {
+        self.updater.install(release.clone());
+        self.update = UpdateState::Installing(release);
+    }
+
+    /// The warning, as a modal, because it is a decision and not a setting.
+    ///
+    /// A modal rather than another row on the surface: the surface has a fixed
+    /// height and two extra lines would push the controls under it down, which
+    /// is exactly what the rework removed.
+    fn confirm_restart(&mut self, ctx: &egui::Context) {
+        let UpdateState::Confirming(release) = &self.update else {
+            return;
+        };
+        let release = release.clone();
+
+        let mut chosen = None;
+        egui::Modal::new(egui::Id::new("update-confirm")).show(ctx, |ui| {
+            ui.set_max_width(260.0);
+            ui.label(
+                egui::RichText::new(format!("Update to {}", release.version))
+                    .size(13.0)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "A window is still sent. Where it came from is only remembered \
+                     for as long as this is running, so restarting now leaves it on \
+                     the target display with nothing able to put it back.",
+                )
+                .size(11.0)
+                .color(SUBDUED),
+            );
+            ui.add_space(10.0);
+
+            ui.vertical_centered_justified(|ui| {
+                if ui.button("Retrieve, then update").clicked() {
+                    chosen = Some(true);
+                }
+                if ui.button("Update anyway").clicked() {
+                    chosen = Some(false);
+                }
+                if ui.button("Not now").clicked() {
+                    chosen = None;
+                    self.update = UpdateState::Available(release.clone());
+                }
+            });
+        });
+
+        match chosen {
+            // Straight through `Core`, not the fade: the point is to be
+            // finished before anything restarts, and an animation would only
+            // put 200ms between the decision and the thing it was guarding.
+            Some(true) => {
+                let outcome = self.core.retrieve();
+                let restored = outcome.is_ok();
+                self.report(ctx, outcome);
+                if restored {
+                    self.install(release);
+                }
+            }
+            Some(false) => self.install(release),
+            None => {}
+        }
+    }
+
+    /// The indicator, and every state after it, in one line beside the target.
+    fn update_row(&mut self, ui: &mut egui::Ui) {
+        let mut asked_for = None;
+
+        match &self.update {
+            UpdateState::Quiet | UpdateState::Confirming(_) => {}
+            UpdateState::Available(release) => {
+                let version = release.version;
+                if ui
+                    .small_button(egui::RichText::new(format!("Update to {version}")).size(11.0))
+                    .on_hover_text(
+                        "Downloads the new version, checks it against the checksum published \
+                         with the release, and restarts. Nothing happens until you click.",
+                    )
+                    .clicked()
+                {
+                    asked_for = Some(release.clone());
+                }
+            }
+            UpdateState::Installing(_) => {
+                ui.label(egui::RichText::new("Updating...").size(11.0).color(ACCENT));
+            }
+        }
+
+        if let Some(release) = asked_for {
+            self.ask_to_install(release);
+        }
+    }
+
     /// The status strip, in its own panel at the foot of the window.
     ///
     /// A panel rather than the last thing in the surface so that it is in the
@@ -608,11 +788,18 @@ impl WinSendApp {
             .map(|m| m.label())
             .unwrap_or_else(|| "no target monitor selected".to_string());
 
-        ui.label(
-            egui::RichText::new(format!("Target: {target}"))
-                .size(11.0)
-                .color(egui::Color32::from_gray(150)),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Target: {target}"))
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(150)),
+            );
+            // Right-aligned and small: an update is worth noticing and never
+            // worth competing with the two controls below it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.update_row(ui);
+            });
+        });
 
         ui.add_space(12.0);
 
@@ -663,6 +850,24 @@ impl WinSendApp {
                     mock.set_zoom_present(present);
                 }
             }
+            // The picker is the only way to confirm a window, and it is a
+            // viewport of its own now, which puts every state that needs a
+            // confirmed window out of reach of anything driving this from
+            // outside. This is the same shortcut the picker takes, without the
+            // clicking.
+            let confirming = ui
+                .small_button(egui::RichText::new("mock: confirm Zoom window").size(10.0))
+                .clicked()
+                .then(|| {
+                    self.core
+                        .candidates()
+                        .into_iter()
+                        .find(|candidate| candidate.likely_zoom)
+                });
+            if let Some(Some(candidate)) = confirming {
+                let outcome = self.core.confirm_window(&candidate);
+                self.report(ctx, outcome);
+            }
             // Injected rather than performed directly, so the press travels the
             // same queue-and-wake path a real hotkey would.
             let mut pressed = None;
@@ -707,6 +912,31 @@ impl WinSendApp {
                 }
                 if let Some(event) = chosen {
                     mock.choose(event);
+                }
+            }
+
+            // Walks the whole update flow without the network: the canned
+            // response goes through the same parsing and comparison the real
+            // updater uses, so what is exercised here is the real decision.
+            let mut offer = false;
+            let mut fail = false;
+            if let Some(mock) = self.updater.as_mock() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("mock: update").size(10.0));
+                    if ui.small_button(egui::RichText::new("offer").size(10.0)).clicked() {
+                        offer = true;
+                    }
+                    if ui.small_button(egui::RichText::new("offer, fails").size(10.0)).clicked() {
+                        offer = true;
+                        fail = true;
+                    }
+                });
+                if offer {
+                    if fail {
+                        mock.set_install_failure("the download did not match its checksum");
+                    }
+                    mock.set_response(&crate::mock::MockUpdater::release_list("99.0.0"));
+                    mock.check();
                 }
             }
         }
@@ -811,6 +1041,22 @@ impl WinSendApp {
             .changed()
         {
             if let Err(message) = self.core.set_fade_on_retrieve(fade) {
+                self.status.push(Outcome::Err, message);
+            }
+        }
+
+        ui.add_space(10.0);
+
+        let mut checking = self.core.config.check_for_updates;
+        if checkbox(ui, &mut checking, "Check for updates on startup")
+            .on_hover_text(
+                "Asks GitHub once per launch whether there is a newer release, and shows a \
+                 button if there is. Nothing downloads or restarts unless you click it. \
+                 Takes effect at the next launch.",
+            )
+            .changed()
+        {
+            if let Err(message) = self.core.set_check_for_updates(checking) {
                 self.status.push(Outcome::Err, message);
             }
         }
@@ -1087,6 +1333,9 @@ impl eframe::App for WinSendApp {
         for event in self.shell.poll() {
             self.handle(ctx, event);
         }
+        for event in self.updater.poll() {
+            self.handle_update(ctx, event);
+        }
         // Before the hidden check below, since a Retrieve can be triggered by
         // a hotkey while the window is in the tray and its fade still has to
         // run to completion.
@@ -1111,6 +1360,8 @@ impl eframe::App for WinSendApp {
             .exact_height(STATUS_HEIGHT)
             .show(ctx, |ui| self.status_strip(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.surface(ui, ctx));
+        // Over the surface, so the decision it asks for cannot be missed.
+        self.confirm_restart(ctx);
         // After the surface, so a Send that could not identify the window has
         // already asked for the picker and it opens in the same frame.
         self.picker_viewport(ctx);

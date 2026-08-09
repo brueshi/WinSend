@@ -563,6 +563,13 @@ impl Core {
         self.config.save()
     }
 
+    /// Takes effect at the next launch, since the check only ever runs once
+    /// per launch and this one has already had its.
+    pub fn set_check_for_updates(&mut self, check: bool) -> Result<(), String> {
+        self.config.check_for_updates = check;
+        self.config.save()
+    }
+
     /// Locate the confirmed window right now, or explain what the user must do.
     ///
     /// Returns the whole candidate rather than a handle so callers can see

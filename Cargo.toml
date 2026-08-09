@@ -20,6 +20,12 @@ eframe = "0.33.3"
 raw-window-handle = "0.6.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 for checking a download against the digest the release publishes.
+# Hand-rolling a hash is about a hundred lines and squarely in the category
+# CLAUDE.md says to reach for a library on: a well-specified algorithm is still
+# cryptography, and RustCrypto's is the one everything else already trusts.
+sha2 = "0.10"
+ureq = "3.4"
 
 # Win32 bindings are the only genuinely platform-bound dependency. Keeping them
 # target-scoped is what lets the UI, config and matching logic build and run on

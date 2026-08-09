@@ -14,6 +14,7 @@ use crate::platform::{
     Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate,
 };
 use crate::shell::{HotkeyReport, Shell, ShellEvent, TrayState, Waker};
+use crate::update::{Release, UpdateEvent, Updater};
 
 /// Which end of the stacking order to move a window to.
 enum Depth {
@@ -385,6 +386,108 @@ impl Shell for MockShell {
 
     #[cfg(not(windows))]
     fn as_mock(&self) -> Option<&MockShell> {
+        Some(self)
+    }
+}
+
+/// A fake release feed.
+///
+/// It fakes the network and nothing else: `check` runs a canned response
+/// through exactly the same parsing and version comparison the real updater
+/// uses, so what is being exercised on macOS is the logic that decides whether
+/// there is an update, not a stand-in for it.
+///
+/// No thread of its own. Events are injected by the debug controls on the
+/// surface, or directly by tests, and the waker is still called on every one,
+/// since getting that wiring wrong is what would leave an indicator that only
+/// appears once the mouse moves over the window.
+pub struct MockUpdater {
+    waker: Waker,
+    queue: RefCell<Vec<UpdateEvent>>,
+    /// What GitHub would have answered. An empty list is the usual case: up to
+    /// date, and therefore silent.
+    response: RefCell<String>,
+    /// What an install will do, so the failure path is reachable.
+    install_fails: RefCell<Option<String>>,
+    checks: RefCell<usize>,
+}
+
+impl MockUpdater {
+    pub fn new(waker: Waker) -> Self {
+        Self {
+            waker,
+            queue: RefCell::new(Vec::new()),
+            response: RefCell::new("[]".to_string()),
+            install_fails: RefCell::new(None),
+            checks: RefCell::new(0),
+        }
+    }
+
+    fn emit(&self, event: UpdateEvent) {
+        self.queue.borrow_mut().push(event);
+        (self.waker)();
+    }
+
+    /// Answer the next check with this release list, in GitHub's own shape.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn set_response(&self, json: &str) {
+        *self.response.borrow_mut() = json.to_string();
+    }
+
+    /// A release list offering `version`, shaped the way the API returns one.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn release_list(version: &str) -> String {
+        format!(
+            r#"[{{"tag_name": "v{version}", "draft": false, "prerelease": true,
+                  "assets": [{{"name": "winsend.exe",
+                               "browser_download_url": "https://example.invalid/winsend.exe",
+                               "digest": "sha256:{}"}}]}}]"#,
+            "0".repeat(64)
+        )
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn set_install_failure(&self, why: &str) {
+        *self.install_fails.borrow_mut() = Some(why.to_string());
+    }
+
+    /// How many times a check has been asked for. It is meant to happen once
+    /// per launch, not once per frame.
+    #[cfg(test)]
+    pub fn checks(&self) -> usize {
+        *self.checks.borrow()
+    }
+}
+
+impl Updater for MockUpdater {
+    fn check(&self) {
+        *self.checks.borrow_mut() += 1;
+
+        // Exactly what the real one does with the body it received, including
+        // staying silent when anything goes wrong.
+        let found = crate::update::newest_release(&self.response.borrow())
+            .ok()
+            .and_then(crate::update::newer_than_current);
+
+        if let Some(release) = found {
+            self.emit(UpdateEvent::Available(release));
+        }
+    }
+
+    fn install(&self, _release: Release) {
+        let outcome = match self.install_fails.borrow().clone() {
+            Some(why) => UpdateEvent::Failed(why),
+            None => UpdateEvent::Installed,
+        };
+        self.emit(outcome);
+    }
+
+    fn poll(&self) -> Vec<UpdateEvent> {
+        self.queue.borrow_mut().drain(..).collect()
+    }
+
+    #[cfg(not(windows))]
+    fn as_mock(&self) -> Option<&MockUpdater> {
         Some(self)
     }
 }
@@ -809,5 +912,99 @@ mod tests {
             mock.set_window_opacity(VIDEO_WINDOW, 0.5),
             Err(PlatformError::WindowGone)
         );
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::update::Version;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn updater() -> (MockUpdater, Arc<AtomicUsize>) {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        let updater = MockUpdater::new(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        (updater, wakes)
+    }
+
+    /// No network, nothing new, a response that will not parse: all of them
+    /// look the same from outside, and none of them is worth interrupting a
+    /// broadcast over.
+    #[test]
+    fn a_check_that_finds_nothing_says_nothing() {
+        let (updater, wakes) = updater();
+
+        updater.check();
+
+        assert!(updater.poll().is_empty(), "an empty release list is silence");
+        assert_eq!(wakes.load(Ordering::SeqCst), 0, "and does not even wake the UI");
+        assert_eq!(updater.checks(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_response_is_silent_rather_than_an_error() {
+        let (updater, _) = updater();
+        updater.set_response(r#"{"message": "API rate limit exceeded"}"#);
+
+        updater.check();
+
+        assert!(updater.poll().is_empty());
+    }
+
+    #[test]
+    fn a_newer_release_is_offered_and_wakes_the_ui() {
+        let (updater, wakes) = updater();
+        updater.set_response(&MockUpdater::release_list("99.0.0"));
+
+        updater.check();
+
+        let [UpdateEvent::Available(release)] = &updater.poll()[..] else {
+            panic!("expected exactly one offer");
+        };
+        assert_eq!(release.version.to_string(), "99.0.0");
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "an idle window has to be told");
+    }
+
+    /// The version this build already is. Offering it would be an update to
+    /// nowhere, and offering an older one would be a downgrade.
+    #[test]
+    fn the_version_already_running_is_not_offered() {
+        let (updater, _) = updater();
+        updater.set_response(&MockUpdater::release_list(&Version::current().to_string()));
+
+        updater.check();
+
+        assert!(updater.poll().is_empty());
+    }
+
+    #[test]
+    fn an_older_release_is_not_offered() {
+        let (updater, _) = updater();
+        updater.set_response(&MockUpdater::release_list("0.0.1"));
+
+        updater.check();
+
+        assert!(updater.poll().is_empty());
+    }
+
+    #[test]
+    fn a_failed_install_reports_why_rather_than_going_quiet() {
+        let (updater, _) = updater();
+        updater.set_install_failure("the download did not match its checksum");
+
+        updater.install(Release {
+            version: "99.0.0".parse().unwrap(),
+            url: "https://example.invalid/winsend.exe".into(),
+            digest: "0".repeat(64),
+        });
+
+        let [UpdateEvent::Failed(why)] = &updater.poll()[..] else {
+            panic!("expected exactly one failure");
+        };
+        assert!(why.contains("checksum"), "got: {why}");
     }
 }

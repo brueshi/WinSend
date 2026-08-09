@@ -47,6 +47,13 @@ pub struct Config {
     /// GPU-composited — so if it flickers or stutters against a real session,
     /// this is the way back to a hard cut without a rebuild.
     pub fade_on_retrieve: bool,
+    /// Ask GitHub once per launch whether there is a newer release.
+    ///
+    /// On by default, and its only effect is to make an indicator appear:
+    /// nothing downloads or restarts without a click. Off means the check
+    /// never runs at all, for a machine that should not be talking to the
+    /// internet unprompted.
+    pub check_for_updates: bool,
     #[serde(with = "hotkeys_as_text")]
     pub hotkeys: Hotkeys,
 }
@@ -59,6 +66,7 @@ impl Default for Config {
             borderless: false,
             clear_target: false,
             fade_on_retrieve: true,
+            check_for_updates: true,
             hotkeys: Hotkeys::default(),
         }
     }
