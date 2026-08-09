@@ -160,6 +160,12 @@ impl WinSendApp {
     pub fn new(cc: &eframe::CreationContext<'_>, core: Core) -> Self {
         apply_style(&cc.egui_ctx);
 
+        // Once, here, because the window exists by the time this runs and the
+        // frame it asks for is not something that needs re-asserting per frame.
+        if let Some(handle) = own_window_handle(cc) {
+            core.platform.apply_window_chrome(handle);
+        }
+
         // The waker is a repaint request against a cloned context. Without it
         // a hotkey press would sit in the queue until something else woke the
         // window, which defeats the point of not having to touch the window.
@@ -939,6 +945,21 @@ fn tray_state(core: &Core) -> TrayState {
         None => "WinSend — no target monitor selected".to_string(),
     };
     TrayState { can_retrieve: core.can_retrieve(), tooltip }
+}
+
+/// Our own window's OS handle, in the same opaque form `Platform` speaks.
+///
+/// Kept free of `cfg` attributes: `RawWindowHandle` names every platform's
+/// variant on every platform, so this compiles as written on macOS and simply
+/// answers `None` there. Returning `None` is a normal answer and means only
+/// that there is no native frame to ask anything of.
+fn own_window_handle(cc: &eframe::CreationContext<'_>) -> Option<u64> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(window) => Some(window.hwnd.get() as u64),
+        _ => None,
+    }
 }
 
 /// A checkbox, kept square while everything around it is a pill.

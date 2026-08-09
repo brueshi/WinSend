@@ -8,7 +8,11 @@ use std::os::windows::ffi::OsStringExt;
 
 use windows::core::BOOL;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWM_WINDOW_CORNER_PREFERENCE,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
     GetMonitorInfoW, MonitorFromWindow, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
@@ -433,6 +437,39 @@ impl Platform for Win32Platform {
             _ => "invalid or unknown",
         };
         vec![format!("process DPI awareness: {described}")]
+    }
+
+    /// Dark title bar and rounded corners, both introduced with Windows 11.
+    ///
+    /// Errors are dropped on purpose rather than out of laziness. Windows 10
+    /// does not recognise either attribute and answers `E_INVALIDARG`, which
+    /// is not a failure: it means the frame stays as it was, which is what
+    /// running on Windows 10 looks like. There is nothing for the user to do
+    /// about it and nothing worth putting in the status strip.
+    ///
+    /// Mica (`DWMWA_SYSTEMBACKDROP_TYPE`) is deliberately absent. The backdrop
+    /// only shows through a transparent window background, so egui's opaque
+    /// `panel_fill` would have to go translucent — and during a broadcast that
+    /// means whatever happens to be behind the window shows through it.
+    fn apply_window_chrome(&self, handle: u64) {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            let dark = BOOL::from(true);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                std::ptr::addr_of!(dark).cast(),
+                std::mem::size_of::<BOOL>() as u32,
+            );
+
+            let rounded = DWMWCP_ROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                std::ptr::addr_of!(rounded).cast(),
+                std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            );
+        }
     }
 
     fn monitors(&self) -> Vec<MonitorInfo> {

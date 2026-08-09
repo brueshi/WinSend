@@ -3969,6 +3969,7 @@ version = "0.1.16"
 dependencies = [
  "eframe",
  "embed-resource",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "windows 0.62.2",

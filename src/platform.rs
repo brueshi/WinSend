@@ -194,6 +194,18 @@ pub trait Platform {
         Vec::new()
     }
 
+    /// Ask the OS to draw our own window's frame to match the application.
+    ///
+    /// The title bar is the one part of the interface the application cannot
+    /// paint for itself, and a white bar above a dark panel is exactly the
+    /// mismatch this exists to remove. Everything it does is advisory: an OS
+    /// that does not recognise the request leaves the frame as it was, which
+    /// is the same outcome as not asking.
+    ///
+    /// Defaulted to nothing so the mock and every non-Windows target need say
+    /// nothing about a question only Windows has an answer to.
+    fn apply_window_chrome(&self, _handle: u64) {}
+
     /// Give the window the foreground.
     ///
     /// The only lever that reaches a full-screen exclusive window. Those are
