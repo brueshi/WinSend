@@ -16,11 +16,12 @@ thumbnail capture, global hotkeys, the tray icon and its menu, the application
 icons, and getting the sent window in front of a full-screen media player on the
 target display.
 
-Not yet verified: hide-to-tray, whether a media player that gives up the
-display on losing focus is reliably restored on Retrieve, the Windows 11 title
-bar and corner styling, and the fade on Retrieve. The last of those is the one
-to watch, since a GPU-composited window may not take kindly to being made
-translucent; **Fade out when retrieving** in Settings turns it off.
+Not yet verified on Windows: hide-to-tray, whether a media player that gives up
+the display on losing focus is reliably restored on Retrieve, the Windows 11
+title bar and corner styling, the fade on Retrieve, and the updater's download
+and swap. The fade is the one to watch, since a GPU-composited window may not
+take kindly to being made translucent; **Fade out when retrieving** in Settings
+turns it off.
 
 Everything above the platform seam — the UI, configuration, window identity,
 binding rules, and the whole of Send and Retrieve including which windows are in
@@ -37,15 +38,22 @@ Everything the operating system provides sits behind one of two traits:
 ```
 src/platform.rs   Platform: what WinSend asks the OS, answered on the spot
 src/shell.rs      Shell: what the OS tells WinSend, on its own schedule
-src/mock.rs       a fake desktop and shell, for developing away from Windows
+src/update.rs     Updater: whether a newer release exists, and installing it
+src/mock.rs       a fake desktop, shell and release feed, for developing away
+                  from Windows
 src/win32.rs      the real Platform
 src/win32_shell.rs  the real Shell: message-only window, hotkeys, tray icon
+src/github.rs     the real Updater: GitHub over HTTPS, on threads of its own
 src/hotkey.rs     key combinations and the rules for binding them
 src/identity.rs   persisting and re-finding the confirmed window
 src/config.rs     settings, stored as JSON under %APPDATA%
 src/core.rs       Send and Retrieve, free of any UI
 src/app.rs        egui front end
 ```
+
+`Updater` is a sibling of `Shell` rather than of `Platform`, for the same
+reason: its answer arrives on somebody else's schedule, from a thread of its
+own, and the UI has to be woken when it does.
 
 Those seams exist for a practical reason rather than a stylistic one: they let
 the entire interface and all of the logic build, run and be tested on a machine
@@ -90,6 +98,15 @@ Five decisions worth knowing:
   it needs around 640px of height to compare thumbnails, which is more than the
   live surface should ever be, so it opens as a window of its own rather than
   as somewhere the app navigates to.
+- **Updating is offered, never taken.** The application runs during a live
+  broadcast, so an update that restarts it at the wrong moment is worse than
+  never updating at all. The check runs once per launch on a thread of its own
+  and its only effect is to make a button appear; downloading and restarting
+  happen on a click. A check that fails — no network, GitHub down, rate
+  limited — says nothing, because none of that is something the operator asked
+  about or can act on. Asking for the update while a window is still sent
+  warns first and offers to retrieve on the way, since the restore point lives
+  in memory and restarting would strand Zoom on the target display.
 - **Retrieve fades, Send cuts.** Send is the half under pressure, where a fifth
   of a second is a cost paid at the worst moment; Retrieve is the relaxed half,
   where something is coming off air and nobody is waiting. The fade also
@@ -198,6 +215,30 @@ window in question was not being enumerated at all.
 
 It goes to the clipboard and to `%APPDATA%\WinSend\diagnostics.txt`.
 
+## Releasing
+
+```
+python3 tools/release.py --patch          # 0.1.15 -> 0.1.16
+python3 tools/release.py 0.2.0 --notes "what changed"
+```
+
+The bump, the commit and the tag happen together or not at all. `Cargo.toml`
+is what a running copy compares against the tags, and it has drifted from them
+before — saying `0.1.0` while `v0.1.2` was released. That was untidy until the
+updater existed; now a copy whose version lags the tags believes it is
+permanently out of date and offers an update to what it is already running.
+
+Releases are read from the releases list rather than from `/releases/latest`,
+which excludes pre-releases and therefore answers 404 here. The highest parsed
+version wins, which is the more honest question anyway. The asset must be named
+`winsend.exe` and must carry a `digest`, which the API supplies; a release
+without one is passed over rather than trusted, since a download that cannot be
+checked is not one to offer.
+
+That check is a SHA-256 against what GitHub published, over TLS. It catches a
+truncated or altered download; it is not code signing and does not pretend to
+be. Signing needs a certificate and is a separate decision with a cost.
+
 ## Known risk
 
 Thumbnails in the window picker use `PrintWindow` with `PW_RENDERFULLCONTENT`.
@@ -218,3 +259,10 @@ screen would defeat the point, so while hidden a repaint is requested on a
 100 ms timer as a floor under the waker. If that turns out to be unnecessary on
 Windows it can go; if it turns out to be insufficient, the window is being
 hidden by a mechanism that needs replacing rather than tuning.
+
+## Licence
+
+MIT. See `LICENSE`.
+
+Zoom is named here only as the application WinSend works with. Nothing in this
+repository is affiliated with or endorsed by Zoom.
