@@ -21,8 +21,32 @@ enum Depth {
     Back,
 }
 
+/// A platform call that changed the fake desktop, as it arrived.
+///
+/// Every other field on `MockPlatform` answers "what state is it in now". This
+/// answers "in what order did it get there", which is the only way to test
+/// something whose whole point is the sequence — Retrieve putting the displaced
+/// windows back *before* it moves the sent window off them, where both orders
+/// leave the desktop looking identical once the dust settles.
+///
+/// Calls, not effects: a call that reports success and does nothing, the way a
+/// window that refuses to minimise does, is still recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Call {
+    Placed(u64),
+    Raised(u64),
+    Demoted(u64),
+    Minimized(u64),
+    Unminimized(u64),
+    Hidden(u64),
+    Shown(u64),
+    Activated(u64),
+}
+
 pub struct MockPlatform {
     windows: RefCell<Vec<WindowCandidate>>,
+    /// Every mutating call, oldest first. See [`Call`].
+    calls: RefCell<Vec<Call>>,
     /// Flips the Zoom windows out of existence to test the reconfirm prompt.
     zoom_present: RefCell<bool>,
     /// Bounds from before a window was minimised, so restoring puts them back
@@ -59,6 +83,7 @@ impl MockPlatform {
     pub fn new() -> Self {
         Self {
             windows: RefCell::new(default_windows()),
+            calls: RefCell::new(Vec::new()),
             zoom_present: RefCell::new(true),
             pre_minimize: RefCell::new(HashMap::new()),
             sticky: RefCell::new(Vec::new()),
@@ -188,6 +213,16 @@ impl MockPlatform {
     #[cfg(test)]
     pub fn is_hidden(&self, handle: u64) -> bool {
         self.hidden.borrow().contains(&handle)
+    }
+
+    /// Every mutating call so far, oldest first.
+    #[cfg(test)]
+    pub fn calls(&self) -> Vec<Call> {
+        self.calls.borrow().clone()
+    }
+
+    fn record(&self, call: Call) {
+        self.calls.borrow_mut().push(call);
     }
 
     /// Move a window to one end of the stacking order.
@@ -480,6 +515,7 @@ impl Platform for MockPlatform {
     }
 
     fn unminimize(&self, handle: u64) -> Result<(), PlatformError> {
+        self.record(Call::Unminimized(handle));
         if !self.zoom_present() {
             return Err(PlatformError::WindowGone);
         }
@@ -518,6 +554,7 @@ impl Platform for MockPlatform {
     /// what a fake desktop cannot model. Pretending otherwise would give
     /// false confidence about the one case it is there to handle.
     fn activate(&self, handle: u64) -> Result<(), PlatformError> {
+        self.record(Call::Activated(handle));
         if !self.windows.borrow().iter().any(|w| w.handle == handle) {
             return Err(PlatformError::WindowGone);
         }
@@ -552,6 +589,7 @@ impl Platform for MockPlatform {
     }
 
     fn hide(&self, handle: u64) -> Result<(), PlatformError> {
+        self.record(Call::Hidden(handle));
         if !self.windows.borrow().iter().any(|w| w.handle == handle) {
             return Err(PlatformError::WindowGone);
         }
@@ -560,11 +598,13 @@ impl Platform for MockPlatform {
     }
 
     fn show(&self, handle: u64) -> Result<(), PlatformError> {
+        self.record(Call::Shown(handle));
         self.hidden.borrow_mut().retain(|hidden| *hidden != handle);
         Ok(())
     }
 
     fn minimize(&self, handle: u64) -> Result<(), PlatformError> {
+        self.record(Call::Minimized(handle));
         if self.unminimisable.borrow().contains(&handle) {
             // Reports success and stays exactly where it was, which is the
             // failure mode the hide fallback exists for.
@@ -584,6 +624,7 @@ impl Platform for MockPlatform {
     }
 
     fn demote(&self, handle: u64) -> Result<(), PlatformError> {
+        self.record(Call::Demoted(handle));
         if self.sticky.borrow().contains(&handle) {
             // Reports success and stays exactly where it was, which is the
             // failure mode the minimise fallback exists for.
@@ -594,11 +635,13 @@ impl Platform for MockPlatform {
     }
 
     fn raise(&self, handle: u64, topmost: bool) -> Result<(), PlatformError> {
+        self.record(Call::Raised(handle));
         self.set_topmost(handle, topmost)?;
         self.restack(handle, Depth::Front)
     }
 
     fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError> {
+        self.record(Call::Placed(handle));
         if !self.zoom_present() {
             return Err(PlatformError::WindowGone);
         }

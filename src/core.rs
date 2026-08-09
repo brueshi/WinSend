@@ -735,13 +735,24 @@ impl Core {
         let window = self.locate()?;
         self.ensure_visible(&window)?;
 
+        // Before the sent window moves, not after.
+        //
+        // Both orders leave the same desktop a moment later, so this looks
+        // arbitrary and is not. Moving the sent window first uncovers a bare
+        // target monitor, and the player then snaps back on top of it: two
+        // transitions where the user asked for one. Restoring first puts the
+        // player back underneath a window that is still covering it, so the
+        // move reveals the thing that is meant to be there.
+        //
+        // It also stays correct without the sent window being on top, since
+        // everything here is restored into the band it came from — an ordinary
+        // window goes to the front of the ordinary band, which is still behind
+        // the sent window while that one is held topmost.
+        self.put_back_displaced();
+
         self.platform
             .place_window(window.handle, Placement { bounds, borderless: false, topmost: false })
             .map_err(|e| Failure::plain(format!("Could not restore the window: {e}")))?;
-
-        // After the window is out of the way, so whatever was covering the
-        // monitor comes back on top of it rather than behind it.
-        self.put_back_displaced();
 
         // Consumed: the next Send captures a fresh restore point rather than
         // reusing a position that may no longer mean anything.
@@ -765,7 +776,7 @@ impl Drop for Core {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::MockPlatform;
+    use crate::mock::{Call, MockPlatform};
 
     /// The two Zoom windows in the mock are identical in every respect the
     /// config records, so tests address them by handle.
@@ -929,6 +940,35 @@ mod tests {
         assert!(
             core.platform.as_mock().unwrap().is_topmost(MEDIA_WINDOW),
             "it was always-on-top before, so it must be again"
+        );
+    }
+
+    /// Both orders end with the same desktop, so nothing about the final state
+    /// can tell them apart. The sequence is the behaviour here: restoring after
+    /// the move uncovers a bare monitor and then snaps the player onto it.
+    #[test]
+    fn retrieve_puts_the_player_back_before_it_uncovers_the_monitor() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.set_topmost(MEDIA_WINDOW, true).unwrap();
+        mock.bring_to_front(MEDIA_WINDOW);
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        let calls = core.platform.as_mock().unwrap().calls();
+        let restored = calls
+            .iter()
+            .rposition(|call| *call == Call::Raised(MEDIA_WINDOW))
+            .expect("the player must be put back");
+        let uncovered = calls
+            .iter()
+            .rposition(|call| *call == Call::Placed(VIDEO_WINDOW))
+            .expect("the sent window must be moved back");
+
+        assert!(
+            restored < uncovered,
+            "the player has to be there before the window moves off it, got: {calls:?}"
         );
     }
 
