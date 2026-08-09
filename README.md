@@ -33,7 +33,7 @@ a session the remembered handle separates them.
 
 ## Design
 
-Everything the operating system provides sits behind one of two traits:
+Everything outside the process sits behind one of three traits:
 
 ```
 src/platform.rs   Platform: what WinSend asks the OS, answered on the spot
@@ -57,15 +57,15 @@ own, and the UI has to be woken when it does.
 
 Those seams exist for a practical reason rather than a stylistic one: they let
 the entire interface and all of the logic build, run and be tested on a machine
-that is not Windows, which reduces the Windows feedback loop to just the two
-Win32 adapters.
+that is not Windows, which reduces the Windows feedback loop to just the three
+adapters behind them.
 
 `Platform` and `Shell` are separate because the dependency runs in opposite
 directions. A platform call is a question with an immediate answer. The shell
 delivers events when the OS decides to, from a thread of its own, and that
 difference shapes the whole of `shell.rs`.
 
-Five decisions worth knowing:
+The decisions worth knowing:
 
 - **The picked window's handle is remembered, but re-validated on every use.**
   Zoom's main meeting window and its video window share process, class and
