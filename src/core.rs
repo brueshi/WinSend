@@ -727,10 +727,26 @@ impl Core {
         Ok(format!("Sent to {label}"))
     }
 
+    /// Retrieve, as one synchronous step. What every caller wants unless it
+    /// intends to animate the gap.
     pub fn retrieve(&mut self) -> Result<String, Failure> {
-        let bounds = self.saved_bounds.ok_or_else(|| {
-            Failure::plain("Nothing has been sent yet, so there is no position to restore.")
-        })?;
+        let handle = self.begin_retrieve()?;
+        self.finish_retrieve(handle)
+    }
+
+    /// The half of Retrieve that happens before the window moves, ending with
+    /// the handle of the window that is about to.
+    ///
+    /// Split out so the interface can fade the window between the two halves
+    /// while `Core` itself stays synchronous and holds no notion of an
+    /// animation. Everything that can fail is on this side, so a fade never
+    /// starts for a Retrieve that was going to be refused anyway.
+    pub fn begin_retrieve(&mut self) -> Result<u64, Failure> {
+        if self.saved_bounds.is_none() {
+            return Err(Failure::plain(
+                "Nothing has been sent yet, so there is no position to restore.",
+            ));
+        }
 
         let window = self.locate()?;
         self.ensure_visible(&window)?;
@@ -750,8 +766,24 @@ impl Core {
         // the sent window while that one is held topmost.
         self.put_back_displaced();
 
+        Ok(window.handle)
+    }
+
+    /// The half that moves the window back, for the handle `begin_retrieve`
+    /// returned.
+    ///
+    /// Takes the handle rather than locating the window again. A fade lasts a
+    /// couple of hundred milliseconds and re-enumerating every window on the
+    /// desktop to confirm what was found moments ago would be work for
+    /// nothing; a window that closed in the gap fails the move instead, and
+    /// says so.
+    pub fn finish_retrieve(&mut self, handle: u64) -> Result<String, Failure> {
+        let bounds = self.saved_bounds.ok_or_else(|| {
+            Failure::plain("Nothing has been sent yet, so there is no position to restore.")
+        })?;
+
         self.platform
-            .place_window(window.handle, Placement { bounds, borderless: false, topmost: false })
+            .place_window(handle, Placement { bounds, borderless: false, topmost: false })
             .map_err(|e| Failure::plain(format!("Could not restore the window: {e}")))?;
 
         // Consumed: the next Send captures a fresh restore point rather than
@@ -773,32 +805,28 @@ impl Drop for Core {
     }
 }
 
+/// Fixtures shared with other modules' tests.
+///
+/// Lives here rather than in each test module because building a `Core` that
+/// is ready to send needs `confirmed_handle`, which is private for good
+/// reason: it is the one thing that separates Zoom's two identical windows and
+/// nothing outside `Core` should be able to assert it.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mock::{Call, MockPlatform};
+pub mod test_support {
+    use super::Core;
+    use crate::config::Config;
+    use crate::identity::WindowIdentity;
+    use crate::mock::MockPlatform;
+    use crate::platform::Platform;
 
-    /// The two Zoom windows in the mock are identical in every respect the
-    /// config records, so tests address them by handle.
-    const MAIN_WINDOW: u64 = 0x1001;
-    const VIDEO_WINDOW: u64 = 0x1002;
+    /// The one of Zoom's two identical windows that the user picked.
+    pub const VIDEO_WINDOW: u64 = 0x1002;
     /// The full-screen media player on the target display.
-    const MEDIA_WINDOW: u64 = 0x3001;
-    const SHELL_WINDOW: u64 = 0x4001;
-    const PARTIAL_WINDOW: u64 = 0x4003;
-    /// A media player owning the second display exclusively.
-    const EXCLUSIVE_WINDOW: u64 = 0x5001;
-    const OWN_WINDOW: u64 = 0x4002;
-
-    fn window(core: &Core, handle: u64) -> WindowCandidate {
-        core.candidates()
-            .into_iter()
-            .find(|c| c.handle == handle)
-            .expect("mock provides this window")
-    }
+    pub const MEDIA_WINDOW: u64 = 0x3001;
 
     /// Mirrors what the picker does, without `confirm_window`'s disk write.
-    fn core_with_confirmed_video_window() -> Core {
+    /// A test that saved would overwrite the developer's own settings.
+    pub fn core_with_confirmed_video_window() -> Core {
         let platform = MockPlatform::new();
         let monitors = platform.monitors();
         let candidate = platform
@@ -814,6 +842,31 @@ mod tests {
         let mut core = Core::new(Box::new(platform), config);
         core.confirmed_handle = Some(VIDEO_WINDOW);
         core
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{core_with_confirmed_video_window, MEDIA_WINDOW, VIDEO_WINDOW};
+    use super::*;
+    use crate::mock::{Call, MockPlatform};
+
+    /// The two Zoom windows in the mock are identical in every respect the
+    /// config records, so tests address them by handle. `VIDEO_WINDOW` and
+    /// `MEDIA_WINDOW` come from `test_support`, which other modules' tests
+    /// share.
+    const MAIN_WINDOW: u64 = 0x1001;
+    const SHELL_WINDOW: u64 = 0x4001;
+    const PARTIAL_WINDOW: u64 = 0x4003;
+    /// A media player owning the second display exclusively.
+    const EXCLUSIVE_WINDOW: u64 = 0x5001;
+    const OWN_WINDOW: u64 = 0x4002;
+
+    fn window(core: &Core, handle: u64) -> WindowCandidate {
+        core.candidates()
+            .into_iter()
+            .find(|c| c.handle == handle)
+            .expect("mock provides this window")
     }
 
     #[test]
