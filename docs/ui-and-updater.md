@@ -167,6 +167,76 @@ whose version lags the tags believes it is permanently out of date.
 **Bump `Cargo.toml` before creating the tag, in the same commit or immediately
 before it.** Consider a check in CI, or a release script that does both.
 
+## Feature 3: fading the window out on Retrieve
+
+Instead of the video window vanishing from the target display in one frame, fade
+it out over a couple of hundred milliseconds.
+
+### Why this belongs on Retrieve and not on Send
+
+The two operations are not equally urgent. Send is the one under pressure — the
+feed has to be up now, and anything that delays it by even a fifth of a second
+is a cost paid at the worst moment. Retrieve is the relaxed half: something is
+being taken off air, and there is no one waiting on it.
+
+So fading Retrieve while leaving Send instant is not an inconsistency to be
+apologised for. It is the transition going where there is slack for it. If a
+fade on Send is wanted later it should be argued separately, and it has to
+contend with the fact that Send already produces a hard cut it does not control
+— the full-screen player gives up the display the instant focus moves.
+
+### The design problem worth thinking about
+
+**A half-finished fade is far worse than no fade.** A window stuck at forty
+percent opacity, on camera, is a visible fault where a hard cut would have been
+merely unremarkable. Every failure path — the window closing mid-animation, the
+platform call failing, the app quitting, a second Retrieve arriving — has to
+land on fully opaque and fully un-layered, never anywhere in between. Build the
+guarantee first and the animation second.
+
+**What is behind matters more than what is fading.** Fading Zoom out reveals
+whatever is underneath, and today Retrieve puts the window back before restoring
+the media player that was displaced. Done in that order the fade reveals a bare
+desktop and then the player snaps in on top, which is two transitions where
+there was one. The player has to be restored *first*, behind the still-opaque
+Zoom window, so the fade reveals the thing that is meant to be there.
+
+That reordering is most of the value and is worth doing whether or not the fade
+is implemented.
+
+**Making another application's window translucent is not free.** It needs
+`WS_EX_LAYERED` and `SetLayeredWindowAttributes`. Layered windows compose
+differently, and Zoom's video window is GPU-composited — the same property that
+made thumbnail capture need `PW_RENDERFULLCONTENT`. It may flicker, drop frames,
+or refuse. Try it against a real session early, because if it misbehaves the
+feature does not survive its own purpose.
+
+Note also that the previous round of work has just finished fixing two faults in
+restoring window styles that were taken away. `WS_EX_LAYERED` is another such
+style. Add it the same way: record the bits set, put back exactly those, and
+never snapshot a whole style word.
+
+### Requirements
+
+- Opacity behind `Platform`, something like `set_window_opacity(handle, alpha)`
+  and a way to clear it. The mock records the values, which is what makes the
+  timing and the end states testable on macOS.
+- The animation itself is portable and belongs above the seam: a small state
+  machine driven by the frame loop, using `ctx.request_repaint()` the way the
+  rest of the app already does. No sleeping on the UI thread, and no thread that
+  outlives the operation.
+- `Core::retrieve` is synchronous today and callers depend on that. Either the
+  fade is driven entirely from `app.rs` around a `Core` that still completes
+  synchronously, or `Core` gains an explicit notion of an operation in progress.
+  The first is smaller; take it unless something forces otherwise.
+- Restore displaced windows before the fade begins, not after the move.
+- A toggle in Settings, and a hard cut when it is off. Do not make it the only
+  behaviour.
+- Around 200ms. Long enough to read as deliberate, short enough that nobody
+  waits for it. Resist making it configurable until someone asks.
+- If a hotkey arrives mid-fade, finish immediately rather than queueing. The
+  operator pressing a key twice means they want it done, not animated twice.
+
 ## Going public
 
 The updater needs the repo public, since the releases API only serves
