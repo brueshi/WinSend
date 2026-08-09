@@ -226,6 +226,24 @@ pub trait Platform {
 
     fn show(&self, handle: u64) -> Result<(), PlatformError>;
 
+    /// Make a window translucent, from 1.0 for opaque down to 0.0 for
+    /// invisible.
+    ///
+    /// Not free on Windows: it needs the window in the layered band, which
+    /// composes differently and which a GPU-composited window such as Zoom's
+    /// may not take kindly to. An error here means the window will not go
+    /// translucent, and the only correct response is to stop trying and cut.
+    fn set_window_opacity(&self, handle: u64, alpha: f32) -> Result<(), PlatformError>;
+
+    /// Put the window back to fully opaque, and undo whatever was needed to
+    /// make it translucent.
+    ///
+    /// Must be safe to call on a window that was never faded, and on one that
+    /// has since closed, because it is the last thing every failure path does.
+    /// A window left part-way transparent on camera is a visible fault, where
+    /// the hard cut this replaced was merely unremarkable.
+    fn clear_window_opacity(&self, handle: u64) -> Result<(), PlatformError>;
+
     /// Escape hatch for the mock-only debug controls. Absent from Windows
     /// builds entirely, so it cannot leak into the shipped binary.
     #[cfg(not(windows))]

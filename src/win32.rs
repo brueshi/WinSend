@@ -2,12 +2,12 @@
 //! live Zoom session on Windows.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, OsString};
 use std::os::windows::ffi::OsStringExt;
 
 use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, COLORREF, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -31,11 +31,12 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextW, SetForegroundWindow,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetWindowLongPtrW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    SetLayeredWindowAttributes, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP,
-    HWND_TOPMOST, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    HWND_TOPMOST, LWA_ALPHA, MONITORINFOF_PRIMARY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WS_CAPTION, WS_EX_LAYERED,
+    WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use crate::platform::{
@@ -64,6 +65,14 @@ pub struct Win32Platform {
     /// Whether a window was already topmost before we raised it, so putting it
     /// back does not quietly clear an always-on-top the user set themselves.
     was_topmost: RefCell<HashMap<u64, bool>>,
+    /// Windows this process put into the layered band in order to fade them.
+    ///
+    /// The same rule as `cleared_styles`, for the same reason: record the bit
+    /// that was set and take back exactly that. A window that was already
+    /// layered before we touched it is not in here and keeps its style, since
+    /// clearing `WS_EX_LAYERED` from a window that arrived with it would break
+    /// however that application draws itself.
+    layered: RefCell<HashSet<u64>>,
 }
 
 /// Whether the window currently sits in the always-on-top band.
@@ -81,6 +90,7 @@ impl Win32Platform {
         }
         Self {
             cleared_styles: RefCell::new(HashMap::new()),
+            layered: RefCell::new(HashSet::new()),
             was_topmost: RefCell::new(HashMap::new()),
         }
     }
@@ -100,6 +110,30 @@ impl Drop for Win32Platform {
     /// it is restarted — changes to another application that outlive this
     /// process.
     fn drop(&mut self) {
+        // First, because it is the one that shows. Quitting part-way through a
+        // fade would otherwise leave another application's window translucent
+        // after this process has gone, with nothing left able to put it back.
+        for handle in self.layered.borrow().iter().copied() {
+            let hwnd = handle_to_hwnd(handle);
+            unsafe {
+                if !IsWindow(Some(hwnd)).as_bool() {
+                    continue;
+                }
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+                let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current & !(WS_EX_LAYERED.0 as isize));
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+
         for (handle, was_topmost) in self.was_topmost.borrow().iter() {
             if *was_topmost {
                 continue;
@@ -601,6 +635,63 @@ impl Platform for Win32Platform {
                 return Err(PlatformError::WindowGone);
             }
             let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        Ok(())
+    }
+
+    fn set_window_opacity(&self, handle: u64, alpha: f32) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+
+            // Only add the bit if it is not already there, and remember that
+            // we were the ones who added it. A window that arrived layered
+            // keeps its style when we are done with it.
+            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if current & WS_EX_LAYERED.0 as isize == 0 {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | WS_EX_LAYERED.0 as isize);
+                self.layered.borrow_mut().insert(handle);
+            }
+
+            let opacity = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), opacity, LWA_ALPHA)
+                .map_err(|e| PlatformError::Denied(e.to_string()))
+        }
+    }
+
+    fn clear_window_opacity(&self, handle: u64) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        let we_layered_it = self.layered.borrow_mut().remove(&handle);
+
+        unsafe {
+            // A window that has closed has nothing left to put back, and
+            // nothing left translucent either. Not an error: this runs on
+            // every failure path, and the window closing is one of them.
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Ok(());
+            }
+
+            // Full opacity first, so a window that arrived already layered —
+            // and therefore keeps its style below — still ends up opaque.
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+
+            if we_layered_it {
+                let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current & !(WS_EX_LAYERED.0 as isize));
+                // Leaving the band is a frame change like any other, and the
+                // window does not repaint out of it until it is told to.
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
         }
         Ok(())
     }

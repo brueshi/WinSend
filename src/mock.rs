@@ -41,12 +41,20 @@ pub enum Call {
     Hidden(u64),
     Shown(u64),
     Activated(u64),
+    /// The alpha as the platform would actually apply it, 0 to 255, so the
+    /// ramp can be compared without worrying about float equality.
+    Opacity(u64, u8),
+    OpacityCleared(u64),
 }
 
 pub struct MockPlatform {
     windows: RefCell<Vec<WindowCandidate>>,
     /// Every mutating call, oldest first. See [`Call`].
     calls: RefCell<Vec<Call>>,
+    /// Current alpha per window, absent when the window is not translucent.
+    /// This is the end state the fade has to land on: every path out of the
+    /// animation must leave this empty.
+    opacity: RefCell<HashMap<u64, u8>>,
     /// Flips the Zoom windows out of existence to test the reconfirm prompt.
     zoom_present: RefCell<bool>,
     /// Bounds from before a window was minimised, so restoring puts them back
@@ -84,6 +92,7 @@ impl MockPlatform {
         Self {
             windows: RefCell::new(default_windows()),
             calls: RefCell::new(Vec::new()),
+            opacity: RefCell::new(HashMap::new()),
             zoom_present: RefCell::new(true),
             pre_minimize: RefCell::new(HashMap::new()),
             sticky: RefCell::new(Vec::new()),
@@ -219,6 +228,13 @@ impl MockPlatform {
     #[cfg(test)]
     pub fn calls(&self) -> Vec<Call> {
         self.calls.borrow().clone()
+    }
+
+    /// How translucent a window currently is, or `None` when it is opaque and
+    /// carries nothing to make it otherwise.
+    #[cfg(test)]
+    pub fn opacity(&self, handle: u64) -> Option<u8> {
+        self.opacity.borrow().get(&handle).copied()
     }
 
     fn record(&self, call: Call) {
@@ -597,6 +613,28 @@ impl Platform for MockPlatform {
         Ok(())
     }
 
+    fn set_window_opacity(&self, handle: u64, alpha: f32) -> Result<(), PlatformError> {
+        let opacity = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+        self.record(Call::Opacity(handle, opacity));
+
+        // A window that has gone refuses, which is what drives the fade to
+        // give up and finish rather than keep ramping against nothing.
+        if !self.zoom_present() || !self.windows.borrow().iter().any(|w| w.handle == handle) {
+            return Err(PlatformError::WindowGone);
+        }
+        self.opacity.borrow_mut().insert(handle, opacity);
+        Ok(())
+    }
+
+    /// Never fails, and is safe on a window that was never faded. It is the
+    /// last thing every failure path does, so it cannot have a failure path of
+    /// its own.
+    fn clear_window_opacity(&self, handle: u64) -> Result<(), PlatformError> {
+        self.record(Call::OpacityCleared(handle));
+        self.opacity.borrow_mut().remove(&handle);
+        Ok(())
+    }
+
     fn show(&self, handle: u64) -> Result<(), PlatformError> {
         self.record(Call::Shown(handle));
         self.hidden.borrow_mut().retain(|hidden| *hidden != handle);
@@ -719,4 +757,57 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         ((g + m) * 255.0) as u8,
         ((b + m) * 255.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VIDEO_WINDOW: u64 = 0x1002;
+
+    #[test]
+    fn opacity_is_recorded_as_the_byte_the_platform_would_apply() {
+        let mock = MockPlatform::new();
+
+        mock.set_window_opacity(VIDEO_WINDOW, 1.0).unwrap();
+        assert_eq!(mock.opacity(VIDEO_WINDOW), Some(255));
+
+        mock.set_window_opacity(VIDEO_WINDOW, 0.5).unwrap();
+        assert_eq!(mock.opacity(VIDEO_WINDOW), Some(128));
+
+        // Out of range rather than an error: an animation that overshoots by a
+        // rounding error should clamp, not fail part-way through.
+        mock.set_window_opacity(VIDEO_WINDOW, -1.0).unwrap();
+        assert_eq!(mock.opacity(VIDEO_WINDOW), Some(0));
+    }
+
+    /// The contract every failure path depends on. Clearing is the last thing
+    /// done when something has already gone wrong, so it cannot have a failure
+    /// of its own, and it has to leave nothing behind.
+    #[test]
+    fn clearing_opacity_always_succeeds_and_leaves_nothing() {
+        let mock = MockPlatform::new();
+        mock.set_window_opacity(VIDEO_WINDOW, 0.25).unwrap();
+
+        assert!(mock.clear_window_opacity(VIDEO_WINDOW).is_ok());
+        assert_eq!(mock.opacity(VIDEO_WINDOW), None);
+
+        assert!(
+            mock.clear_window_opacity(0xDEAD).is_ok(),
+            "a window that was never faded, or has since closed, is not an error"
+        );
+    }
+
+    /// A window that has gone refuses, which is what tells an animation to
+    /// stop ramping against nothing and finish.
+    #[test]
+    fn a_window_that_is_gone_will_not_take_an_opacity() {
+        let mock = MockPlatform::new();
+        mock.set_zoom_present(false);
+
+        assert_eq!(
+            mock.set_window_opacity(VIDEO_WINDOW, 0.5),
+            Err(PlatformError::WindowGone)
+        );
+    }
 }
