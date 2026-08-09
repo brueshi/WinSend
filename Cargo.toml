@@ -4,6 +4,8 @@ version = "0.1.17"
 edition = "2021"
 authors = ["brueshi"]
 description = "Sends Zoom's dual-monitor video window to a chosen display and back"
+license = "MIT"
+repository = "https://github.com/brueshi/WinSend"
 
 [[bin]]
 name = "winsend"
