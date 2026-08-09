@@ -20,7 +20,10 @@ pub struct TargetMonitor {
     pub bounds: Bounds,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Note the manual `Default` below rather than a derive: the container-level
+/// `serde(default)` fills missing fields from it, so it is the one place that
+/// decides both what a fresh install gets and what an older config file gains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub target_monitor: Option<TargetMonitor>,
@@ -36,8 +39,29 @@ pub struct Config {
     /// which the automatic behaviour goes out of its way to avoid. As a
     /// deliberate choice it is the blunt instrument that always works.
     pub clear_target: bool,
+    /// Fade the video window out on Retrieve rather than cutting it.
+    ///
+    /// On by default: the fade is the behaviour, and this exists to turn it
+    /// off. Making another application's window translucent needs the layered
+    /// band, which composes differently, and Zoom's video window is
+    /// GPU-composited — so if it flickers or stutters against a real session,
+    /// this is the way back to a hard cut without a rebuild.
+    pub fade_on_retrieve: bool,
     #[serde(with = "hotkeys_as_text")]
     pub hotkeys: Hotkeys,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            target_monitor: None,
+            zoom_window: None,
+            borderless: false,
+            clear_target: false,
+            fade_on_retrieve: true,
+            hotkeys: Hotkeys::default(),
+        }
+    }
 }
 
 /// Hotkeys persist as the text they display as — `"Ctrl+Alt+F9"` — rather than
@@ -218,6 +242,20 @@ mod tests {
 
         assert_eq!(loaded.hotkeys.send, Some("Ctrl+Alt+F9".parse().unwrap()));
         assert_eq!(loaded.hotkeys.retrieve, None);
+    }
+
+    /// The fade is the behaviour and the setting exists to turn it off, so a
+    /// config written before it existed has to arrive with it on rather than
+    /// with a bool's default.
+    #[test]
+    fn the_fade_is_on_unless_it_has_been_turned_off() {
+        assert!(Config::default().fade_on_retrieve);
+
+        let existing: Config = serde_json::from_str(r#"{"borderless": true}"#).unwrap();
+        assert!(existing.fade_on_retrieve, "an older config must gain it switched on");
+
+        let opted_out: Config = serde_json::from_str(r#"{"fade_on_retrieve": false}"#).unwrap();
+        assert!(!opted_out.fade_on_retrieve, "and an explicit no must survive a reload");
     }
 
     #[test]

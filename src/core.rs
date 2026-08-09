@@ -558,6 +558,11 @@ impl Core {
         self.config.save()
     }
 
+    pub fn set_fade_on_retrieve(&mut self, fade: bool) -> Result<(), String> {
+        self.config.fade_on_retrieve = fade;
+        self.config.save()
+    }
+
     /// Locate the confirmed window right now, or explain what the user must do.
     ///
     /// Returns the whole candidate rather than a handle so callers can see

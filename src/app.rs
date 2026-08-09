@@ -86,6 +86,98 @@ const STATUS_HISTORY: usize = 3;
 /// reaching for it is a worse failure than a blank strip.
 const STATUS_HEIGHT: f32 = 52.0;
 
+/// How long the video window takes to fade out on Retrieve.
+///
+/// Long enough to read as deliberate, short enough that nobody waits for it.
+/// Deliberately not configurable until someone asks: another setting to get
+/// wrong, for a quantity with one right answer.
+const FADE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A Retrieve part-way through, with the window fading and not yet moved.
+///
+/// Takes `now` rather than reading the clock, so the ramp, the move at the end
+/// and every failure path landing opaque can all be exercised against the mock
+/// without a window and without waiting 200ms per test.
+struct Fade {
+    /// The window being faded. Held rather than located again each frame: the
+    /// whole thing lasts 200ms, and re-enumerating the desktop per frame to
+    /// re-confirm what was found moments ago would be work for nothing.
+    handle: u64,
+    started: std::time::Instant,
+}
+
+/// What starting a Retrieve turned into.
+enum Started {
+    /// The fade is running. Drive it with [`Fade::advance`].
+    Fading(Fade),
+    /// Nothing was animated and the Retrieve is already over, either because
+    /// it was refused or because the window would not go translucent.
+    Cut(Result<String, Failure>),
+}
+
+impl Fade {
+    /// Begin, or fall back to the hard cut this replaced.
+    fn begin(core: &mut Core, now: std::time::Instant) -> Started {
+        // Everything that can fail about the Retrieve is on this side, so a
+        // fade never starts for one that was going to be refused. It also puts
+        // the displaced windows back while the sent window is still opaque and
+        // still covering them, which is what the fade then reveals.
+        let handle = match core.begin_retrieve() {
+            Ok(handle) => handle,
+            Err(failure) => return Started::Cut(Err(failure)),
+        };
+
+        // The first step is full opacity, so a window that will not join the
+        // layered band at all says so here — before anything on screen has
+        // changed, and while a plain cut is still the whole of the fallback.
+        if core.platform.set_window_opacity(handle, 1.0).is_err() {
+            let fade = Self { handle, started: now };
+            return Started::Cut(fade.finish(core));
+        }
+
+        Started::Fading(Self { handle, started: now })
+    }
+
+    /// How opaque the window should be, or `None` once the ramp is over.
+    fn alpha(&self, now: std::time::Instant) -> Option<f32> {
+        // Saturating, so a clock that steps backwards reads as no time passed
+        // rather than as a negative alpha.
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed >= FADE {
+            return None;
+        }
+        Some(1.0 - elapsed.as_secs_f32() / FADE.as_secs_f32())
+    }
+
+    /// Advance one frame. `None` while still fading, otherwise the outcome of
+    /// the completed Retrieve.
+    fn advance(&self, core: &mut Core, now: std::time::Instant) -> Option<Result<String, Failure>> {
+        match self.alpha(now) {
+            Some(alpha) if core.platform.set_window_opacity(self.handle, alpha).is_ok() => None,
+            // Either the ramp is over, or the window stopped accepting an
+            // opacity at all — having closed mid-animation being the likely
+            // reason. Both end the same way, because a fade that stops part
+            // way through is the one outcome this must never leave behind.
+            _ => Some(self.finish(core)),
+        }
+    }
+
+    /// The one place a fade ends.
+    ///
+    /// Every path out of the animation comes through here — finished, failed,
+    /// interrupted by another press, or the app going down — so there is a
+    /// single place to be sure the window lands opaque and un-layered. A
+    /// window stuck at forty percent on camera is a visible fault, where the
+    /// hard cut this replaced was merely unremarkable.
+    fn finish(&self, core: &mut Core) -> Result<String, Failure> {
+        let outcome = core.finish_retrieve(self.handle);
+        // After the move, and whether or not it worked. Opacity is not
+        // conditional on anything.
+        let _ = core.platform.clear_window_opacity(self.handle);
+        outcome
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Ok,
@@ -139,6 +231,8 @@ pub struct WinSendApp {
     configuring: bool,
     /// Whether the picker's viewport is open.
     picking: bool,
+    /// A Retrieve fading the window out, if one is running.
+    fading: Option<Fade>,
     status: StatusLog,
     /// Picker contents, snapshotted when it opens so the list does not
     /// reshuffle under the cursor while the user is reading it.
@@ -180,6 +274,7 @@ impl WinSendApp {
             shell,
             configuring: false,
             picking: false,
+            fading: None,
             status: StatusLog::default(),
             candidates: Vec::new(),
             thumbnails: HashMap::new(),
@@ -220,11 +315,71 @@ impl WinSendApp {
     /// Run an action, however it was asked for. A hotkey press and a button
     /// click are the same thing by the time they reach here.
     fn perform(&mut self, ctx: &egui::Context, action: Action) {
-        let outcome = match action {
-            Action::Send => self.core.send(),
-            Action::Retrieve => self.core.retrieve(),
+        // A press arriving mid-fade finishes it at once rather than queueing
+        // behind it. The operator pressing a key twice means they want it
+        // done, not animated twice.
+        let interrupted_a_fade = self.finish_fade(ctx);
+
+        match action {
+            // Send is the urgent half and still has to happen. It just acts on
+            // a window that has finished moving rather than on one caught part
+            // way through being moved.
+            Action::Send => {
+                let outcome = self.core.send();
+                self.report(ctx, outcome);
+            }
+            // The fade that was just cut short *was* the Retrieve. Starting
+            // another would only produce "nothing has been sent yet".
+            Action::Retrieve if interrupted_a_fade => {}
+            Action::Retrieve => self.start_retrieve(ctx),
+        }
+    }
+
+    /// Retrieve, with the fade when it is wanted and a hard cut when it is not.
+    fn start_retrieve(&mut self, ctx: &egui::Context) {
+        if !self.core.config.fade_on_retrieve {
+            let outcome = self.core.retrieve();
+            self.report(ctx, outcome);
+            return;
+        }
+
+        match Fade::begin(&mut self.core, std::time::Instant::now()) {
+            Started::Fading(fade) => {
+                self.fading = Some(fade);
+                ctx.request_repaint();
+            }
+            Started::Cut(outcome) => self.report(ctx, outcome),
+        }
+    }
+
+    /// Advance a fade by one frame, if one is running.
+    fn fade_step(&mut self, ctx: &egui::Context) {
+        // Taken out and put back rather than borrowed, so the fade can be
+        // handed `&mut self.core` without the two borrows overlapping.
+        let Some(fade) = self.fading.take() else {
+            return;
         };
+
+        match fade.advance(&mut self.core, std::time::Instant::now()) {
+            None => {
+                self.fading = Some(fade);
+                // Unconditional rather than `request_repaint_after`: hidden to
+                // the tray the loop is already on a 100ms timer, which would
+                // step a 200ms fade about twice.
+                ctx.request_repaint();
+            }
+            Some(outcome) => self.report(ctx, outcome),
+        }
+    }
+
+    /// End a fade now, wherever it had got to. Says whether there was one.
+    fn finish_fade(&mut self, ctx: &egui::Context) -> bool {
+        let Some(fade) = self.fading.take() else {
+            return false;
+        };
+        let outcome = fade.finish(&mut self.core);
         self.report(ctx, outcome);
+        true
     }
 
     fn handle(&mut self, ctx: &egui::Context, event: ShellEvent) {
@@ -249,6 +404,10 @@ impl WinSendApp {
             // The only path that actually exits. Everything else, including
             // the window's own close button, hides instead.
             ShellEvent::Quit => {
+                // Before the window goes. A fade abandoned here would leave
+                // Zoom's window translucent after this process has gone, with
+                // nothing left running that could put it back.
+                self.finish_fade(ctx);
                 self.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -272,6 +431,8 @@ impl WinSendApp {
             return;
         }
         if self.quitting || !CLOSE_HIDES_TO_TRAY {
+            // Going down for real, so the same guarantee as Quit applies.
+            self.finish_fade(ctx);
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -638,6 +799,23 @@ impl WinSendApp {
         }
 
         ui.add_space(10.0);
+
+        let mut fade = self.core.config.fade_on_retrieve;
+        if checkbox(ui, &mut fade, "Fade out when retrieving")
+            .on_hover_text(
+                "Fades the video window out over a fifth of a second instead of cutting it, \
+                 so the display it leaves is uncovered smoothly. Turn this off if the window \
+                 flickers or the fade stutters: it needs the window to be composed differently \
+                 while it runs, which not every application takes kindly to.",
+            )
+            .changed()
+        {
+            if let Err(message) = self.core.set_fade_on_retrieve(fade) {
+                self.status.push(Outcome::Err, message);
+            }
+        }
+
+        ui.add_space(10.0);
         ui.separator();
         ui.add_space(6.0);
 
@@ -909,6 +1087,10 @@ impl eframe::App for WinSendApp {
         for event in self.shell.poll() {
             self.handle(ctx, event);
         }
+        // Before the hidden check below, since a Retrieve can be triggered by
+        // a hotkey while the window is in the tray and its fade still has to
+        // run to completion.
+        self.fade_step(ctx);
         // Before any widget sees the keyboard, so a capture in progress takes
         // every press for itself.
         self.capture_step(ctx);
@@ -1143,6 +1325,193 @@ mod tests {
         log.push(Outcome::Err, "Copied to the clipboard");
 
         assert_eq!(log.iter().count(), 2);
+    }
+
+    mod fading {
+        use super::*;
+        use crate::core::test_support::{
+            core_with_confirmed_video_window, MEDIA_WINDOW, VIDEO_WINDOW,
+        };
+        use crate::mock::Call;
+        use std::time::Instant;
+
+        /// A Core with something to retrieve, and a player on the target
+        /// display that Send will have pushed out of the way.
+        fn sent() -> (Core, Instant) {
+            let mut core = core_with_confirmed_video_window();
+            let mock = core.platform.as_mock().unwrap();
+            mock.set_topmost(MEDIA_WINDOW, true).unwrap();
+            mock.bring_to_front(MEDIA_WINDOW);
+            core.send().expect("the send must succeed");
+            (core, Instant::now())
+        }
+
+        fn begin(core: &mut Core, now: Instant) -> Fade {
+            match Fade::begin(core, now) {
+                Started::Fading(fade) => fade,
+                Started::Cut(_) => panic!("the mock window accepts opacity, so it must fade"),
+            }
+        }
+
+        #[test]
+        fn the_ramp_runs_from_opaque_to_gone() {
+            let fade = Fade { handle: VIDEO_WINDOW, started: Instant::now() };
+            let at = |ms| fade.alpha(fade.started + std::time::Duration::from_millis(ms));
+
+            assert_eq!(at(0), Some(1.0), "it starts where the window already is");
+            assert!(
+                at(100).is_some_and(|alpha| (alpha - 0.5).abs() < 0.01),
+                "halfway through is halfway down, got {:?}",
+                at(100)
+            );
+            assert_eq!(at(200), None, "the ramp is over rather than at zero");
+            assert_eq!(at(5_000), None, "and stays over");
+        }
+
+        /// A clock that steps backwards must read as no time passed, not as a
+        /// negative alpha that would clamp to invisible.
+        #[test]
+        fn a_clock_that_goes_backwards_does_not_make_the_window_vanish() {
+            let started = Instant::now() + std::time::Duration::from_secs(1);
+            let fade = Fade { handle: VIDEO_WINDOW, started };
+            assert_eq!(fade.alpha(Instant::now()), Some(1.0));
+        }
+
+        #[test]
+        fn the_window_goes_translucent_while_it_fades() {
+            let (mut core, now) = sent();
+            let fade = begin(&mut core, now);
+
+            let still_going =
+                fade.advance(&mut core, now + std::time::Duration::from_millis(100));
+
+            assert!(still_going.is_none(), "it is not finished halfway through");
+            let opacity = core.platform.as_mock().unwrap().opacity(VIDEO_WINDOW);
+            assert!(
+                opacity.is_some_and(|alpha| (100..=155).contains(&alpha)),
+                "about half opaque, got {opacity:?}"
+            );
+        }
+
+        /// The end state that matters most. Whatever happened on the way, the
+        /// window is opaque and carries nothing that was making it otherwise.
+        #[test]
+        fn the_fade_ends_opaque_and_carrying_nothing() {
+            let (mut core, now) = sent();
+            let fade = begin(&mut core, now);
+
+            let outcome = fade.advance(&mut core, now + FADE);
+
+            assert!(outcome.is_some_and(|result| result.is_ok()), "it completes the retrieve");
+            assert_eq!(
+                core.platform.as_mock().unwrap().opacity(VIDEO_WINDOW),
+                None,
+                "nothing may be left holding the window translucent"
+            );
+        }
+
+        /// A second press mid-fade finishes it rather than queueing behind it,
+        /// and must land on the same end state as running to completion.
+        #[test]
+        fn finishing_early_still_lands_opaque() {
+            let (mut core, now) = sent();
+            let fade = begin(&mut core, now);
+            fade.advance(&mut core, now + std::time::Duration::from_millis(40));
+
+            let outcome = fade.finish(&mut core);
+
+            assert!(outcome.is_ok());
+            assert_eq!(core.platform.as_mock().unwrap().opacity(VIDEO_WINDOW), None);
+        }
+
+        /// The failure the whole design is arranged around: a window that goes
+        /// away part-way through must not leave anything half-applied.
+        #[test]
+        fn a_window_that_closes_mid_fade_does_not_stay_translucent() {
+            let (mut core, now) = sent();
+            let fade = begin(&mut core, now);
+            fade.advance(&mut core, now + std::time::Duration::from_millis(60));
+
+            core.platform.as_mock().unwrap().set_zoom_present(false);
+            let outcome = fade.advance(&mut core, now + std::time::Duration::from_millis(120));
+
+            assert!(outcome.is_some(), "it gives up rather than ramping against nothing");
+            assert_eq!(
+                core.platform.as_mock().unwrap().opacity(VIDEO_WINDOW),
+                None,
+                "the opacity is cleared even though the window went away"
+            );
+        }
+
+        /// The reordering the fade exists to make use of: the player is back
+        /// underneath the still-opaque window before any of it fades, so what
+        /// the fade reveals is the thing that belongs there.
+        #[test]
+        fn the_player_is_back_before_any_of_the_fade_happens() {
+            let (mut core, now) = sent();
+            let fade = begin(&mut core, now);
+            fade.advance(&mut core, now + FADE);
+
+            let calls = core.platform.as_mock().unwrap().calls();
+            let restored = calls
+                .iter()
+                .rposition(|call| *call == Call::Raised(MEDIA_WINDOW))
+                .expect("the player must be put back");
+            let first_fade = calls
+                .iter()
+                .position(|call| matches!(call, Call::Opacity(handle, _) if *handle == VIDEO_WINDOW))
+                .expect("the window must be faded");
+
+            assert!(restored < first_fade, "got: {calls:?}");
+        }
+
+        /// And the move happens after the fade rather than during it, so the
+        /// window is invisible by the time it jumps to the other display.
+        #[test]
+        fn the_window_moves_only_once_it_has_faded_out() {
+            let (mut core, now) = sent();
+            let fade = begin(&mut core, now);
+            fade.advance(&mut core, now + FADE);
+
+            let calls = core.platform.as_mock().unwrap().calls();
+            let last_fade = calls
+                .iter()
+                .rposition(|call| matches!(call, Call::Opacity(handle, _) if *handle == VIDEO_WINDOW))
+                .expect("the window must be faded");
+            let moved = calls
+                .iter()
+                .rposition(|call| *call == Call::Placed(VIDEO_WINDOW))
+                .expect("the window must move back");
+            let cleared = calls
+                .iter()
+                .rposition(|call| *call == Call::OpacityCleared(VIDEO_WINDOW))
+                .expect("the opacity must be put back");
+
+            assert!(last_fade < moved, "the fade finishes before the move: {calls:?}");
+            assert!(moved < cleared, "and it is opaque again only once home: {calls:?}");
+        }
+
+        /// A Retrieve with nothing to restore must be refused before anything
+        /// is made translucent, rather than fading a window and then failing.
+        #[test]
+        fn nothing_fades_when_there_is_nothing_to_retrieve() {
+            let mut core = core_with_confirmed_video_window();
+
+            let started = Fade::begin(&mut core, Instant::now());
+
+            assert!(matches!(started, Started::Cut(Err(_))));
+            assert_eq!(core.platform.as_mock().unwrap().opacity(VIDEO_WINDOW), None);
+            assert!(
+                !core
+                    .platform
+                    .as_mock()
+                    .unwrap()
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, Call::Opacity(..))),
+                "the window must never have been touched"
+            );
+        }
     }
 }
 
