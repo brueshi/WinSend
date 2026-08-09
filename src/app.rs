@@ -67,6 +67,11 @@ const OK: egui::Color32 = egui::Color32::from_rgb(102, 187, 122);
 const ERR: egui::Color32 = egui::Color32::from_rgb(226, 106, 106);
 const SUBDUED: egui::Color32 = egui::Color32::from_gray(150);
 
+/// Half the height of the tallest control, which is what makes a rectangle a
+/// pill. epaint clamps this to half of whatever it is actually painting, so the
+/// same value is correct for every control regardless of its height.
+const PILL: egui::CornerRadius = egui::CornerRadius::same(19);
+
 /// How many recent messages the status strip keeps.
 ///
 /// Enough that a message cannot be pushed out before it has been read, which
@@ -487,7 +492,7 @@ impl WinSendApp {
             ui.separator();
             if let Some(mock) = self.core.platform.as_mock() {
                 let mut present = mock.zoom_present();
-                if ui.checkbox(&mut present, "mock: Zoom running").changed() {
+                if checkbox(ui, &mut present, "mock: Zoom running").changed() {
                     mock.set_zoom_present(present);
                 }
             }
@@ -601,8 +606,7 @@ impl WinSendApp {
         ui.add_space(8.0);
 
         let mut clear_target = self.core.config.clear_target;
-        if ui
-            .checkbox(&mut clear_target, "Minimise other windows on this monitor")
+        if checkbox(ui, &mut clear_target, "Minimise other windows on this monitor")
             .on_hover_text(
                 "Minimises anything filling the target monitor when sending, and restores it on Retrieve. \
                  Use this when something full screen refuses to give up the display. \
@@ -618,8 +622,7 @@ impl WinSendApp {
         ui.add_space(10.0);
 
         let mut borderless = self.core.config.borderless;
-        if ui
-            .checkbox(&mut borderless, "Strip window frame when sending")
+        if checkbox(ui, &mut borderless, "Strip window frame when sending")
             .on_hover_text("Removes the title bar and border so the window fills the monitor edge to edge")
             .changed()
         {
@@ -938,6 +941,24 @@ fn tray_state(core: &Core) -> TrayState {
     TrayState { can_retrieve: core.can_retrieve(), tooltip }
 }
 
+/// A checkbox, kept square while everything around it is a pill.
+///
+/// The pill radius turns egui's checkbox into a circle, and a circle means
+/// "one of these" in every other piece of desktop software. These settings are
+/// independent of each other, so a round box would be claiming something that
+/// is not true of them.
+fn checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let square = egui::CornerRadius::same(4);
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.corner_radius = square;
+        widgets.hovered.corner_radius = square;
+        widgets.active.corner_radius = square;
+        ui.checkbox(checked, label)
+    })
+    .inner
+}
+
 /// Translate an egui key into one that can be registered with Windows.
 ///
 /// Returning `None` is the normal answer for anything without a virtual-key
@@ -1116,10 +1137,38 @@ fn apply_style(ctx: &egui::Context) {
     visuals.window_fill = egui::Color32::from_gray(20);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(48);
     visuals.selection.bg_fill = ACCENT.gamma_multiply(0.5);
+
+    // Every interactive state, not just the resting one. A radius set on
+    // `inactive` alone gives a button that changes shape the moment the
+    // pointer touches it, which reads as a rendering fault rather than as a
+    // style.
+    //
+    // One value serves every control because epaint clamps the radius to half
+    // of whatever rectangle it is painting, so this is a full pill on the
+    // 38px main buttons and on a checkbox alike, without a table of sizes to
+    // keep in step with the layout.
+    for widget in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = PILL;
+    }
+
+    // Deliberately not a pill. `noninteractive` is what frames the grouped
+    // rows in the picker and the panel separators, and a 19px radius on a
+    // full-width card makes it a lozenge rather than a container.
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
+    visuals.window_corner_radius = egui::CornerRadius::same(10);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
+
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    // Wider than it was: a pill curves away from its text at both ends, and
+    // the old padding left short labels touching the curve.
+    style.spacing.button_padding = egui::vec2(14.0, 6.0);
     ctx.set_style(style);
 }
