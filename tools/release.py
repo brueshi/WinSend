@@ -126,6 +126,17 @@ def main() -> None:
     )
     if not BUILT.exists():
         sys.exit(f"the build reported success but {BUILT} is not there")
+    if BUILT.name != ASSET:
+        sys.exit(f"the build produced {BUILT.name}, and the updater looks for {ASSET}")
+
+    # Before publishing, and this order is not incidental. `gh release create`
+    # creates the tag remotely if it is not already there, and it creates it at
+    # the default branch's head — which would be the commit before the bump.
+    # The release would then point at a tree whose Cargo.toml reports the
+    # previous version, which is the exact drift this script exists to prevent.
+    print("pushing the bump and the tag")
+    run(["git", "push", "origin", "HEAD"])
+    run(["git", "push", "origin", tag])
 
     print(f"publishing {tag}")
     run(
@@ -134,7 +145,7 @@ def main() -> None:
             "release",
             "create",
             tag,
-            str(BUILT) + "#" + ASSET,
+            str(BUILT),
             "--title",
             f"{tag} — {args.notes}" if args.notes else tag,
             "--notes",
@@ -143,7 +154,7 @@ def main() -> None:
         ]
     )
 
-    print(f"released {tag}. Push it with: git push origin main {tag}")
+    print(f"released {tag}")
 
 
 if __name__ == "__main__":
