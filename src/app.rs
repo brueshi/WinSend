@@ -12,8 +12,14 @@ use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
 /// The height of the surface with the configuration folded away.
 ///
 /// This is the shape that matters: it sits on screen during a broadcast, so it
-/// stays as small as two large buttons and a line of status allow.
-pub const COMPACT_HEIGHT: f32 = 260.0 + MOCK_CONTROLS_HEIGHT;
+/// stays as small as two large buttons and the status strip allow.
+///
+/// The strip costs the live window its full height, where the single label it
+/// replaced cost nothing until it had something to say. That is what a message
+/// which cannot be overwritten before it is read is worth, and it is paid in
+/// window height rather than out of the controls, which are pressed under
+/// pressure and do not shrink to make room for anything.
+pub const COMPACT_HEIGHT: f32 = 260.0 + STATUS_HEIGHT + MOCK_CONTROLS_HEIGHT;
 
 /// Room for the mock-only debug controls, where they are compiled in.
 ///
@@ -28,7 +34,7 @@ const MOCK_CONTROLS_HEIGHT: f32 = 56.0;
 /// The height with the configuration disclosed. The window grows to this and
 /// shrinks back, and only ever because the user asked it to — which is the
 /// whole difference between a response and a surprise.
-const EXPANDED_HEIGHT: f32 = 690.0 + MOCK_CONTROLS_HEIGHT;
+const EXPANDED_HEIGHT: f32 = 690.0 + STATUS_HEIGHT + MOCK_CONTROLS_HEIGHT;
 /// The width the window opens at, and what a resize falls back to when the
 /// current width cannot be read.
 pub const DEFAULT_WIDTH: f32 = 340.0;
@@ -61,10 +67,63 @@ const OK: egui::Color32 = egui::Color32::from_rgb(102, 187, 122);
 const ERR: egui::Color32 = egui::Color32::from_rgb(226, 106, 106);
 const SUBDUED: egui::Color32 = egui::Color32::from_gray(150);
 
-enum Status {
-    Idle,
-    Ok(String),
-    Err(String),
+/// How many recent messages the status strip keeps.
+///
+/// Enough that a message cannot be pushed out before it has been read, which
+/// is the whole complaint against a single label, and few enough that what is
+/// on screen is still status rather than history.
+const STATUS_HISTORY: usize = 3;
+
+/// The strip's height, reserved whether or not there is anything to say.
+///
+/// Fixed on purpose. A strip that grew with each message would move the
+/// disclosure underneath it, and a control that shifts while the operator is
+/// reaching for it is a worse failure than a blank strip.
+const STATUS_HEIGHT: f32 = 52.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Ok,
+    Err,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Message {
+    outcome: Outcome,
+    text: String,
+}
+
+/// The last few things that happened, newest first.
+///
+/// A list rather than one label because the old one was overwritten by
+/// whatever came next: a Send followed immediately by a hotkey report left no
+/// trace of the first, and a message that vanished before it was read was
+/// never delivered.
+#[derive(Debug, Default)]
+struct StatusLog {
+    messages: std::collections::VecDeque<Message>,
+}
+
+impl StatusLog {
+    fn push(&mut self, outcome: Outcome, text: impl Into<String>) {
+        let message = Message { outcome, text: text.into() };
+
+        // Pressing Send twice is a normal thing to do here and says the same
+        // thing twice. Repeating it would push the two messages that give it
+        // context out of a three-deep list for no information at all.
+        if self.messages.front() == Some(&message) {
+            return;
+        }
+
+        self.messages.push_front(message);
+        self.messages.truncate(STATUS_HISTORY);
+    }
+
+    /// Newest first, which is where the eye goes and where the message that
+    /// just arrived belongs.
+    fn iter(&self) -> impl Iterator<Item = &Message> {
+        self.messages.iter()
+    }
 }
 
 pub struct WinSendApp {
@@ -75,7 +134,7 @@ pub struct WinSendApp {
     configuring: bool,
     /// Whether the picker's viewport is open.
     picking: bool,
-    status: Status,
+    status: StatusLog,
     /// Picker contents, snapshotted when it opens so the list does not
     /// reshuffle under the cursor while the user is reading it.
     candidates: Vec<WindowCandidate>,
@@ -110,7 +169,7 @@ impl WinSendApp {
             shell,
             configuring: false,
             picking: false,
-            status: Status::Idle,
+            status: StatusLog::default(),
             candidates: Vec::new(),
             thumbnails: HashMap::new(),
             capturing: None,
@@ -136,10 +195,10 @@ impl WinSendApp {
     /// their own way to Settings.
     fn report(&mut self, ctx: &egui::Context, outcome: Result<String, Failure>) {
         match outcome {
-            Ok(message) => self.status = Status::Ok(message),
+            Ok(message) => self.status.push(Outcome::Ok, message),
             Err(failure) => {
                 let needs_selection = failure.needs_selection;
-                self.status = Status::Err(failure.message);
+                self.status.push(Outcome::Err, failure.message);
                 if needs_selection {
                     self.open_picker(ctx);
                 }
@@ -165,7 +224,7 @@ impl WinSendApp {
             // this feature cannot afford.
             ShellEvent::HotkeysApplied(report) => {
                 if let Some(summary) = report.summary() {
-                    self.status = Status::Err(summary);
+                    self.status.push(Outcome::Err, summary);
                 }
                 self.hotkey_report = report;
             }
@@ -220,10 +279,13 @@ impl WinSendApp {
     /// swallowed by the OS and never reaches this window, so without this,
     /// rebinding a key to itself — or to the other action's key — would look
     /// like the capture had simply stopped working.
+    /// The log is deliberately not cleared here. It used to be, because one
+    /// label showing a stale error while the user pressed keys was confusing;
+    /// with a list the new message simply arrives on top, and throwing away
+    /// what came before would be the very thing this replaced.
     fn start_capture(&mut self, action: Action) {
         self.capturing = Some(action);
         self.shell.apply_hotkeys(Default::default());
-        self.status = Status::Idle;
     }
 
     fn end_capture(&mut self) {
@@ -269,15 +331,15 @@ impl WinSendApp {
         // A rejected combination leaves the capture running, so the user can
         // correct it by pressing another rather than starting over.
         if let Err(why) = hotkey.validate() {
-            self.status = Status::Err(why);
+            self.status.push(Outcome::Err, why);
             return;
         }
         match self.core.set_hotkey(action, Some(hotkey)) {
             Ok(message) => {
-                self.status = Status::Ok(message);
+                self.status.push(Outcome::Ok, message);
                 self.end_capture();
             }
-            Err(failure) => self.status = Status::Err(failure.message),
+            Err(failure) => self.status.push(Outcome::Err, failure.message),
         }
     }
 
@@ -335,17 +397,30 @@ impl WinSendApp {
         self.candidates.clear();
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
-        let (text, colour) = match &self.status {
-            Status::Idle => (String::new(), egui::Color32::GRAY),
-            Status::Ok(message) => (message.clone(), OK),
-            Status::Err(message) => (message.clone(), ERR),
-        };
-        if text.is_empty() {
-            return;
-        }
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new(text).color(colour).size(11.5));
+    /// The status strip, in its own panel at the foot of the window.
+    ///
+    /// A panel rather than the last thing in the surface so that it is in the
+    /// same place whether the configuration is disclosed or not, and so that
+    /// nothing above it moves as messages arrive.
+    fn status_strip(&self, ui: &mut egui::Ui) {
+        // Scrolls rather than truncates. A message worth showing is worth
+        // showing whole, and the ones that overflow are the long ones that
+        // explain a failure.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                for (age, message) in self.status.iter().enumerate() {
+                    let colour = match message.outcome {
+                        Outcome::Ok => OK,
+                        Outcome::Err => ERR,
+                    };
+                    // Older messages recede rather than disappear, which says
+                    // which one just arrived without a clock the window would
+                    // have to keep repainting to keep honest.
+                    let colour = if age == 0 { colour } else { colour.gamma_multiply(0.55) };
+                    ui.label(egui::RichText::new(&message.text).color(colour).size(11.5));
+                }
+            });
     }
 
     /// The whole interface: the live controls, then the configuration when it
@@ -403,7 +478,6 @@ impl WinSendApp {
             self.perform(ctx, action);
         }
 
-        self.status_bar(ui);
 
         // Mock-only: exercise the "window vanished" path without needing Zoom,
         // and the hotkey path without a real key registration.
@@ -537,7 +611,7 @@ impl WinSendApp {
             .changed()
         {
             if let Err(message) = self.core.set_clear_target(clear_target) {
-                self.status = Status::Err(message);
+                self.status.push(Outcome::Err, message);
             }
         }
 
@@ -550,7 +624,7 @@ impl WinSendApp {
             .changed()
         {
             if let Err(message) = self.core.set_borderless(borderless) {
-                self.status = Status::Err(message);
+                self.status.push(Outcome::Err, message);
             }
         }
 
@@ -604,7 +678,6 @@ impl WinSendApp {
             );
         }
 
-        self.status_bar(ui);
     }
 
     fn hotkey_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -840,6 +913,12 @@ impl eframe::App for WinSendApp {
             return;
         }
 
+        // Before the central panel, as egui requires, and at the foot of the
+        // window so the strip is in one place whether the configuration is
+        // disclosed or not.
+        egui::TopBottomPanel::bottom("status")
+            .exact_height(STATUS_HEIGHT)
+            .show(ctx, |ui| self.status_strip(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.surface(ui, ctx));
         // After the surface, so a Send that could not identify the window has
         // already asked for the picker and it opens in the same frame.
@@ -954,6 +1033,74 @@ mod tests {
     fn keys_windows_cannot_register_are_ignored() {
         assert_eq!(key_from_egui(egui::Key::F35), None);
         assert_eq!(key_from_egui(egui::Key::Plus), None);
+    }
+
+    fn texts(log: &StatusLog) -> Vec<&str> {
+        log.iter().map(|message| message.text.as_str()).collect()
+    }
+
+    /// The whole point of a list. A Send followed by a hotkey report used to
+    /// leave no trace of the Send at all.
+    #[test]
+    fn a_message_is_not_lost_to_the_one_after_it() {
+        let mut log = StatusLog::default();
+        log.push(Outcome::Ok, "Sent to 1920x1080");
+        log.push(Outcome::Err, "Send hotkey unavailable");
+
+        assert_eq!(
+            texts(&log),
+            vec!["Send hotkey unavailable", "Sent to 1920x1080"],
+            "newest first, and the earlier one survives"
+        );
+    }
+
+    #[test]
+    fn only_the_most_recent_few_are_kept() {
+        let mut log = StatusLog::default();
+        for n in 0..STATUS_HISTORY + 2 {
+            log.push(Outcome::Ok, format!("message {n}"));
+        }
+
+        assert_eq!(log.iter().count(), STATUS_HISTORY);
+        assert_eq!(texts(&log)[0], "message 4", "the newest is still on top");
+    }
+
+    /// Pressing Send twice is normal here and says the same thing twice.
+    /// Repeating it would push out the messages that give it context.
+    #[test]
+    fn saying_the_same_thing_twice_running_does_not_repeat_it() {
+        let mut log = StatusLog::default();
+        log.push(Outcome::Ok, "Sent to 1920x1080");
+        log.push(Outcome::Ok, "Sent to 1920x1080");
+
+        assert_eq!(texts(&log), vec!["Sent to 1920x1080"]);
+    }
+
+    /// Only when they are consecutive. The same message either side of a
+    /// failure is two separate events and reads as one if the second is
+    /// swallowed.
+    #[test]
+    fn the_same_message_after_something_else_is_still_shown() {
+        let mut log = StatusLog::default();
+        log.push(Outcome::Ok, "Sent to 1920x1080");
+        log.push(Outcome::Err, "Could not move the window");
+        log.push(Outcome::Ok, "Sent to 1920x1080");
+
+        assert_eq!(
+            texts(&log),
+            vec!["Sent to 1920x1080", "Could not move the window", "Sent to 1920x1080"]
+        );
+    }
+
+    /// The same words are not the same message when one is a success and the
+    /// other a failure, so the outcome has to be part of the comparison.
+    #[test]
+    fn the_same_words_with_a_different_outcome_are_two_messages() {
+        let mut log = StatusLog::default();
+        log.push(Outcome::Ok, "Copied to the clipboard");
+        log.push(Outcome::Err, "Copied to the clipboard");
+
+        assert_eq!(log.iter().count(), 2);
     }
 }
 
