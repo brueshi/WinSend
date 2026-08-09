@@ -16,8 +16,11 @@ thumbnail capture, global hotkeys, the tray icon and its menu, the application
 icons, and getting the sent window in front of a full-screen media player on the
 target display.
 
-Not yet verified: hide-to-tray, and whether a media player that gives up the
-display on losing focus is reliably restored on Retrieve.
+Not yet verified: hide-to-tray, whether a media player that gives up the
+display on losing focus is reliably restored on Retrieve, the Windows 11 title
+bar and corner styling, and the fade on Retrieve. The last of those is the one
+to watch, since a GPU-composited window may not take kindly to being made
+translucent; **Fade out when retrieving** in Settings turns it off.
 
 Everything above the platform seam — the UI, configuration, window identity,
 binding rules, and the whole of Send and Retrieve including which windows are in
@@ -87,6 +90,17 @@ Five decisions worth knowing:
   it needs around 640px of height to compare thumbnails, which is more than the
   live surface should ever be, so it opens as a window of its own rather than
   as somewhere the app navigates to.
+- **Retrieve fades, Send cuts.** Send is the half under pressure, where a fifth
+  of a second is a cost paid at the worst moment; Retrieve is the relaxed half,
+  where something is coming off air and nobody is waiting. The fade also
+  depends on the ordering above: displaced windows go back while the sent
+  window is still opaque and still covering them, so the fade uncovers what
+  belongs there rather than a bare desktop the player then snaps onto. Because
+  a window stuck part-way transparent on camera is far worse than no fade at
+  all, every path out of the animation — finishing, the window closing, another
+  press, quitting — runs through one place that restores full opacity
+  unconditionally, and a window that will not go translucent falls back to a
+  hard cut before anything on screen has changed.
 - **Getting in front of full-screen media is a focus problem, not a z-order
   one.** This took six attempts to learn and is the least obvious thing in the
   codebase. A full-screen media player is managed outside the normal stacking
