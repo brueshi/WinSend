@@ -79,6 +79,14 @@ Five decisions worth knowing:
   they press it. Pressing Send twice is already a no-op, where double-tapping a
   toggle would bounce the window mid-broadcast.
 
+- **The interface is one surface, and only the user resizes it.** Send,
+  Retrieve and the status strip share a window with the configuration, which
+  folds into a disclosure that grows the window when opened and shrinks it when
+  closed. Three screens that swapped and resized on every navigation meant the
+  window jumped size when nobody had asked it to. The picker is the exception:
+  it needs around 640px of height to compare thumbnails, which is more than the
+  live surface should ever be, so it opens as a window of its own rather than
+  as somewhere the app navigates to.
 - **Getting in front of full-screen media is a focus problem, not a z-order
   one.** This took six attempts to learn and is the least obvious thing in the
   codebase. A full-screen media player is managed outside the normal stacking
@@ -141,8 +149,9 @@ PATH="$(brew --prefix lld)/bin:$PATH" \
 `WINSEND_MOCK=1` forces the mock platform and shell on Windows, which is useful
 for working on the interface without a meeting running and without taking real
 hotkeys off the machine. In debug builds, `WINSEND_SCREEN=settings|select` opens
-straight onto a screen, and the main screen carries mock controls that inject
-hotkey presses and tray menu choices through the same path a real one takes.
+straight onto the configuration or the picker, and the surface carries mock
+controls that inject hotkey presses and tray menu choices through the same path
+a real one takes.
 
 The tray icon is drawn by a script rather than committed as an opaque binary:
 
