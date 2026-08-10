@@ -227,6 +227,80 @@ impl FromStr for Hotkey {
     }
 }
 
+/// A combination to synthesize into another application, not to register.
+///
+/// Distinct from [`Hotkey`] because the two live under opposite rules. A
+/// registered hotkey must not swallow a typable key, so `Hotkey` insists on a
+/// modifier; a synthesized chord is whatever the target application's own
+/// shortcut happens to be, and for a media player that is usually a bare `F`
+/// or `Enter`. There is deliberately no Win modifier: synthesizing Win+key
+/// would trigger operating-system shortcuts in the middle of someone's
+/// desktop, and no player uses one.
+///
+/// Unconstructed outside tests until the platform seam grows `send_key`,
+/// which is the next commit; the allowance goes with it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeyChord {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub key: Key,
+}
+
+impl fmt::Display for KeyChord {
+    /// Modifiers in the same fixed order as [`Hotkey`], so chords and
+    /// bindings read alike wherever they appear together.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (present, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")] {
+            if present {
+                write!(f, "{name}+")?;
+            }
+        }
+        write!(f, "{}", self.key)
+    }
+}
+
+impl FromStr for KeyChord {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('+').map(str::trim).collect();
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err(format!("\"{s}\" is not a well-formed combination"));
+        }
+
+        // `split` never yields an empty vector, and the check above rules out
+        // the single-empty-part case, so there is always a key to take.
+        let (key_name, modifiers) = parts.split_last().expect("at least one part");
+
+        let mut chord = KeyChord {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            key: key_name.parse()?,
+        };
+
+        for modifier in modifiers {
+            let slot = match modifier.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => &mut chord.ctrl,
+                "alt" => &mut chord.alt,
+                "shift" => &mut chord.shift,
+                "win" | "super" | "meta" => {
+                    return Err("Win cannot be synthesized: it would trigger system shortcuts".into());
+                }
+                other => return Err(format!("\"{other}\" is not a modifier")),
+            };
+            if *slot {
+                return Err(format!("\"{modifier}\" appears more than once"));
+            }
+            *slot = true;
+        }
+
+        Ok(chord)
+    }
+}
+
 /// What a hotkey press should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -381,6 +455,38 @@ mod tests {
     fn nothing_is_bound_by_default() {
         let hotkeys = Hotkeys::default();
         assert!(Action::ALL.iter().all(|a| hotkeys.binding(*a).is_none()));
+    }
+
+    fn parse_chord(s: &str) -> KeyChord {
+        s.parse().unwrap_or_else(|e| panic!("{s:?} should parse: {e}"))
+    }
+
+    #[test]
+    fn chords_round_trip_through_their_written_form() {
+        for text in ["F", "Enter", "F11", "Alt+Enter", "Ctrl+Shift+F", "Space"] {
+            assert_eq!(parse_chord(text).to_string(), text);
+        }
+    }
+
+    /// The reason `KeyChord` exists at all: a bare letter is a perfectly good
+    /// chord to send and a forbidden combination to register.
+    #[test]
+    fn a_bare_typable_key_is_a_valid_chord() {
+        assert_eq!(parse_chord("F").key, "F".parse::<Key>().unwrap());
+        assert!("F".parse::<Hotkey>().is_err(), "the same text must still be refused as a binding");
+    }
+
+    #[test]
+    fn chord_parsing_is_case_and_whitespace_insensitive() {
+        assert_eq!(parse_chord("alt + ENTER"), parse_chord("Alt+Enter"));
+        assert_eq!(parse_chord("CONTROL+shift+f"), parse_chord("Ctrl+Shift+F"));
+    }
+
+    #[test]
+    fn chords_reject_what_cannot_be_synthesized() {
+        for text in ["Win+F", "Super+A", "meta+Enter", "Hyper+F", "Ctrl+Nope", "Ctrl+", "+F", "", "Alt+Alt+F"] {
+            assert!(text.parse::<KeyChord>().is_err(), "{text:?} should not parse");
+        }
     }
 
     #[test]
