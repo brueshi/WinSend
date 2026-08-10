@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::hotkey::KeyChord;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bounds {
     pub x: i32,
@@ -214,6 +216,22 @@ pub trait Platform {
     /// but they give way when something else takes focus, which is exactly
     /// what clicking another window does by hand.
     fn activate(&self, handle: u64) -> Result<(), PlatformError>;
+
+    /// Press a key combination in the window, as if typed.
+    ///
+    /// The one mechanism that reaches another application's full-screen mode.
+    /// Windows has no API for asking a process to enter it — full screen is
+    /// internal state each application manages for itself — so the only honest
+    /// request is the application's own toggle shortcut, delivered as input.
+    /// Input lands wherever the focus is, so this refuses unless `handle`
+    /// holds the foreground, and refuses while a physically held modifier
+    /// would corrupt the chord. A `Denied` from either guard means "not right
+    /// now" rather than "never": the caller retries on its next look.
+    ///
+    /// Uncalled until the Retrieve pipeline grows its re-entry step, which is
+    /// the next commit; the allowance goes with it.
+    #[allow(dead_code)]
+    fn send_key(&self, handle: u64, chord: KeyChord) -> Result<(), PlatformError>;
 
     /// Take a window off screen entirely, and put it back.
     ///

@@ -23,6 +23,10 @@ use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::HiDpi::{
     GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -39,6 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
+use crate::hotkey::KeyChord;
 use crate::platform::{
     Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate,
 };
@@ -623,6 +628,85 @@ impl Platform for Win32Platform {
 
             if attached {
                 let _ = AttachThreadInput(ours, foreground_thread, false);
+            }
+        }
+        Ok(())
+    }
+
+    /// Press the chord with `SendInput`, the way typing it does.
+    ///
+    /// Injected input goes to whatever has focus, not to a window of the
+    /// caller's choosing, so the foreground check is not an optimisation — it
+    /// is the difference between toggling the player and typing an F into
+    /// someone's document.
+    fn send_key(&self, handle: u64, chord: KeyChord) -> Result<(), PlatformError> {
+        let hwnd = handle_to_hwnd(handle);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(PlatformError::WindowGone);
+            }
+            if GetForegroundWindow() != hwnd {
+                return Err(PlatformError::Denied(
+                    "the window is not in the foreground".into(),
+                ));
+            }
+
+            // A modifier the user is physically holding — most likely the
+            // Retrieve hotkey they just pressed — combines with the injected
+            // events and turns F into Ctrl+Alt+F. Refuse rather than send a
+            // corrupted chord; by the next attempt the keys are released.
+            let pressed = |vk: VIRTUAL_KEY| GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0;
+            let corrupting = [
+                (!chord.ctrl && pressed(VK_CONTROL), "Ctrl"),
+                (!chord.alt && pressed(VK_MENU), "Alt"),
+                (!chord.shift && pressed(VK_SHIFT), "Shift"),
+                (pressed(VK_LWIN) || pressed(VK_RWIN), "Win"),
+            ];
+            if let Some((_, name)) = corrupting.iter().find(|(held, _)| *held) {
+                return Err(PlatformError::Denied(format!(
+                    "{name} is still held down and would corrupt the keystroke"
+                )));
+            }
+
+            let key_event = |vk: u16, up: bool| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: 0,
+                        dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+
+            // Modifiers down, key down, key up, modifiers up in reverse — the
+            // order the same chord arrives in when typed.
+            let modifiers: Vec<u16> = [
+                (chord.ctrl, VK_CONTROL),
+                (chord.alt, VK_MENU),
+                (chord.shift, VK_SHIFT),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, vk)| vk.0)
+            .collect();
+
+            let mut inputs = Vec::with_capacity(modifiers.len() * 2 + 2);
+            inputs.extend(modifiers.iter().map(|&vk| key_event(vk, false)));
+            inputs.push(key_event(chord.key.virtual_key(), false));
+            inputs.push(key_event(chord.key.virtual_key(), true));
+            inputs.extend(modifiers.iter().rev().map(|&vk| key_event(vk, true)));
+
+            let injected = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            if injected as usize != inputs.len() {
+                // UIPI swallows input aimed at a higher-integrity process and
+                // reports it as blocked. Name the fix rather than the API.
+                return Err(PlatformError::Denied(
+                    "the input was blocked. If the player runs as administrator, WinSend must too"
+                        .into(),
+                ));
             }
         }
         Ok(())

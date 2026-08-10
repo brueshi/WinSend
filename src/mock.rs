@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::hotkey::{Action, Hotkey, Hotkeys};
+use crate::hotkey::{Action, Hotkey, Hotkeys, KeyChord};
 use crate::platform::{
     Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate,
 };
@@ -46,6 +46,10 @@ pub enum Call {
     /// ramp can be compared without worrying about float equality.
     Opacity(u64, u8),
     OpacityCleared(u64),
+    /// Constructed only from tests until the re-entry step lands, which is
+    /// the next commit; the allowance goes with it.
+    #[allow(dead_code)]
+    KeySent(u64, KeyChord),
 }
 
 pub struct MockPlatform {
@@ -80,6 +84,15 @@ pub struct MockPlatform {
     /// matter — the first is why nothing could ever be found to push aside,
     /// the second is the only trace it leaves behind.
     exclusive: RefCell<Vec<u64>>,
+    /// The windowed bounds an exclusive window resumes at instead of
+    /// restoring its own full screen, for players that come back windowed.
+    returns_windowed: RefCell<HashMap<u64, Bounds>>,
+    /// Full-screen bounds saved when a window resumed windowed, so its toggle
+    /// key can put them back. Present exactly while the window is windowed.
+    windowed_from: RefCell<HashMap<u64, Bounds>>,
+    /// Windows that stay cloaked however often they are activated, the way a
+    /// suspended application that never resumes in time does.
+    never_resumes: RefCell<Vec<u64>>,
 }
 
 impl Default for MockPlatform {
@@ -102,6 +115,9 @@ impl MockPlatform {
             activated: RefCell::new(Vec::new()),
             exclusive: RefCell::new(Vec::new()),
             suspends: RefCell::new(Vec::new()),
+            returns_windowed: RefCell::new(HashMap::new()),
+            windowed_from: RefCell::new(HashMap::new()),
+            never_resumes: RefCell::new(Vec::new()),
         }
     }
 
@@ -205,6 +221,23 @@ impl MockPlatform {
     #[cfg(test)]
     pub fn set_suspends(&self, handle: u64) {
         self.suspends.borrow_mut().push(handle);
+    }
+
+    /// Make an exclusive window resume windowed at these bounds instead of
+    /// restoring its own full screen, so the toggle-key path can be
+    /// exercised. Its full-screen bounds are remembered, and `send_key` puts
+    /// them back.
+    #[cfg(test)]
+    pub fn set_returns_windowed(&self, handle: u64, windowed: Bounds) {
+        self.returns_windowed.borrow_mut().insert(handle, windowed);
+    }
+
+    /// Make a window stay cloaked no matter how often it is activated, the
+    /// way a suspended application that never resumes does, so the timeout
+    /// path can be exercised.
+    #[cfg(test)]
+    pub fn set_never_resumes(&self, handle: u64) {
+        self.never_resumes.borrow_mut().push(handle);
     }
 
     #[cfg(test)]
@@ -677,8 +710,36 @@ impl Platform for MockPlatform {
         if !self.windows.borrow().iter().any(|w| w.handle == handle) {
             return Err(PlatformError::WindowGone);
         }
-        if let Some(window) = self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle) {
-            window.cloaked = false;
+        if !self.never_resumes.borrow().contains(&handle) {
+            if let Some(window) =
+                self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle)
+            {
+                window.cloaked = false;
+            }
+        }
+
+        // A player that resumes windowed rather than restoring its own full
+        // screen: it leaves the exclusive band and takes its windowed bounds,
+        // remembering the full-screen ones so its toggle key can put them
+        // back.
+        let windowed = self.returns_windowed.borrow().get(&handle).copied();
+        if let Some(windowed) = windowed {
+            let was_exclusive = {
+                let mut exclusive = self.exclusive.borrow_mut();
+                let at = exclusive.iter().position(|h| *h == handle);
+                if let Some(at) = at {
+                    exclusive.remove(at);
+                }
+                at.is_some()
+            };
+            if was_exclusive {
+                if let Some(window) =
+                    self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle)
+                {
+                    self.windowed_from.borrow_mut().insert(handle, window.bounds);
+                    window.bounds = windowed;
+                }
+            }
         }
         self.activated.borrow_mut().push(handle);
 
@@ -713,6 +774,33 @@ impl Platform for MockPlatform {
             return Err(PlatformError::WindowGone);
         }
         self.hidden.borrow_mut().push(handle);
+        Ok(())
+    }
+
+    /// Deliver the chord if the window would receive it, the way `SendInput`
+    /// does: input goes to the focus, so anything but the most recently
+    /// activated window refuses. A windowed-resumed player toggles back to
+    /// full screen; for everything else the press is recorded and nothing
+    /// changes, since what an arbitrary application does with a keystroke is
+    /// its own business.
+    fn send_key(&self, handle: u64, chord: KeyChord) -> Result<(), PlatformError> {
+        self.record(Call::KeySent(handle, chord));
+        if !self.windows.borrow().iter().any(|w| w.handle == handle) {
+            return Err(PlatformError::WindowGone);
+        }
+        if self.activated.borrow().last() != Some(&handle) {
+            return Err(PlatformError::Denied(
+                "the window is not in the foreground".into(),
+            ));
+        }
+        if let Some(fullscreen) = self.windowed_from.borrow_mut().remove(&handle) {
+            if let Some(window) =
+                self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle)
+            {
+                window.bounds = fullscreen;
+            }
+            self.exclusive.borrow_mut().push(handle);
+        }
         Ok(())
     }
 
@@ -882,6 +970,67 @@ mod tests {
         // rounding error should clamp, not fail part-way through.
         mock.set_window_opacity(VIDEO_WINDOW, -1.0).unwrap();
         assert_eq!(mock.opacity(VIDEO_WINDOW), Some(0));
+    }
+
+    /// The foreground rule `SendInput` lives under: input goes to the focus,
+    /// so a chord for any window but the most recently activated one must be
+    /// refused rather than delivered to the wrong application.
+    #[test]
+    fn a_chord_only_reaches_the_window_holding_the_foreground() {
+        let mock = MockPlatform::new();
+        let chord: KeyChord = "F".parse().unwrap();
+
+        let refused = mock.send_key(VIDEO_WINDOW, chord);
+        assert!(matches!(refused, Err(PlatformError::Denied(_))), "nothing has the foreground yet");
+
+        mock.activate(VIDEO_WINDOW).unwrap();
+        assert!(mock.send_key(VIDEO_WINDOW, chord).is_ok());
+        assert!(mock.calls().contains(&Call::KeySent(VIDEO_WINDOW, chord)));
+    }
+
+    /// The windowed-resume model: an exclusive player that comes back
+    /// windowed keeps its full-screen bounds on file, and its toggle key is
+    /// what puts them back.
+    #[test]
+    fn the_toggle_key_returns_a_windowed_player_to_full_screen() {
+        let mock = MockPlatform::new();
+        let player = 0x3001;
+        let fullscreen = mock.window_bounds(player).unwrap();
+        let windowed = Bounds::new(2600, 100, 960, 540);
+        mock.set_exclusive(player);
+        mock.set_returns_windowed(player, windowed);
+
+        mock.activate(player).unwrap();
+        assert_eq!(mock.window_bounds(player).unwrap(), windowed, "resumed windowed, not full screen");
+        assert!(
+            mock.candidate_windows().iter().any(|w| w.handle == player),
+            "a windowed player is back in the ordinary window list"
+        );
+
+        mock.send_key(player, "F".parse().unwrap()).unwrap();
+        assert_eq!(mock.window_bounds(player).unwrap(), fullscreen);
+        assert!(
+            !mock.candidate_windows().iter().any(|w| w.handle == player),
+            "full screen again means exclusive again, and gone from the list"
+        );
+    }
+
+    /// The suspended-application model the timeout path is built against: a
+    /// window that never resumes stays cloaked no matter how often it is
+    /// given the foreground.
+    #[test]
+    fn a_window_that_never_resumes_stays_cloaked_through_activation() {
+        let mock = MockPlatform::new();
+        let player = 0x3001;
+        mock.set_exclusive(player);
+        mock.set_suspends(player);
+        mock.set_never_resumes(player);
+
+        mock.activate(VIDEO_WINDOW).unwrap();
+        assert!(mock.is_cloaked(player), "losing the display suspends it");
+
+        mock.activate(player).unwrap();
+        assert!(mock.is_cloaked(player), "activation does not wake it");
     }
 
     /// The contract every failure path depends on. Clearing is the last thing
