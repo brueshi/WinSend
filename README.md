@@ -22,8 +22,15 @@ not, and could not have been until now: there has to be a release newer than the
 one running before that path can be walked at all, and until this one there was
 not.
 
-**Fade out when retrieving** and **Check for updates on startup** in Settings
-turn off the two pieces that touch anything outside this application.
+The full-screen restore — pressing a player that gave up the display back to
+full screen after Retrieve, and the Restore Media binding for one the automatic
+path cannot see — is built and tested against the mock, and unverified against
+a real player. `docs/media-restore.md` records the design and what a real
+desktop still has to answer.
+
+**Fade out when retrieving**, **Return full-screen video after Retrieve** and
+**Check for updates on startup** in Settings turn off the three pieces that
+touch anything outside this application.
 
 Everything above the platform seam — the UI, configuration, window identity,
 binding rules, and the whole of Send and Retrieve including which windows are in
@@ -129,6 +136,18 @@ The decisions worth knowing:
   which is something else taking the foreground — which is why clicking any
   other application makes it minimise. So Send takes the foreground, and the
   z-order work below it only ever mattered for ordinary windows.
+- **Coming back is measured, the same as going out.** Retrieve gives a
+  displaced player focus back, but whether it returns to full screen is the
+  application's own decision, and Windows has no API for asking another
+  process to make it. So Retrieve watches: gone from the window list means
+  exclusive full screen again and nothing to do; still minimised or cloaked
+  means still resuming; visibly windowed on two consecutive looks means the
+  player's own full-screen shortcut, pressed once while it holds the
+  foreground. The shortcut comes from a per-process table, overridable in the
+  config, and no key is ever guessed for an unknown process. A player the
+  automatic path cannot see — one already stowed before Send — can be bound
+  like the Zoom window and brought back with the Restore Media hotkey. The
+  design and its guards are in `docs/media-restore.md`.
 - **A placement is measured, not assumed.** A window does not always end up
   where it was put: coordinates can be scaled on a display whose DPI differs
   from the one the process was told about, and an application can resize itself
@@ -259,6 +278,17 @@ Getting in front of a full-screen player works by taking the foreground, which
 means the player gives up the display and, being suspended or minimised, stops
 playing. There is no way to be in front of such a window and leave it running:
 those are the same thing from its point of view.
+
+The way back is just as indirect, and carries the newer risk. Full screen is
+internal state each application manages for itself, so the only way to restore
+it from outside is to synthesize the application's own shortcut — which is
+typing into another program. The guards are listed in `docs/media-restore.md`;
+the shape of the risk is that every one of them is a measurement taken moments
+before the press, and the desktop can change between the measurement and the
+keystroke. The press targets the foreground and is refused when the player is
+not it, so the failure mode is a key not sent, not a key sent astray. Injected
+input is also swallowed silently when the target runs elevated: if the player
+runs as administrator, WinSend must too, and the status line says so.
 
 A window hidden to the tray is not guaranteed to be told to redraw, and eframe
 only runs a frame when it is. A hotkey that worked only while the window was on
