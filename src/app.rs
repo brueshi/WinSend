@@ -210,6 +210,14 @@ enum Outcome {
     Err,
 }
 
+/// Which binding the picker is choosing for. One viewport serves both; what
+/// varies is the candidate list, the wording, and where the click lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerFor {
+    Zoom,
+    Media,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Message {
     outcome: Outcome,
@@ -255,8 +263,8 @@ pub struct WinSendApp {
     /// Whether the configuration section is disclosed. The one thing that
     /// changes the window's size, and only when clicked.
     configuring: bool,
-    /// Whether the picker's viewport is open.
-    picking: bool,
+    /// The binding the open picker is choosing for, if it is open at all.
+    picking: Option<PickerFor>,
     /// A Retrieve fading the window out, if one is running.
     fading: Option<Fade>,
     /// When to stop watching put-back players for full-screen re-entry.
@@ -326,7 +334,7 @@ impl WinSendApp {
             core,
             shell,
             configuring: false,
-            picking: false,
+            picking: None,
             fading: None,
             media_restore_deadline: None,
             updater,
@@ -346,7 +354,7 @@ impl WinSendApp {
         #[cfg(debug_assertions)]
         match std::env::var("WINSEND_SCREEN").as_deref() {
             Ok("settings") => app.set_configuring(&cc.egui_ctx, true),
-            Ok("select") => app.open_picker(&cc.egui_ctx),
+            Ok("select") => app.open_picker(&cc.egui_ctx, PickerFor::Zoom),
             _ => {}
         }
 
@@ -357,13 +365,25 @@ impl WinSendApp {
     /// to the picker instead of leaving the user to decode an error and find
     /// their own way to Settings.
     fn report(&mut self, ctx: &egui::Context, outcome: Result<String, Failure>) {
+        self.report_for(ctx, outcome, PickerFor::Zoom);
+    }
+
+    /// `report`, with a say in which picker a `needs_selection` opens. The
+    /// Restore Media action must not answer "no media window yet" with a list
+    /// of Zoom windows.
+    fn report_for(
+        &mut self,
+        ctx: &egui::Context,
+        outcome: Result<String, Failure>,
+        picker: PickerFor,
+    ) {
         match outcome {
             Ok(message) => self.status.push(Outcome::Ok, message),
             Err(failure) => {
                 let needs_selection = failure.needs_selection;
                 self.status.push(Outcome::Err, failure.message);
                 if needs_selection {
-                    self.open_picker(ctx);
+                    self.open_picker(ctx, picker);
                 }
             }
         }
@@ -389,6 +409,11 @@ impl WinSendApp {
             // another would only produce "nothing has been sent yet".
             Action::Retrieve if interrupted_a_fade => {}
             Action::Retrieve => self.start_retrieve(ctx),
+            Action::RestoreMedia => {
+                let outcome = self.core.restore_media();
+                self.report_for(ctx, outcome, PickerFor::Media);
+                self.arm_media_restore(ctx);
+            }
         }
     }
 
@@ -652,9 +677,12 @@ impl WinSendApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
     }
 
-    fn open_picker(&mut self, ctx: &egui::Context) {
-        self.picking = true;
-        self.candidates = self.core.candidates();
+    fn open_picker(&mut self, ctx: &egui::Context, picker: PickerFor) {
+        self.picking = Some(picker);
+        self.candidates = match picker {
+            PickerFor::Zoom => self.core.candidates(),
+            PickerFor::Media => self.core.media_candidates(),
+        };
         self.thumbnails.clear();
         for candidate in &self.candidates {
             if let Some(thumb) = self.core.platform.thumbnail(candidate.handle) {
@@ -673,7 +701,7 @@ impl WinSendApp {
     }
 
     fn close_picker(&mut self) {
-        self.picking = false;
+        self.picking = None;
         self.thumbnails.clear();
         self.candidates.clear();
     }
@@ -1162,8 +1190,39 @@ impl WinSendApp {
         );
         ui.add_space(4.0);
         if ui.button("Select Zoom Window").clicked() {
-            self.open_picker(ctx);
+            self.open_picker(ctx, PickerFor::Zoom);
         }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        ui.label(egui::RichText::new("Media window").size(12.0).strong());
+        let bound = self
+            .core
+            .config
+            .media_window
+            .as_ref()
+            .map(|w| {
+                let name = if w.title.is_empty() { &w.process_name } else { &w.title };
+                format!("{} ({})", name, w.class_name)
+            })
+            .unwrap_or_else(|| "none selected".to_string());
+        ui.label(
+            egui::RichText::new(bound)
+                .size(11.0)
+                .color(egui::Color32::from_gray(150)),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("Select Media Window").clicked() {
+                self.open_picker(ctx, PickerFor::Media);
+            }
+            if self.core.config.media_window.is_some() && ui.button("Clear").clicked() {
+                let outcome = self.core.clear_media_window();
+                self.report(ctx, outcome);
+            }
+        });
 
         ui.add_space(10.0);
         ui.separator();
@@ -1269,12 +1328,15 @@ impl WinSendApp {
     /// for the candidate list and the textures, and a deferred viewport's
     /// closure has to be `Send + Sync + 'static`, which that is not.
     fn picker_viewport(&mut self, ctx: &egui::Context) {
-        if !self.picking {
+        let Some(picker) = self.picking else {
             return;
-        }
+        };
 
         let builder = egui::ViewportBuilder::default()
-            .with_title("Select Zoom Window")
+            .with_title(match picker {
+                PickerFor::Zoom => "Select Zoom Window",
+                PickerFor::Media => "Select Media Window",
+            })
             .with_inner_size(PICKER_SIZE)
             .with_min_inner_size([360.0, 320.0])
             // The surface it opens from is always on top, and a picker behind
@@ -1286,7 +1348,7 @@ impl WinSendApp {
             egui::ViewportId::from_hash_of(PICKER_VIEWPORT),
             builder,
             |ctx, _class| {
-                egui::CentralPanel::default().show(ctx, |ui| self.picker(ui, ctx));
+                egui::CentralPanel::default().show(ctx, |ui| self.picker(ui, ctx, picker));
                 if ctx.input(|input| input.viewport().close_requested()) {
                     closing = true;
                 }
@@ -1298,11 +1360,17 @@ impl WinSendApp {
         }
     }
 
-    fn picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, picker: PickerFor) {
         ui.label(
-            egui::RichText::new(
-                "Pin someone in Zoom first, then pick the window showing only that video feed.",
-            )
+            egui::RichText::new(match picker {
+                PickerFor::Zoom => {
+                    "Pin someone in Zoom first, then pick the window showing only that video feed."
+                }
+                PickerFor::Media => {
+                    "Pick the media player to restore. A full-screen video window often has \
+                     no title; go by the process name."
+                }
+            })
             .size(11.0)
             .color(egui::Color32::from_gray(150)),
         );
@@ -1361,9 +1429,17 @@ impl WinSendApp {
                                             )
                                             .truncate()
                                         };
+                                        // The media list includes untitled
+                                        // windows on purpose; a blank row
+                                        // heading would read as a bug.
+                                        let heading = if candidate.title.is_empty() {
+                                            "(no title)"
+                                        } else {
+                                            &candidate.title
+                                        };
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(&candidate.title)
+                                                egui::RichText::new(heading)
                                                     .size(12.0)
                                                     .strong(),
                                             )
@@ -1401,7 +1477,10 @@ impl WinSendApp {
         });
 
         if let Some(candidate) = confirmed {
-            let outcome = self.core.confirm_window(&candidate);
+            let outcome = match picker {
+                PickerFor::Zoom => self.core.confirm_window(&candidate),
+                PickerFor::Media => self.core.confirm_media_window(&candidate),
+            };
             self.report(ctx, outcome);
             self.close_picker();
         }

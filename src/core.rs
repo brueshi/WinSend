@@ -763,6 +763,111 @@ impl Core {
         Ok(format!("Confirmed \"{}\"", candidate.title))
     }
 
+    /// Picker contents for the media binding.
+    ///
+    /// Not `identifiable`: its title filter is the exact reason the player
+    /// was invisible for six attempts — a full-screen video output window
+    /// typically has no title at all. Untitled windows are offered here and
+    /// labelled by their process instead, because the process and class are
+    /// what the binding matches on anyway.
+    pub fn media_candidates(&self) -> Vec<WindowCandidate> {
+        let mut candidates: Vec<WindowCandidate> = self
+            .platform
+            .candidate_windows()
+            .into_iter()
+            .filter(|c| {
+                !c.own_process
+                    && !c.cloaked
+                    && !c.minimized
+                    && c.bounds.width > 0
+                    && c.bounds.height > 0
+            })
+            .collect();
+        candidates.sort_by_key(|c| (c.process_name.to_lowercase(), c.handle));
+        candidates
+    }
+
+    pub fn confirm_media_window(&mut self, candidate: &WindowCandidate) -> Result<String, Failure> {
+        self.config.media_window = Some(WindowIdentity::from_candidate(candidate));
+        self.config.save()?;
+        let name = if candidate.title.is_empty() {
+            &candidate.process_name
+        } else {
+            &candidate.title
+        };
+        Ok(format!("Media window set to \"{name}\""))
+    }
+
+    pub fn clear_media_window(&mut self) -> Result<String, Failure> {
+        self.config.media_window = None;
+        self.config.save()?;
+        Ok("Media window cleared".to_string())
+    }
+
+    /// Bring the bound media window back and watch it to full screen.
+    ///
+    /// The manual half of the full-screen restore, for the player the
+    /// automatic watch cannot see: one that was already stowed before Send
+    /// left no before-and-after difference to notice. Deliberately ignores
+    /// `restore_fullscreen` — that setting governs what Retrieve does on its
+    /// own, and pressing this hotkey is the explicit request the setting
+    /// exists to distinguish from.
+    pub fn restore_media(&mut self) -> Result<String, Failure> {
+        let Some(identity) = self.config.media_window.clone() else {
+            return Err(Failure::needs_selection("No media window has been selected yet"));
+        };
+
+        // Resolution runs against every other-process window, minimised and
+        // cloaked included: the bound window being stowed is the whole reason
+        // this action exists. The empty-title tie-break in `resolve` is what
+        // separates an untitled output window from a titled main one sharing
+        // its process and class.
+        let candidates: Vec<WindowCandidate> = self
+            .platform
+            .candidate_windows()
+            .into_iter()
+            .filter(|c| !c.own_process)
+            .collect();
+        let handle = match resolve(&identity, &candidates) {
+            Resolution::Found(handle) => handle,
+            Resolution::Ambiguous(_) => {
+                return Err(Failure::needs_selection(format!(
+                    "More than one window looks like the media window ({})",
+                    identity.process_name
+                )));
+            }
+            Resolution::NotFound => {
+                return Err(Failure::plain(format!(
+                    "The media window ({}) is not open",
+                    identity.process_name
+                )));
+            }
+        };
+
+        let process = candidates
+            .iter()
+            .find(|c| c.handle == handle)
+            .map(|c| c.process_name.clone())
+            .unwrap_or_else(|| identity.process_name.clone());
+
+        let _ = self.platform.unminimize(handle);
+        let _ = self.platform.activate(handle);
+
+        // Pressing the hotkey twice must not queue the same player twice: the
+        // second watch would send a second toggle at a window the first one
+        // already restored.
+        self.pending_reentry.retain(|entry| entry.handle != handle);
+        self.pending_reentry.push(MediaReentry {
+            handle,
+            process: process.clone(),
+            chord: fullscreen_key_for(&self.config, &process),
+            key_sent: false,
+            seen_windowed: false,
+        });
+
+        Ok(format!("Restoring {process}"))
+    }
+
     pub fn set_target_monitor(&mut self, monitor: &MonitorInfo) -> Result<String, Failure> {
         self.config.set_target(monitor);
         self.config.save()?;
@@ -1842,6 +1947,139 @@ mod tests {
         core.send().unwrap();
         assert!(!core.media_restore_pending(), "the new Send owns the display now");
         assert_eq!(core.media_restore_step(), MediaRestoreStep::Idle);
+    }
+
+    /// The identity of the fixture's untitled VLC output window, as binding
+    /// it through the media picker would record.
+    fn vlc_identity() -> WindowIdentity {
+        WindowIdentity {
+            process_name: "vlc.exe".to_string(),
+            class_name: "Qt5152QWindowIcon".to_string(),
+            title: String::new(),
+        }
+    }
+
+    /// The media picker exists because the ordinary one cannot show the
+    /// player: an untitled window has nothing to match a saved identity by
+    /// title, but process and class are the identity anyway.
+    #[test]
+    fn the_media_picker_offers_the_untitled_player() {
+        let core = core_with_confirmed_video_window();
+
+        assert!(
+            core.media_candidates().iter().any(|c| c.handle == MEDIA_WINDOW),
+            "the untitled player is the one window this picker is for"
+        );
+        assert!(
+            core.candidates().iter().all(|c| c.handle != MEDIA_WINDOW),
+            "and the Zoom picker still keeps it out"
+        );
+        assert!(
+            core.media_candidates().iter().all(|c| !c.own_process && !c.minimized),
+            "our own windows and iconic ones are still nothing to offer"
+        );
+    }
+
+    /// Without a binding there is nothing to restore, and the failure routes
+    /// to the media picker rather than to an error to decode.
+    #[test]
+    fn restore_media_without_a_binding_asks_for_selection() {
+        let mut core = core_with_confirmed_video_window();
+
+        let failure = core.restore_media().unwrap_err();
+        assert!(failure.needs_selection);
+    }
+
+    /// The manual path, measured like the automatic one: a player that comes
+    /// back already full screen gets focus and nothing else.
+    #[test]
+    fn restore_media_brings_back_a_stowed_player_without_typing_at_it() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.media_window = Some(vlc_identity());
+        core.platform.minimize(MEDIA_WINDOW).unwrap();
+
+        let message = core.restore_media().unwrap();
+        assert!(message.contains("vlc.exe"), "got: {message}");
+        let mock = core.platform.as_mock().unwrap();
+        assert!(!mock.is_minimized(MEDIA_WINDOW));
+        assert!(mock.was_activated(MEDIA_WINDOW), "focus is what brings a player back");
+
+        match core.media_restore_step() {
+            MediaRestoreStep::Done(message) => {
+                assert!(message.contains("full screen again"), "got: {message}");
+            }
+            other => panic!("unminimising restored its full-screen bounds: {other:?}"),
+        }
+        assert!(
+            !core
+                .platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::KeySent(..)))
+        );
+    }
+
+    /// The manual path pressing the key: bound player in the taskbar, resumes
+    /// windowed, gets its own shortcut and returns to full screen.
+    #[test]
+    fn restore_media_presses_a_windowed_player_back_to_full_screen() {
+        const BOUND_PLAYER: u64 = 0x6001;
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            BOUND_PLAYER,
+            "mpv.exe",
+            "MpvOutput",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(BOUND_PLAYER);
+        mock.set_returns_windowed(BOUND_PLAYER, windowed_on_display_two());
+        core.config.media_window = Some(WindowIdentity {
+            process_name: "mpv.exe".to_string(),
+            class_name: "MpvOutput".to_string(),
+            title: String::new(),
+        });
+        core.platform.minimize(BOUND_PLAYER).unwrap();
+
+        core.restore_media().unwrap();
+        assert_eq!(core.media_restore_step(), MediaRestoreStep::Waiting);
+        assert_eq!(core.media_restore_step(), MediaRestoreStep::Waiting);
+
+        let chord: KeyChord = "F".parse().unwrap();
+        assert!(
+            core.platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .contains(&Call::KeySent(BOUND_PLAYER, chord))
+        );
+        match core.media_restore_step() {
+            MediaRestoreStep::Done(message) => {
+                assert!(message.contains("Sent F to mpv.exe"), "got: {message}");
+            }
+            other => panic!("the toggle made it exclusive again: {other:?}"),
+        }
+    }
+
+    /// Pressing the hotkey twice while a watch is running must not queue a
+    /// second toggle at the same window.
+    #[test]
+    fn restore_media_pressed_twice_watches_once() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.media_window = Some(vlc_identity());
+        core.platform.minimize(MEDIA_WINDOW).unwrap();
+
+        core.restore_media().unwrap();
+        core.restore_media().unwrap();
+
+        assert_eq!(
+            core.pending_reentry.len(),
+            1,
+            "one player, one watch, however many presses"
+        );
     }
 
     /// Pressing Send twice must not lose what the first press moved aside.

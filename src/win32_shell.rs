@@ -60,6 +60,7 @@ const MENU_SEND: u32 = 101;
 const MENU_RETRIEVE: u32 = 102;
 const MENU_SETTINGS: u32 = 103;
 const MENU_QUIT: u32 = 104;
+const MENU_RESTORE_MEDIA: u32 = 105;
 
 /// The icon, embedded rather than compiled in as a resource.
 ///
@@ -80,6 +81,7 @@ fn hotkey_id(action: Action) -> i32 {
     match action {
         Action::Send => 1,
         Action::Retrieve => 2,
+        Action::RestoreMedia => 3,
     }
 }
 
@@ -331,6 +333,7 @@ unsafe fn show_menu(hwnd: HWND, can_retrieve: bool) -> Option<ShellEvent> {
         MENU_RETRIEVE,
         w!("Retrieve"),
     );
+    item(MF_STRING, MENU_RESTORE_MEDIA, w!("Restore Media"));
     item(MF_SEPARATOR, 0, PCWSTR::null());
     item(MF_STRING, MENU_SETTINGS, w!("Settings"));
     item(MF_SEPARATOR, 0, PCWSTR::null());
@@ -358,6 +361,7 @@ unsafe fn show_menu(hwnd: HWND, can_retrieve: bool) -> Option<ShellEvent> {
     match chosen.0 as u32 {
         MENU_SEND => Some(ShellEvent::Trigger(Action::Send)),
         MENU_RETRIEVE => Some(ShellEvent::Trigger(Action::Retrieve)),
+        MENU_RESTORE_MEDIA => Some(ShellEvent::Trigger(Action::RestoreMedia)),
         MENU_SETTINGS => Some(ShellEvent::ShowSettings),
         MENU_QUIT => Some(ShellEvent::Quit),
         // Dismissed without choosing anything.

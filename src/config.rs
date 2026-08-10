@@ -29,6 +29,12 @@ pub struct TargetMonitor {
 pub struct Config {
     pub target_monitor: Option<TargetMonitor>,
     pub zoom_window: Option<WindowIdentity>,
+    /// The media window the Restore Media action brings back.
+    ///
+    /// Bound explicitly, like the Zoom window, for the players the automatic
+    /// watch cannot see: one that was already stowed before Send left no
+    /// before-and-after difference to notice.
+    pub media_window: Option<WindowIdentity>,
     /// Strip the window frame so it fills the monitor edge to edge. Whether
     /// this is needed depends on how Zoom frames its video window, which we
     /// cannot know until it is tested against a real session.
@@ -85,6 +91,7 @@ impl Default for Config {
         Self {
             target_monitor: None,
             zoom_window: None,
+            media_window: None,
             borderless: false,
             clear_target: false,
             fade_on_retrieve: true,
@@ -114,12 +121,14 @@ mod hotkeys_as_text {
     struct Stored {
         send: Option<String>,
         retrieve: Option<String>,
+        restore_media: Option<String>,
     }
 
     pub fn serialize<S: Serializer>(hotkeys: &Hotkeys, serializer: S) -> Result<S::Ok, S::Error> {
         Stored {
             send: hotkeys.send.map(|h| h.to_string()),
             retrieve: hotkeys.retrieve.map(|h| h.to_string()),
+            restore_media: hotkeys.restore_media.map(|h| h.to_string()),
         }
         .serialize(serializer)
     }
@@ -132,6 +141,10 @@ mod hotkeys_as_text {
         let mut hotkeys = Hotkeys::default();
         let _ = hotkeys.set(Action::Send, stored.send.and_then(|t| t.parse().ok()));
         let _ = hotkeys.set(Action::Retrieve, stored.retrieve.and_then(|t| t.parse().ok()));
+        let _ = hotkeys.set(
+            Action::RestoreMedia,
+            stored.restore_media.and_then(|t| t.parse().ok()),
+        );
         Ok(hotkeys)
     }
 }
@@ -326,6 +339,24 @@ mod tests {
         assert!(!Config::default().clear_target);
         let loaded: Config = serde_json::from_str(r#"{"borderless": true}"#).unwrap();
         assert!(!loaded.clear_target, "an existing config must not gain it");
+    }
+
+    #[test]
+    fn the_restore_media_hotkey_persists_beside_the_others() {
+        let mut config = Config::default();
+        config
+            .hotkeys
+            .set(Action::RestoreMedia, Some("Ctrl+Alt+F11".parse().unwrap()))
+            .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""restore_media":"Ctrl+Alt+F11""#), "got: {json}");
+
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.hotkeys, config.hotkeys);
+        // And a file from before the action existed simply lacks the binding.
+        let old: Config = serde_json::from_str(r#"{"hotkeys": {"send": "Ctrl+Alt+F9"}}"#).unwrap();
+        assert_eq!(old.hotkeys.restore_media, None);
     }
 
     #[test]

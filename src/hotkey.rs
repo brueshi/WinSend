@@ -302,28 +302,35 @@ impl FromStr for KeyChord {
 pub enum Action {
     Send,
     Retrieve,
+    /// Bring the bound media window back and press it to full screen. The
+    /// manual fallback for a player the automatic watch missed — one that
+    /// was already stowed before Send, or displaced by something other than
+    /// WinSend.
+    RestoreMedia,
 }
 
 impl Action {
-    pub const ALL: [Action; 2] = [Action::Send, Action::Retrieve];
+    pub const ALL: [Action; 3] = [Action::Send, Action::Retrieve, Action::RestoreMedia];
 
     pub fn label(self) -> &'static str {
         match self {
             Action::Send => "Send",
             Action::Retrieve => "Retrieve",
+            Action::RestoreMedia => "Restore Media",
         }
     }
 }
 
 /// The full set of bindings.
 ///
-/// Both are optional and both start unbound: registering a default would mean
+/// All are optional and all start unbound: registering a default would mean
 /// quietly taking a combination from another application on first run, and
 /// failing to do so would produce an error the user never asked for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Hotkeys {
     pub send: Option<Hotkey>,
     pub retrieve: Option<Hotkey>,
+    pub restore_media: Option<Hotkey>,
 }
 
 impl Hotkeys {
@@ -331,6 +338,7 @@ impl Hotkeys {
         match action {
             Action::Send => self.send,
             Action::Retrieve => self.retrieve,
+            Action::RestoreMedia => self.restore_media,
         }
     }
 
@@ -352,6 +360,7 @@ impl Hotkeys {
         match action {
             Action::Send => self.send = hotkey,
             Action::Retrieve => self.retrieve = hotkey,
+            Action::RestoreMedia => self.restore_media = hotkey,
         }
         Ok(())
     }
@@ -430,6 +439,16 @@ mod tests {
         let clash = hotkeys.set(Action::Retrieve, Some(parse("Ctrl+Alt+F9")));
         assert!(clash.is_err(), "one press must not mean both actions");
         assert_eq!(hotkeys.retrieve, None, "a rejected binding must not be stored");
+    }
+
+    #[test]
+    fn the_third_action_shares_the_no_duplicates_rule() {
+        let mut hotkeys = Hotkeys::default();
+        hotkeys.set(Action::Send, Some(parse("Ctrl+Alt+F9"))).unwrap();
+
+        assert!(hotkeys.set(Action::RestoreMedia, Some(parse("Ctrl+Alt+F9"))).is_err());
+        hotkeys.set(Action::RestoreMedia, Some(parse("Ctrl+Alt+F10"))).unwrap();
+        assert_eq!(hotkeys.binding(Action::RestoreMedia), Some(parse("Ctrl+Alt+F10")));
     }
 
     #[test]
