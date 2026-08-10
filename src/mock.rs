@@ -438,7 +438,7 @@ impl MockUpdater {
     #[cfg_attr(windows, allow(dead_code))]
     pub fn release_list(version: &str) -> String {
         format!(
-            r#"[{{"tag_name": "v{version}", "draft": false, "prerelease": true,
+            r#"[{{"tag_name": "v{version}", "draft": false, "prerelease": false,
                   "assets": [{{"name": "winsend.exe",
                                "browser_download_url": "https://example.invalid/winsend.exe",
                                "digest": "sha256:{}"}}]}}]"#,

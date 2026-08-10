@@ -14,6 +14,11 @@ whatever happened to be lying in target/.
     python3 tools/release.py 0.1.16
     python3 tools/release.py --patch          # 0.1.15 -> 0.1.16
     python3 tools/release.py --patch --dry-run
+    python3 tools/release.py --patch --prerelease
+
+Releases are official by default. The updater offers stable releases and skips
+pre-releases, so --prerelease publishes something that has to be fetched by
+hand: useful for a build you want on a machine without pushing it to everyone.
 
 Requires `gh` for the publish step, and the same lld/cargo-xwin setup the
 README describes for the cross-build.
@@ -73,6 +78,11 @@ def main() -> None:
     parser.add_argument("version", nargs="?", help="the new version, e.g. 0.1.16")
     parser.add_argument("--patch", action="store_true", help="bump the last number")
     parser.add_argument("--notes", default="", help="one line describing the release")
+    parser.add_argument(
+        "--prerelease",
+        action="store_true",
+        help="publish as a pre-release, which the updater will not offer",
+    )
     parser.add_argument("--dry-run", action="store_true", help="say what would happen")
     args = parser.parse_args()
 
@@ -99,7 +109,8 @@ def main() -> None:
     if run(["git", "tag", "--list", tag]):
         sys.exit(f"{tag} already exists")
 
-    print(f"{'.'.join(map(str, current))} -> {'.'.join(map(str, new))} ({tag})")
+    kind = "pre-release" if args.prerelease else "official release"
+    print(f"{'.'.join(map(str, current))} -> {'.'.join(map(str, new))} ({tag}, {kind})")
     if args.dry_run:
         print("dry run: nothing was changed")
         return
@@ -138,21 +149,21 @@ def main() -> None:
     run(["git", "push", "origin", "HEAD"])
     run(["git", "push", "origin", tag])
 
-    print(f"publishing {tag}")
-    run(
-        [
-            "gh",
-            "release",
-            "create",
-            tag,
-            str(BUILT),
-            "--title",
-            f"{tag} — {args.notes}" if args.notes else tag,
-            "--notes",
-            args.notes or "See the commits since the previous tag.",
-            "--prerelease",
-        ]
-    )
+    print(f"publishing {tag} as {'a pre-release' if args.prerelease else 'an official release'}")
+    publish = [
+        "gh",
+        "release",
+        "create",
+        tag,
+        str(BUILT),
+        "--title",
+        f"{tag} — {args.notes}" if args.notes else tag,
+        "--notes",
+        args.notes or "See the commits since the previous tag.",
+    ]
+    if args.prerelease:
+        publish.append("--prerelease")
+    run(publish)
 
     print(f"released {tag}")
 

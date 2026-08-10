@@ -26,11 +26,12 @@ const ASSET: &str = "winsend.exe";
 
 /// Where releases are read from.
 ///
-/// The list rather than `/releases/latest`, which is not the same question:
-/// that endpoint excludes pre-releases, and every release of this project so
-/// far has been one, so it answers 404. Picking the highest version out of the
-/// list is also the more honest question to ask, since what matters is the
-/// number rather than which release GitHub considers current.
+/// The list rather than `/releases/latest`, even though that endpoint also
+/// excludes pre-releases and would now be close to the right question. It is
+/// not the same question: `latest` is the most recently published release,
+/// where what matters here is the highest version number. A patch published
+/// against an older line would make those two disagree, and the comparison
+/// this feature rests on is numeric.
 ///
 /// Only reached from `github.rs`, which is Windows-only, so on other targets
 /// this and the three items marked the same way below read as dead code. They
@@ -163,6 +164,8 @@ struct ApiRelease {
     #[serde(default)]
     draft: bool,
     #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
     assets: Vec<ApiAsset>,
 }
 
@@ -178,18 +181,23 @@ struct ApiAsset {
 
 /// The highest-numbered release that could actually be installed.
 ///
-/// Draft releases are skipped; pre-releases are not, because every release of
-/// this project has been one. A release whose tag will not parse, or which
-/// publishes no usable asset, is passed over rather than guessed at — that
-/// includes one with no digest, since a download that cannot be checked is not
-/// one to offer.
+/// Drafts and pre-releases are both skipped. Marking a release as a
+/// pre-release has to mean something, and what it means here is that nobody is
+/// pushed onto it in the middle of a production: it is opted into by
+/// downloading it by hand. Anyone still running a build from before there were
+/// any stable releases will keep being offered pre-releases, since that
+/// judgement lives in the copy doing the asking.
+///
+/// A release whose tag will not parse, or which publishes no usable asset, is
+/// passed over rather than guessed at — including one with no digest, since a
+/// download that cannot be checked is not one to offer.
 pub fn newest_release(json: &str) -> Result<Option<Release>, String> {
     let releases: Vec<ApiRelease> =
         serde_json::from_str(json).map_err(|e| format!("could not read the release list: {e}"))?;
 
     Ok(releases
         .into_iter()
-        .filter(|release| !release.draft)
+        .filter(|release| !release.draft && !release.prerelease)
         .filter_map(|release| {
             let version = release.tag_name.parse().ok()?;
             let asset = release
@@ -341,13 +349,12 @@ mod tests {
         assert_eq!(Version::current().to_string(), env!("CARGO_PKG_VERSION"));
     }
 
-    /// Trimmed from a real response, including the pre-release flag every
-    /// release of this project carries.
+    /// Trimmed from a real response.
     const RELEASES_JSON: &str = r#"[
         {
             "tag_name": "v0.1.15",
             "draft": false,
-            "prerelease": true,
+            "prerelease": false,
             "assets": [{
                 "name": "winsend.exe",
                 "browser_download_url": "https://example.invalid/v0.1.15/winsend.exe",
@@ -358,7 +365,7 @@ mod tests {
         {
             "tag_name": "v0.1.9",
             "draft": false,
-            "prerelease": true,
+            "prerelease": false,
             "assets": [{
                 "name": "winsend.exe",
                 "browser_download_url": "https://example.invalid/v0.1.9/winsend.exe",
@@ -378,11 +385,35 @@ mod tests {
         );
     }
 
-    /// A pre-release is still a release here. Every one of this project's has
-    /// been one, and skipping them would mean never offering anything.
+    /// Marking a release a pre-release has to mean something, and what it
+    /// means is that nobody is moved onto it without going and fetching it.
     #[test]
-    fn a_pre_release_is_still_offered() {
-        assert!(newest_release(RELEASES_JSON).unwrap().is_some());
+    fn a_pre_release_is_not_offered_even_when_it_is_the_newest() {
+        let json = r#"[
+            {"tag_name": "v9.9.9", "draft": false, "prerelease": true, "assets": [
+                {"name": "winsend.exe", "browser_download_url": "u", "digest": "sha256:ab"}]},
+            {"tag_name": "v1.0.0", "draft": false, "prerelease": false, "assets": [
+                {"name": "winsend.exe", "browser_download_url": "u", "digest": "sha256:ab"}]}
+        ]"#;
+
+        let release = newest_release(json).unwrap().expect("the stable one is usable");
+        assert_eq!(
+            release.version,
+            version("1.0.0"),
+            "the higher-numbered pre-release must be passed over"
+        );
+    }
+
+    /// Before there are any stable releases, the honest answer is silence
+    /// rather than the newest pre-release.
+    #[test]
+    fn nothing_is_offered_when_every_release_is_a_pre_release() {
+        let json = r#"[
+            {"tag_name": "v9.9.9", "draft": false, "prerelease": true, "assets": [
+                {"name": "winsend.exe", "browser_download_url": "u", "digest": "sha256:ab"}]}
+        ]"#;
+
+        assert_eq!(newest_release(json).unwrap(), None);
     }
 
     #[test]

@@ -12,16 +12,18 @@ someone is pinned. WinSend does it in one press, without leaving Zoom.
 ## Status
 
 Confirmed working against a real Zoom session on Windows: Send and Retrieve,
-thumbnail capture, global hotkeys, the tray icon and its menu, the application
-icons, and getting the sent window in front of a full-screen media player on the
-target display.
+thumbnail capture, global hotkeys, the tray icon and its menu, hide-to-tray, the
+application icons, getting the sent window in front of a full-screen media
+player on the target display, the single surface and its disclosure, the
+Windows 11 title bar and corner styling, and the fade on Retrieve.
 
-Not yet verified on Windows: hide-to-tray, whether a media player that gives up
-the display on losing focus is reliably restored on Retrieve, the Windows 11
-title bar and corner styling, the fade on Retrieve, and the updater's download
-and swap. The fade is the one to watch, since a GPU-composited window may not
-take kindly to being made translucent; **Fade out when retrieving** in Settings
-turns it off.
+The update check is confirmed against the live API. Its download and swap are
+not, and could not have been until now: there has to be a release newer than the
+one running before that path can be walked at all, and until this one there was
+not.
+
+**Fade out when retrieving** and **Check for updates on startup** in Settings
+turn off the two pieces that touch anything outside this application.
 
 Everything above the platform seam — the UI, configuration, window identity,
 binding rules, and the whole of Send and Retrieve including which windows are in
@@ -228,12 +230,17 @@ before — saying `0.1.0` while `v0.1.2` was released. That was untidy until the
 updater existed; now a copy whose version lags the tags believes it is
 permanently out of date and offers an update to what it is already running.
 
-Releases are read from the releases list rather than from `/releases/latest`,
-which excludes pre-releases and therefore answers 404 here. The highest parsed
-version wins, which is the more honest question anyway. The asset must be named
-`winsend.exe` and must carry a `digest`, which the API supplies; a release
-without one is passed over rather than trusted, since a download that cannot be
-checked is not one to offer.
+Releases are official by default. `--prerelease` publishes one the updater will
+not offer, which is how a build reaches a particular machine without being
+pushed to everyone.
+
+Releases are read from the releases list rather than from `/releases/latest`.
+Both exclude pre-releases, but they are not the same question: `latest` is the
+most recently published release, where what matters here is the highest version
+number, and a patch against an older line would make those disagree. The asset
+must be named `winsend.exe` and must carry a `digest`, which the API supplies;
+a release without one is passed over rather than trusted, since a download that
+cannot be checked is not one to offer.
 
 That check is a SHA-256 against what GitHub published, over TLS. It catches a
 truncated or altered download; it is not code signing and does not pretend to
