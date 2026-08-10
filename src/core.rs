@@ -8,9 +8,11 @@
 //! something else entirely.
 
 use crate::config::Config;
-use crate::hotkey::{Action, Hotkey};
+use crate::hotkey::{Action, Hotkey, KeyChord};
 use crate::identity::{matches_structurally, resolve, Resolution, WindowIdentity};
-use crate::platform::{Bounds, MonitorInfo, Placement, Platform, WindowCandidate};
+use crate::platform::{
+    Bounds, MonitorInfo, Placement, Platform, PlatformError, WindowCandidate,
+};
 
 /// Why an action could not complete.
 ///
@@ -93,6 +95,53 @@ const COVERING: f32 = 0.7;
 /// monitor it happens to occupy.
 const OBSCURING: f32 = 0.15;
 
+/// How much of its monitor a returning player must cover to count as full
+/// screen again. Just short of total, because a border-to-border window can
+/// report a pixel or two of slack on a mixed-DPI desktop.
+const FULLSCREEN: f32 = 0.98;
+
+/// The full-screen toggle each player answers to.
+///
+/// A table because there is no other source: full screen is internal state
+/// each application manages for itself, keyed to whatever shortcut it chose.
+/// Overridden per process by `media_keys` in the config, and extended for
+/// unknown players by `media_default_key` — which is unset by default, since
+/// a guessed keystroke into an unknown application is typing into it.
+const FULLSCREEN_KEYS: &[(&str, &str)] = &[
+    ("vlc.exe", "F"),
+    ("mpv.exe", "F"),
+    ("wmplayer.exe", "Alt+Enter"),
+    ("mpc-hc.exe", "Alt+Enter"),
+    ("mpc-hc64.exe", "Alt+Enter"),
+    ("PotPlayerMini64.exe", "Enter"),
+    ("chrome.exe", "F11"),
+    ("msedge.exe", "F11"),
+    ("firefox.exe", "F11"),
+];
+
+/// The chord that toggles full screen for this process, if any is known.
+///
+/// A config entry that fails to parse yields no key rather than falling back
+/// to the built-in table: an override the user wrote is an instruction, and
+/// quietly substituting a different key for a typo would send the wrong
+/// keystroke on purpose.
+fn fullscreen_key_for(config: &Config, process: &str) -> Option<KeyChord> {
+    let configured = config
+        .media_keys
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(process))
+        .map(|(_, chord)| chord.as_str());
+    let builtin = FULLSCREEN_KEYS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(process))
+        .map(|(_, chord)| *chord);
+    configured
+        .or(builtin)
+        .or(config.media_default_key.as_deref())?
+        .parse()
+        .ok()
+}
+
 /// What was done to a window that was blocking the target monitor, so it can be
 /// put back exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +160,45 @@ struct Displaced {
     /// minimised itself on losing focus needs focus to come back, which is
     /// what clicking it in the taskbar does by hand.
     refocus: bool,
+    /// The application's own full-screen toggle, if one is known.
+    ///
+    /// Resolved from the keymap at the moment the window is noticed rather
+    /// than when it is put back, because that is when the window is reliably
+    /// enumerable and its process name in hand. None means no key is known,
+    /// which Retrieve reports honestly instead of guessing.
+    fullscreen_key: Option<KeyChord>,
+}
+
+/// A player put back by Retrieve whose full-screen state is still being
+/// watched.
+///
+/// The watching has to span frames: a suspended application takes time to
+/// resume, and whether it restored its own full screen can only be measured
+/// once it has. Each look is a measurement — never a guess — and the key is
+/// pressed at most once.
+struct MediaReentry {
+    handle: u64,
+    /// For the status messages. A handle tells the user nothing.
+    process: String,
+    chord: Option<KeyChord>,
+    /// The key has been pressed; what remains is seeing whether it took.
+    key_sent: bool,
+    /// The window has been observed windowed once already. The key is only
+    /// pressed on the second consecutive look, because a player enumerable
+    /// for a single frame while still mid-restore would otherwise be toggled
+    /// straight back out of the full screen it was entering.
+    seen_windowed: bool,
+}
+
+/// Where one look at the watched players left things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaRestoreStep {
+    /// Nothing is being watched.
+    Idle,
+    /// At least one player has not settled; look again next frame.
+    Waiting,
+    /// Every player accounted for, with what happened to each.
+    Done(String),
 }
 
 pub struct Core {
@@ -132,6 +220,13 @@ pub struct Core {
     /// Session-scoped for the same reason as `saved_bounds`: putting back a
     /// window from a previous run would be restoring a layout that is gone.
     displaced: Vec<Displaced>,
+    /// Players put back by the last Retrieve and still being watched for
+    /// full-screen re-entry. Stepped by the UI clock, emptied by completion,
+    /// timeout or the next Send.
+    pending_reentry: Vec<MediaReentry>,
+    /// Outcomes from players that finished while others were still being
+    /// watched, held so the eventual report covers all of them.
+    reentry_outcomes: Vec<String>,
 }
 
 impl Core {
@@ -142,6 +237,8 @@ impl Core {
             saved_bounds: None,
             confirmed_handle: None,
             displaced: Vec::new(),
+            pending_reentry: Vec::new(),
+            reentry_outcomes: Vec::new(),
         }
     }
 
@@ -227,6 +324,7 @@ impl Core {
                         minimized: true,
                         hidden: false,
                         refocus: false,
+                        fullscreen_key: None,
                     });
                 }
             }
@@ -247,6 +345,7 @@ impl Core {
                         minimized: false,
                         hidden: true,
                         refocus: false,
+                        fullscreen_key: None,
                     }),
                 }
             }
@@ -266,6 +365,7 @@ impl Core {
                     minimized: false,
                     hidden: false,
                     refocus: false,
+                    fullscreen_key: None,
                 });
             }
         }
@@ -285,6 +385,7 @@ impl Core {
                     minimized: true,
                     hidden: false,
                     refocus: false,
+                    fullscreen_key: None,
                 }),
             }
         }
@@ -325,6 +426,10 @@ impl Core {
     /// Put back everything moved aside, in reverse order so the window that was
     /// on top ends up on top again.
     fn put_back_displaced(&mut self) {
+        // One snapshot for the process names. The stowed windows are
+        // enumerable right up until they are put back, which makes this the
+        // last easy moment to learn what they are called.
+        let candidates = self.platform.candidate_windows();
         for window in std::mem::take(&mut self.displaced).into_iter().rev() {
             if window.hidden {
                 let _ = self.platform.show(window.handle);
@@ -338,6 +443,146 @@ impl Core {
             if window.refocus {
                 let _ = self.platform.activate(window.handle);
             }
+
+            // A window that gave up the display on its own gets watched back
+            // to full screen, when the user has not turned that off. Queued
+            // rather than acted on here: whether it needs the key at all is
+            // only measurable once it has finished resuming, frames from now.
+            if window.refocus && self.config.restore_fullscreen {
+                let process = candidates
+                    .iter()
+                    .find(|c| c.handle == window.handle)
+                    .map(|c| c.process_name.clone())
+                    .unwrap_or_else(|| "the player".to_string());
+                self.pending_reentry.push(MediaReentry {
+                    handle: window.handle,
+                    process,
+                    chord: window.fullscreen_key,
+                    key_sent: false,
+                    seen_windowed: false,
+                });
+            }
+        }
+    }
+
+    /// Whether any player is still being watched for full-screen re-entry.
+    pub fn media_restore_pending(&self) -> bool {
+        !self.pending_reentry.is_empty()
+    }
+
+    /// One look at every player still being watched, advancing each by what
+    /// was measured. Driven by the UI clock after Retrieve has finished,
+    /// because the answers change frame to frame as applications resume.
+    ///
+    /// Per player, in order of what a look can find: gone from the window
+    /// list means exclusive full screen again (or closed) and nothing to do;
+    /// still minimised or cloaked means still resuming, look again; filling
+    /// its monitor means full screen without needing the key; visibly
+    /// windowed twice in a row means the key, once. A refused press is a
+    /// not-right-now — a held modifier, focus not settled — and is retried on
+    /// the next look.
+    pub fn media_restore_step(&mut self) -> MediaRestoreStep {
+        if self.pending_reentry.is_empty() {
+            return MediaRestoreStep::Idle;
+        }
+
+        let candidates = self.platform.candidate_windows();
+        let monitors = self.platform.monitors();
+        let mut remaining: Vec<MediaReentry> = Vec::new();
+
+        // `key_sent` never sets without a chord, so the fallthrough covers
+        // both the player that restored itself and the defensive impossible.
+        let fullscreen_again = |entry: &MediaReentry| match (entry.key_sent, entry.chord) {
+            (true, Some(chord)) => format!("Sent {chord} to {}", entry.process),
+            _ => format!("{} is full screen again", entry.process),
+        };
+
+        for mut entry in std::mem::take(&mut self.pending_reentry) {
+            let Some(candidate) = candidates.iter().find(|c| c.handle == entry.handle) else {
+                // Absent from the list is what owning the screen exclusively
+                // looks like — the same signature that identified the player
+                // in the first place.
+                self.reentry_outcomes.push(fullscreen_again(&entry));
+                continue;
+            };
+
+            if candidate.minimized || candidate.cloaked {
+                remaining.push(entry);
+                continue;
+            }
+
+            let fills_its_monitor = monitors
+                .iter()
+                .find(|m| m.id == candidate.monitor_id)
+                .map(|m| candidate.bounds.coverage_of(m.bounds) >= FULLSCREEN)
+                .unwrap_or(false);
+            if fills_its_monitor {
+                self.reentry_outcomes.push(fullscreen_again(&entry));
+                continue;
+            }
+
+            // Visibly windowed. The key was already pressed: give it time to
+            // take, and let the timeout say so if it never does.
+            if entry.key_sent {
+                remaining.push(entry);
+                continue;
+            }
+
+            let Some(chord) = entry.chord else {
+                self.reentry_outcomes.push(format!(
+                    "{} came back windowed. No full-screen key is known for it; \
+                     add one to media_keys in the config file",
+                    entry.process
+                ));
+                continue;
+            };
+
+            if !entry.seen_windowed {
+                entry.seen_windowed = true;
+                remaining.push(entry);
+                continue;
+            }
+
+            match self.platform.send_key(entry.handle, chord) {
+                Ok(()) => {
+                    entry.key_sent = true;
+                    remaining.push(entry);
+                }
+                Err(PlatformError::Denied(_)) => remaining.push(entry),
+                Err(PlatformError::WindowGone) => {
+                    self.reentry_outcomes.push(format!("{} is gone", entry.process));
+                }
+            }
+        }
+
+        self.pending_reentry = remaining;
+        if self.pending_reentry.is_empty() {
+            MediaRestoreStep::Done(std::mem::take(&mut self.reentry_outcomes).join("; "))
+        } else {
+            MediaRestoreStep::Waiting
+        }
+    }
+
+    /// Stop watching, reporting where every player got to. The timeout path,
+    /// and the honest one: a player that never resumed or ignored its key is
+    /// named rather than quietly forgotten.
+    pub fn cancel_media_restore(&mut self) -> Option<String> {
+        let mut outcomes = std::mem::take(&mut self.reentry_outcomes);
+        for entry in std::mem::take(&mut self.pending_reentry) {
+            outcomes.push(if entry.key_sent {
+                let key = entry
+                    .chord
+                    .map(|chord| chord.to_string())
+                    .unwrap_or_else(|| "its key".to_string());
+                format!("{} did not return to full screen after {key}", entry.process)
+            } else {
+                format!("{} did not come back in time", entry.process)
+            });
+        }
+        if outcomes.is_empty() {
+            None
+        } else {
+            Some(outcomes.join("; "))
         }
     }
 
@@ -540,6 +785,11 @@ impl Core {
         self.config.save()
     }
 
+    pub fn set_restore_fullscreen(&mut self, restore: bool) -> Result<(), String> {
+        self.config.restore_fullscreen = restore;
+        self.config.save()
+    }
+
     /// Write the report next to the config and say where it went.
     pub fn save_diagnostics(&self) -> Result<String, Failure> {
         let path = crate::config::diagnostics_path()
@@ -671,6 +921,12 @@ impl Core {
         // clicking another window does by hand. Doing it after positioning
         // meant anything the application re-arranged on being focused happened
         // after the size had been set, and undid it.
+        // A new Send supersedes any re-entry still being watched from the
+        // last Retrieve: pressing a player back to full screen while a window
+        // is being sent over it would be working against this very request.
+        self.pending_reentry.clear();
+        self.reentry_outcomes.clear();
+
         let stowed_before = self.stowed_now();
         let _ = self.platform.activate(window.handle);
 
@@ -679,17 +935,29 @@ impl Core {
         // window list at all, or not stowed, and now it is both. Without
         // noticing, Retrieve has nothing to put back and it stays in the
         // taskbar until someone clicks it.
-        for handle in self.stowed_now() {
-            if handle != window.handle && !stowed_before.contains(&handle) {
-                self.record_displaced(Displaced {
-                    handle,
-                    was_topmost: false,
-                    demoted: false,
-                    minimized: true,
-                    hidden: false,
-                    refocus: true,
-                });
+        //
+        // The full candidate is walked rather than just the handle, because
+        // this is the one moment the player is reliably enumerable with its
+        // process name attached — while it owned the screen it was in no list
+        // at all — and the process name is what keys the full-screen toggle
+        // Retrieve will need.
+        for candidate in self.platform.candidate_windows() {
+            let newly_stowed = (candidate.minimized || candidate.cloaked)
+                && candidate.handle != window.handle
+                && !stowed_before.contains(&candidate.handle);
+            if !newly_stowed {
+                continue;
             }
+            let fullscreen_key = fullscreen_key_for(&self.config, &candidate.process_name);
+            self.record_displaced(Displaced {
+                handle: candidate.handle,
+                was_topmost: false,
+                demoted: false,
+                minimized: true,
+                hidden: false,
+                refocus: true,
+                fullscreen_key,
+            });
         }
 
         self.platform
@@ -1274,6 +1542,306 @@ mod tests {
         let mock = core.platform.as_mock().unwrap();
         assert!(!mock.is_cloaked(EXCLUSIVE_WINDOW), "it must come back");
         assert!(mock.was_activated(EXCLUSIVE_WINDOW));
+    }
+
+    /// The windowed bounds a resuming player is parked at in these tests:
+    /// well on the target display, nowhere near filling it.
+    fn windowed_on_display_two() -> Bounds {
+        Bounds::new(2600, 100, 960, 540)
+    }
+
+    /// The unsolved half of the full-screen problem, end to end: a player
+    /// that resumes windowed is measured to be windowed — twice, so a single
+    /// mid-restore frame cannot mislead — and then pressed back to full
+    /// screen with its own shortcut, exactly once, only after the sent
+    /// window has been placed back.
+    #[test]
+    fn a_player_that_comes_back_windowed_is_pressed_back_to_full_screen() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "wmplayer.exe",
+            "WMPlayerApp",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_returns_windowed(EXCLUSIVE_WINDOW, windowed_on_display_two());
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+        assert!(core.media_restore_pending());
+
+        let chord: KeyChord = "Alt+Enter".parse().unwrap();
+        assert_eq!(core.media_restore_step(), MediaRestoreStep::Waiting);
+        let mock = core.platform.as_mock().unwrap();
+        assert!(
+            !mock.calls().contains(&Call::KeySent(EXCLUSIVE_WINDOW, chord)),
+            "the first windowed look is the debounce and presses nothing"
+        );
+
+        assert_eq!(core.media_restore_step(), MediaRestoreStep::Waiting);
+        let calls = core.platform.as_mock().unwrap().calls();
+        let pressed = calls
+            .iter()
+            .position(|c| *c == Call::KeySent(EXCLUSIVE_WINDOW, chord))
+            .expect("the second windowed look presses the key");
+        let placed_back = calls
+            .iter()
+            .rposition(|c| *c == Call::Placed(VIDEO_WINDOW))
+            .expect("retrieve places the window back");
+        assert!(
+            pressed > placed_back,
+            "the key lands after the sent window is off the player, never into the reveal"
+        );
+
+        match core.media_restore_step() {
+            MediaRestoreStep::Done(message) => {
+                assert!(message.contains("Sent Alt+Enter to wmplayer.exe"), "got: {message}");
+            }
+            other => panic!("the player is exclusive again, so the watch is done: {other:?}"),
+        }
+        assert_eq!(
+            core.platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, Call::KeySent(EXCLUSIVE_WINDOW, _)))
+                .count(),
+            1,
+            "at most one press, however many looks it took"
+        );
+    }
+
+    /// A player that puts its own full screen back on being refocused must
+    /// not be toggled straight back out of it.
+    #[test]
+    fn a_player_that_restores_its_own_full_screen_is_left_alone() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "wmplayer.exe",
+            "WMPlayerApp",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        match core.media_restore_step() {
+            MediaRestoreStep::Done(message) => {
+                assert!(message.contains("full screen again"), "got: {message}");
+            }
+            other => panic!("absent from the list means exclusive again: {other:?}"),
+        }
+        assert!(
+            !core
+                .platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::KeySent(..))),
+            "measuring is what stops a key being sent at a window already full screen"
+        );
+    }
+
+    /// A suspended application that never resumes gets waited on, not typed
+    /// at, and the timeout names it rather than quietly giving up.
+    #[test]
+    fn a_player_that_never_resumes_is_reported_by_the_timeout() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "explorer.exe",
+            "ApplicationFrameWindow",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_suspends(EXCLUSIVE_WINDOW);
+        mock.set_never_resumes(EXCLUSIVE_WINDOW);
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        for _ in 0..5 {
+            assert_eq!(core.media_restore_step(), MediaRestoreStep::Waiting);
+        }
+        assert!(
+            !core
+                .platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::KeySent(..))),
+            "a window still cloaked cannot take input, so none is sent"
+        );
+
+        let message = core.cancel_media_restore().expect("the timeout has something to say");
+        assert!(message.contains("did not come back in time"), "got: {message}");
+        assert!(!core.media_restore_pending(), "cancelling is final");
+    }
+
+    /// The setting is the off switch for the whole behaviour, not a filter on
+    /// part of it.
+    #[test]
+    fn nothing_is_watched_when_the_setting_is_off() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.restore_fullscreen = false;
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "wmplayer.exe",
+            "WMPlayerApp",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_returns_windowed(EXCLUSIVE_WINDOW, windowed_on_display_two());
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        assert!(!core.media_restore_pending());
+        assert_eq!(core.media_restore_step(), MediaRestoreStep::Idle);
+        assert!(
+            !core.platform.as_mock().unwrap().is_minimized(EXCLUSIVE_WINDOW),
+            "the player is still put back; only the key press is off"
+        );
+    }
+
+    /// No key is guessed for a player the table does not know. The report
+    /// says how to teach it one instead.
+    #[test]
+    fn an_unknown_player_gets_no_guessed_key() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "obscureplayer.exe",
+            "ObscureClass",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_returns_windowed(EXCLUSIVE_WINDOW, windowed_on_display_two());
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+
+        match core.media_restore_step() {
+            MediaRestoreStep::Done(message) => {
+                assert!(message.contains("media_keys"), "the report teaches the fix: {message}");
+            }
+            other => panic!("nothing to wait for without a key: {other:?}"),
+        }
+        assert!(
+            !core
+                .platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::KeySent(..)))
+        );
+    }
+
+    /// An override the user wrote wins over the built-in table.
+    #[test]
+    fn a_configured_key_beats_the_builtin_table() {
+        let mut core = core_with_confirmed_video_window();
+        core.config
+            .media_keys
+            .insert("wmplayer.exe".to_string(), "Ctrl+F".to_string());
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "wmplayer.exe",
+            "WMPlayerApp",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_returns_windowed(EXCLUSIVE_WINDOW, windowed_on_display_two());
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+        core.media_restore_step();
+        core.media_restore_step();
+
+        let chord: KeyChord = "Ctrl+F".parse().unwrap();
+        assert!(
+            core.platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .contains(&Call::KeySent(EXCLUSIVE_WINDOW, chord)),
+            "the override is an instruction, not a suggestion"
+        );
+    }
+
+    /// The configured default reaches players the table has never heard of.
+    #[test]
+    fn the_default_key_covers_an_unknown_player() {
+        let mut core = core_with_confirmed_video_window();
+        core.config.media_default_key = Some("Enter".to_string());
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "obscureplayer.exe",
+            "ObscureClass",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_returns_windowed(EXCLUSIVE_WINDOW, windowed_on_display_two());
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+        core.media_restore_step();
+        core.media_restore_step();
+
+        let chord: KeyChord = "Enter".parse().unwrap();
+        assert!(
+            core.platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .contains(&Call::KeySent(EXCLUSIVE_WINDOW, chord))
+        );
+    }
+
+    /// Pressing Send again while a watch is running supersedes it: pressing
+    /// the player back to full screen mid-Send would fight the Send.
+    #[test]
+    fn a_new_send_stops_the_watch() {
+        let mut core = core_with_confirmed_video_window();
+        let mock = core.platform.as_mock().unwrap();
+        mock.add_window(
+            EXCLUSIVE_WINDOW,
+            "wmplayer.exe",
+            "WMPlayerApp",
+            "",
+            Bounds::new(2560, 0, 1920, 1080),
+        );
+        mock.set_exclusive(EXCLUSIVE_WINDOW);
+        mock.set_returns_windowed(EXCLUSIVE_WINDOW, windowed_on_display_two());
+
+        core.send().unwrap();
+        core.retrieve().unwrap();
+        assert!(core.media_restore_pending());
+
+        core.send().unwrap();
+        assert!(!core.media_restore_pending(), "the new Send owns the display now");
+        assert_eq!(core.media_restore_step(), MediaRestoreStep::Idle);
     }
 
     /// Pressing Send twice must not lose what the first press moved aside.

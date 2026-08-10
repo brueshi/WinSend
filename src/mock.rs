@@ -46,9 +46,6 @@ pub enum Call {
     /// ramp can be compared without worrying about float equality.
     Opacity(u64, u8),
     OpacityCleared(u64),
-    /// Constructed only from tests until the re-entry step lands, which is
-    /// the next commit; the allowance goes with it.
-    #[allow(dead_code)]
     KeySent(u64, KeyChord),
 }
 

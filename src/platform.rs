@@ -227,10 +227,6 @@ pub trait Platform {
     /// holds the foreground, and refuses while a physically held modifier
     /// would corrupt the chord. A `Denied` from either guard means "not right
     /// now" rather than "never": the caller retries on its next look.
-    ///
-    /// Uncalled until the Retrieve pipeline grows its re-entry step, which is
-    /// the next commit; the allowance goes with it.
-    #[allow(dead_code)]
     fn send_key(&self, handle: u64, chord: KeyChord) -> Result<(), PlatformError>;
 
     /// Take a window off screen entirely, and put it back.

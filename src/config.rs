@@ -4,6 +4,7 @@
 //! means "not configured yet". Refusing to start because of a bad JSON file
 //! would be the wrong failure mode for a tool used live.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,27 @@ pub struct Config {
     /// GPU-composited — so if it flickers or stutters against a real session,
     /// this is the way back to a hard cut without a rebuild.
     pub fade_on_retrieve: bool,
+    /// Press a displaced media player back to full screen after Retrieve.
+    ///
+    /// On by default: putting the desktop back the way it was found is the
+    /// behaviour, and this exists to turn it off. Only a player that Send
+    /// itself displaced is touched, only after it visibly came back windowed,
+    /// and only with its own full-screen shortcut while it holds the focus.
+    pub restore_fullscreen: bool,
+    /// Full-screen toggle per process, overriding the built-in table.
+    ///
+    /// Keys are process names, values are chords as text: `{"vlc.exe": "F"}`.
+    /// Matched case-insensitively. There is no settings UI for this — the
+    /// built-in table covers the common players, and a hand-maintained map in
+    /// a readable file beats a grid of text fields for the rest.
+    pub media_keys: HashMap<String, String>,
+    /// The chord to try for a player the table does not know.
+    ///
+    /// None by default, deliberately: sending a guessed key to an unknown
+    /// application is typing into it, and the one thing worse than a player
+    /// left windowed is some other program reacting to a keystroke it was
+    /// never meant to see.
+    pub media_default_key: Option<String>,
     /// Ask GitHub once per launch whether there is a newer release.
     ///
     /// On by default, and its only effect is to make an indicator appear:
@@ -66,6 +88,9 @@ impl Default for Config {
             borderless: false,
             clear_target: false,
             fade_on_retrieve: true,
+            restore_fullscreen: true,
+            media_keys: HashMap::new(),
+            media_default_key: None,
             check_for_updates: true,
             hotkeys: Hotkeys::default(),
         }
@@ -264,6 +289,36 @@ mod tests {
 
         let opted_out: Config = serde_json::from_str(r#"{"fade_on_retrieve": false}"#).unwrap();
         assert!(!opted_out.fade_on_retrieve, "and an explicit no must survive a reload");
+    }
+
+    /// Same shape as the fade: the restore is the behaviour and the setting
+    /// exists to turn it off, so an older config must gain it switched on.
+    #[test]
+    fn the_fullscreen_restore_is_on_unless_it_has_been_turned_off() {
+        assert!(Config::default().restore_fullscreen);
+
+        let existing: Config = serde_json::from_str(r#"{"borderless": true}"#).unwrap();
+        assert!(existing.restore_fullscreen, "an older config must gain it switched on");
+
+        let opted_out: Config = serde_json::from_str(r#"{"restore_fullscreen": false}"#).unwrap();
+        assert!(!opted_out.restore_fullscreen, "and an explicit no must survive a reload");
+    }
+
+    /// The keymap persists as readable text, the same rule as the hotkeys.
+    #[test]
+    fn media_keys_round_trip_and_an_old_config_arrives_without_any() {
+        let mut config = Config::default();
+        config.media_keys.insert("vlc.exe".to_string(), "F".to_string());
+        config.media_default_key = Some("Enter".to_string());
+
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.media_keys, config.media_keys);
+        assert_eq!(loaded.media_default_key, config.media_default_key);
+
+        let old: Config = serde_json::from_str(r#"{"borderless": true}"#).unwrap();
+        assert!(old.media_keys.is_empty());
+        assert_eq!(old.media_default_key, None);
     }
 
     #[test]

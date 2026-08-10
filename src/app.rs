@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
-use crate::core::{Core, Failure};
+use crate::core::{Core, Failure, MediaRestoreStep};
 use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::WindowCandidate;
 use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
@@ -93,6 +93,12 @@ const STATUS_HEIGHT: f32 = 52.0;
 /// Deliberately not configurable until someone asks: another setting to get
 /// wrong, for a quantity with one right answer.
 const FADE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long a put-back player gets to settle before the watch reports what
+/// happened instead. Generous against a suspended application resuming, and
+/// short enough that the report still lands while the Retrieve is the thing
+/// the user just did.
+const MEDIA_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A Retrieve part-way through, with the window fading and not yet moved.
 ///
@@ -253,6 +259,12 @@ pub struct WinSendApp {
     picking: bool,
     /// A Retrieve fading the window out, if one is running.
     fading: Option<Fade>,
+    /// When to stop watching put-back players for full-screen re-entry.
+    ///
+    /// The clock half of the watch: `Core` owns the measuring and this owns
+    /// only the deadline, the same split as [`Fade`], so the state machine
+    /// stays testable against the mock while time stays up here.
+    media_restore_deadline: Option<std::time::Instant>,
     updater: Box<dyn Updater>,
     update: UpdateState,
     /// Set when an update has been installed, so `main` can start the new
@@ -316,6 +328,7 @@ impl WinSendApp {
             configuring: false,
             picking: false,
             fading: None,
+            media_restore_deadline: None,
             updater,
             update: UpdateState::Quiet,
             relaunch,
@@ -384,6 +397,7 @@ impl WinSendApp {
         if !self.core.config.fade_on_retrieve {
             let outcome = self.core.retrieve();
             self.report(ctx, outcome);
+            self.arm_media_restore(ctx);
             return;
         }
 
@@ -392,7 +406,10 @@ impl WinSendApp {
                 self.fading = Some(fade);
                 ctx.request_repaint();
             }
-            Started::Cut(outcome) => self.report(ctx, outcome),
+            Started::Cut(outcome) => {
+                self.report(ctx, outcome);
+                self.arm_media_restore(ctx);
+            }
         }
     }
 
@@ -412,7 +429,10 @@ impl WinSendApp {
                 // step a 200ms fade about twice.
                 ctx.request_repaint();
             }
-            Some(outcome) => self.report(ctx, outcome),
+            Some(outcome) => {
+                self.report(ctx, outcome);
+                self.arm_media_restore(ctx);
+            }
         }
     }
 
@@ -423,7 +443,52 @@ impl WinSendApp {
         };
         let outcome = fade.finish(&mut self.core);
         self.report(ctx, outcome);
+        self.arm_media_restore(ctx);
         true
+    }
+
+    /// Start the clock on the full-screen watch, if Retrieve queued one.
+    ///
+    /// Called wherever a Retrieve reports its outcome, which is the moment
+    /// the sent window has finished moving and the players are free to
+    /// resume. Does nothing when nothing was displaced or the setting is off,
+    /// which is every Retrieve that never covered a full-screen player.
+    fn arm_media_restore(&mut self, ctx: &egui::Context) {
+        if self.core.media_restore_pending() {
+            self.media_restore_deadline = Some(std::time::Instant::now() + MEDIA_RESTORE_TIMEOUT);
+            ctx.request_repaint();
+        }
+    }
+
+    /// One look at the watched players, if the watch is running.
+    ///
+    /// Skipped while a fade is still up: the key must land after the sent
+    /// window has moved off the player, not into the middle of the reveal.
+    /// That ordering is what makes "was it restored" measurable at all.
+    fn media_restore_tick(&mut self, ctx: &egui::Context) {
+        let Some(deadline) = self.media_restore_deadline else {
+            return;
+        };
+        if self.fading.is_some() {
+            return;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            self.media_restore_deadline = None;
+            if let Some(message) = self.core.cancel_media_restore() {
+                self.status.push(Outcome::Err, message);
+            }
+            return;
+        }
+
+        match self.core.media_restore_step() {
+            MediaRestoreStep::Idle => self.media_restore_deadline = None,
+            MediaRestoreStep::Waiting => ctx.request_repaint(),
+            MediaRestoreStep::Done(message) => {
+                self.media_restore_deadline = None;
+                self.status.push(Outcome::Ok, message);
+            }
+        }
     }
 
     fn handle(&mut self, ctx: &egui::Context, event: ShellEvent) {
@@ -1047,6 +1112,23 @@ impl WinSendApp {
 
         ui.add_space(10.0);
 
+        let mut restore = self.core.config.restore_fullscreen;
+        if checkbox(ui, &mut restore, "Return full-screen video after Retrieve")
+            .on_hover_text(
+                "A player that gave up the display when the window was sent over it is \
+                 pressed back to full screen after Retrieve, using its own shortcut — \
+                 F for VLC, F11 for browsers, Alt+Enter for Media Player. Only pressed \
+                 when the player visibly came back windowed, and at most once.",
+            )
+            .changed()
+        {
+            if let Err(message) = self.core.set_restore_fullscreen(restore) {
+                self.status.push(Outcome::Err, message);
+            }
+        }
+
+        ui.add_space(10.0);
+
         let mut checking = self.core.config.check_for_updates;
         if checkbox(ui, &mut checking, "Check for updates on startup")
             .on_hover_text(
@@ -1340,6 +1422,9 @@ impl eframe::App for WinSendApp {
         // a hotkey while the window is in the tray and its fade still has to
         // run to completion.
         self.fade_step(ctx);
+        // After the fade, which owns the screen until the sent window is off
+        // the player being watched.
+        self.media_restore_tick(ctx);
         // Before any widget sees the keyboard, so a capture in progress takes
         // every press for itself.
         self.capture_step(ctx);

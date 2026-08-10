@@ -236,10 +236,6 @@ impl FromStr for Hotkey {
 /// or `Enter`. There is deliberately no Win modifier: synthesizing Win+key
 /// would trigger operating-system shortcuts in the middle of someone's
 /// desktop, and no player uses one.
-///
-/// Unconstructed outside tests until the platform seam grows `send_key`,
-/// which is the next commit; the allowance goes with it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyChord {
     pub ctrl: bool,
