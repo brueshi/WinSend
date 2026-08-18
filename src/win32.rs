@@ -7,7 +7,7 @@ use std::ffi::{c_void, OsString};
 use std::os::windows::ffi::OsStringExt;
 
 use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, COLORREF, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, COLORREF, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -15,8 +15,9 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-    GetMonitorInfoW, MonitorFromWindow, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SelectObject, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Threading::{
@@ -436,6 +437,24 @@ fn downsample_bgra(source: &[u8], width: u32, height: u32) -> Thumbnail {
     }
 
     Thumbnail { width: target_width, height: target_height, rgba }
+}
+
+/// The display a rectangle is aimed at, which is how far a correction is
+/// allowed to reach. Falls back to the rectangle itself when the query fails,
+/// bounding the correction to exactly what was asked for.
+unsafe fn monitor_bounds_for(wanted: Bounds) -> Bounds {
+    let centre = POINT {
+        x: wanted.x + wanted.width / 2,
+        y: wanted.y + wanted.height / 2,
+    };
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    let monitor = MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST);
+    if GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _).as_bool() {
+        rect_to_bounds(info.monitorInfo.rcMonitor)
+    } else {
+        wanted
+    }
 }
 
 fn handle_to_hwnd(handle: u64) -> HWND {
@@ -859,7 +878,11 @@ impl Platform for Win32Platform {
             if GetWindowRect(hwnd, &mut actual).is_ok() {
                 let actual = rect_to_bounds(actual);
                 if actual != placement.bounds {
-                    let corrected = corrected_request(placement.bounds, actual);
+                    let corrected = corrected_request(
+                        placement.bounds,
+                        actual,
+                        monitor_bounds_for(placement.bounds),
+                    );
                     let _ = SetWindowPos(
                         hwnd,
                         Some(insert_after),
