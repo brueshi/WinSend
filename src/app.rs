@@ -94,6 +94,17 @@ const STATUS_HEIGHT: f32 = 52.0;
 /// wrong, for a quantity with one right answer.
 const FADE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How often the last placement is looked at, and for how long.
+///
+/// Fifty milliseconds is faster than anyone can see a window move and slower
+/// than the frame rate, so the watch costs a couple of dozen cheap reads
+/// rather than one per frame. A second and a bit covers an application being
+/// told its scaling changed and resizing itself in response, which is the
+/// slowest thing this is waiting for, without leaving a watch running into
+/// whatever the operator does next.
+const SETTLE_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+const SETTLE_WATCH: std::time::Duration = std::time::Duration::from_millis(1200);
+
 /// How long a put-back player gets to settle before the watch reports what
 /// happened instead. Generous against a suspended application resuming, and
 /// short enough that the report still lands while the Retrieve is the thing
@@ -111,6 +122,16 @@ struct Fade {
     /// re-confirm what was found moments ago would be work for nothing.
     handle: u64,
     started: std::time::Instant,
+}
+
+/// The clock half of the placement watch, the same split as [`Fade`]: `Core`
+/// owns the measuring and the corrections, this owns only when to look and
+/// when to stop, so the state machine stays testable against the mock while
+/// time stays up here.
+#[derive(Debug, Clone, Copy)]
+struct SettleClock {
+    next_look: std::time::Instant,
+    until: std::time::Instant,
 }
 
 /// What starting a Retrieve turned into.
@@ -267,6 +288,9 @@ pub struct WinSendApp {
     picking: Option<PickerFor>,
     /// A Retrieve fading the window out, if one is running.
     fading: Option<Fade>,
+    /// When to next look at the window that was last placed, and when to give
+    /// up looking.
+    settling: Option<SettleClock>,
     /// When to stop watching put-back players for full-screen re-entry.
     ///
     /// The clock half of the watch: `Core` owns the measuring and this owns
@@ -336,6 +360,7 @@ impl WinSendApp {
             configuring: false,
             picking: None,
             fading: None,
+            settling: None,
             media_restore_deadline: None,
             updater,
             update: UpdateState::Quiet,
@@ -404,6 +429,7 @@ impl WinSendApp {
             Action::Send => {
                 let outcome = self.core.send();
                 self.report(ctx, outcome);
+                self.arm_watches(ctx);
             }
             // The fade that was just cut short *was* the Retrieve. Starting
             // another would only produce "nothing has been sent yet".
@@ -412,7 +438,7 @@ impl WinSendApp {
             Action::RestoreMedia => {
                 let outcome = self.core.restore_media();
                 self.report_for(ctx, outcome, PickerFor::Media);
-                self.arm_media_restore(ctx);
+                self.arm_watches(ctx);
             }
         }
     }
@@ -422,7 +448,7 @@ impl WinSendApp {
         if !self.core.config.fade_on_retrieve {
             let outcome = self.core.retrieve();
             self.report(ctx, outcome);
-            self.arm_media_restore(ctx);
+            self.arm_watches(ctx);
             return;
         }
 
@@ -433,7 +459,7 @@ impl WinSendApp {
             }
             Started::Cut(outcome) => {
                 self.report(ctx, outcome);
-                self.arm_media_restore(ctx);
+                self.arm_watches(ctx);
             }
         }
     }
@@ -456,7 +482,7 @@ impl WinSendApp {
             }
             Some(outcome) => {
                 self.report(ctx, outcome);
-                self.arm_media_restore(ctx);
+                self.arm_watches(ctx);
             }
         }
     }
@@ -468,8 +494,65 @@ impl WinSendApp {
         };
         let outcome = fade.finish(&mut self.core);
         self.report(ctx, outcome);
-        self.arm_media_restore(ctx);
+        self.arm_watches(ctx);
         true
+    }
+
+    /// Start the clocks on whatever the action just queued.
+    ///
+    /// Both watches begin at the same moment and for the same reason: the
+    /// action has reported, so the window has finished moving and everything
+    /// that happens next is the desktop reacting rather than us acting. They
+    /// are separate watches because they measure different things — where the
+    /// sent window ended up, and whether a displaced player came back to full
+    /// screen — and either can be running without the other.
+    fn arm_watches(&mut self, ctx: &egui::Context) {
+        self.arm_media_restore(ctx);
+        self.arm_settle(ctx);
+    }
+
+    /// Start the clock on the placement watch, if the action placed anything.
+    fn arm_settle(&mut self, ctx: &egui::Context) {
+        if !self.core.placement_settling() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.settling = Some(SettleClock { next_look: now + SETTLE_LOOK, until: now + SETTLE_WATCH });
+        ctx.request_repaint_after(SETTLE_LOOK);
+    }
+
+    /// One look at the last placement, if the watch is running.
+    ///
+    /// Runs to the end of its window rather than stopping at the first
+    /// agreeable measurement. A window that has crossed a scaling boundary is
+    /// the right size until the application is told, and stopping early would
+    /// mean stopping in exactly that gap — measuring the one moment the bug is
+    /// invisible and calling it settled.
+    fn settle_tick(&mut self, ctx: &egui::Context) {
+        let Some(mut clock) = self.settling else {
+            return;
+        };
+        // Superseded: a Retrieve starting drops the Send's watch, and there is
+        // nothing left for this clock to drive.
+        if !self.core.placement_settling() {
+            self.settling = None;
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        if now >= clock.until {
+            self.settling = None;
+            if let Some(message) = self.core.finish_settle() {
+                self.status.push(Outcome::Err, message);
+            }
+            return;
+        }
+        if now >= clock.next_look {
+            self.core.settle_look();
+            clock.next_look = now + SETTLE_LOOK;
+        }
+        self.settling = Some(clock);
+        ctx.request_repaint_after(SETTLE_LOOK);
     }
 
     /// Start the clock on the full-screen watch, if Retrieve queued one.
@@ -1504,6 +1587,9 @@ impl eframe::App for WinSendApp {
         // After the fade, which owns the screen until the sent window is off
         // the player being watched.
         self.media_restore_tick(ctx);
+        // Independent of both: it watches the window this application moved,
+        // where the other watch waits on one it only displaced.
+        self.settle_tick(ctx);
         // Before any widget sees the keyboard, so a capture in progress takes
         // every press for itself.
         self.capture_step(ctx);

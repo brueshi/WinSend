@@ -207,6 +207,7 @@ pub fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::BASE_DPI;
 
     fn monitor(id: &str, x: i32, primary: bool) -> MonitorInfo {
         MonitorInfo {
@@ -214,6 +215,7 @@ mod tests {
             bounds: Bounds::new(x, 0, 1920, 1080),
             work_area: Bounds::new(x, 0, 1920, 1040),
             is_primary: primary,
+            dpi: BASE_DPI,
         }
     }
 

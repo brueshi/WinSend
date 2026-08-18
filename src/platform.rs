@@ -30,9 +30,25 @@ pub struct MonitorInfo {
     pub bounds: Bounds,
     pub work_area: Bounds,
     pub is_primary: bool,
+    /// Dots per inch, where 96 is 100% scaling.
+    ///
+    /// Recorded because a move between displays of different DPI is not an
+    /// ordinary move: the application is told its scaling changed and resizes
+    /// itself afterwards, which is invisible in the geometry alone and is what
+    /// makes a restored window come back the wrong size.
+    pub dpi: u32,
 }
 
+/// 96 dots per inch, which Windows calls 100% scaling. The baseline every
+/// other DPI is a ratio of.
+pub const BASE_DPI: u32 = 96;
+
 impl MonitorInfo {
+    /// Windows' scaling percentage for this display, as shown in Settings.
+    pub fn scaling_percent(&self) -> u32 {
+        self.dpi * 100 / BASE_DPI
+    }
+
     /// Human-readable label for the settings list, e.g.
     /// `2560x1440 at (2560, 0) — secondary`.
     pub fn label(&self) -> String {
@@ -126,6 +142,49 @@ pub struct Placement {
     pub topmost: bool,
 }
 
+/// What to ask for next, given what was asked for and what arrived.
+///
+/// Position is corrected by the difference and size by the ratio, because the
+/// two go wrong in different ways: an offset is added to a position, while a
+/// scale multiplies a size. Asking for the square of the request over the
+/// result cancels a scale factor exactly in one step, where adding the
+/// difference would only close part of the gap.
+///
+/// `limit` is the display the request was aimed at, and it is what keeps the
+/// ratio from running away. A window that lands at half the size asked for
+/// makes the next ask twice as large — and on Send the first ask is already
+/// the whole display, so an unbounded second ask is two displays wide and
+/// spills onto the neighbouring monitor. Nothing returned here is allowed to
+/// be larger than the display it is aimed at, or to start off it.
+///
+/// The bound applies to the correction only. The original request is passed
+/// through untouched, so a window the user had straddling two displays is
+/// still placed straddling them; it is only the guess at what to ask for
+/// *instead* that is kept on one screen.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn corrected_request(wanted: Bounds, actual: Bounds, limit: Bounds) -> Bounds {
+    let scale = |wanted: i32, actual: i32, limit: i32| {
+        if actual <= 0 || wanted <= 0 {
+            wanted
+        } else {
+            (((wanted as i64 * wanted as i64) / actual as i64) as i32).clamp(1, limit.max(1))
+        }
+    };
+    let width = scale(wanted.width, actual.width, limit.width);
+    let height = scale(wanted.height, actual.height, limit.height);
+    // The origin stays on the display, and far enough onto it that the window
+    // does not hang off the far edge by more than it has to.
+    let origin = |wanted: i32, actual: i32, limit_start: i32, limit_span: i32, span: i32| {
+        (wanted + (wanted - actual)).clamp(limit_start, limit_start + (limit_span - span).max(0))
+    };
+    Bounds::new(
+        origin(wanted.x, actual.x, limit.x, limit.width, width),
+        origin(wanted.y, actual.y, limit.y, limit.height, height),
+        width,
+        height,
+    )
+}
+
 /// RGBA8 preview of a window, sized by the platform layer.
 #[derive(Debug, Clone)]
 pub struct Thumbnail {
@@ -164,6 +223,16 @@ pub trait Platform {
     fn thumbnail(&self, handle: u64) -> Option<Thumbnail>;
 
     fn window_bounds(&self, handle: u64) -> Result<Bounds, PlatformError>;
+
+    /// The scaling the window is currently being drawn at, in dots per inch.
+    ///
+    /// Only ever reported, never acted on: it is what turns "the window came
+    /// back the wrong size" into "the window came back scaled by 150%" in the
+    /// diagnostics, which is the difference between a guess and a reading.
+    /// `None` where the platform cannot say.
+    fn window_dpi(&self, _handle: u64) -> Option<u32> {
+        None
+    }
 
     /// Bring a minimised window back so its real bounds can be read. Called
     /// before capturing a restore point, since a minimised window reports
@@ -263,5 +332,86 @@ pub trait Platform {
     #[cfg(not(windows))]
     fn as_mock(&self) -> Option<&crate::mock::MockPlatform> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The display the corrections in these tests are aimed at.
+    fn display() -> Bounds {
+        Bounds::new(0, 0, 1920, 1080)
+    }
+
+    #[test]
+    fn a_scale_factor_is_cancelled_in_one_step() {
+        // Asked for 1000 wide, arrived 1500: the window is being scaled by
+        // 1.5, so asking for 667 lands on 1000.
+        let corrected = corrected_request(
+            Bounds::new(100, 100, 1000, 600),
+            Bounds::new(100, 100, 1500, 900),
+            display(),
+        );
+        assert_eq!((corrected.width, corrected.height), (666, 400));
+        // Which is what lands on the size actually wanted once the window
+        // scales it by the same 1.5 again.
+        assert_eq!(corrected.height * 3 / 2, 600);
+    }
+
+    #[test]
+    fn an_offset_is_corrected_by_the_difference() {
+        let corrected = corrected_request(
+            Bounds::new(300, 200, 400, 300),
+            Bounds::new(280, 190, 400, 300),
+            display(),
+        );
+        assert_eq!((corrected.x, corrected.y), (320, 210));
+    }
+
+    #[test]
+    fn a_correction_never_asks_for_more_than_the_display() {
+        // The Send case: the whole display was asked for and half of it
+        // arrived. Unbounded, the next ask would be two displays wide.
+        let corrected = corrected_request(
+            Bounds::new(0, 0, 1920, 1080),
+            Bounds::new(0, 0, 960, 540),
+            display(),
+        );
+        assert_eq!((corrected.width, corrected.height), (1920, 1080));
+        assert_eq!((corrected.x, corrected.y), (0, 0));
+    }
+
+    #[test]
+    fn a_correction_never_starts_off_the_display() {
+        let corrected = corrected_request(
+            Bounds::new(0, 0, 800, 600),
+            Bounds::new(1400, 900, 800, 600),
+            display(),
+        );
+        assert!(corrected.x >= 0 && corrected.y >= 0);
+        assert!(corrected.x + corrected.width <= display().width);
+        assert!(corrected.y + corrected.height <= display().height);
+    }
+
+    #[test]
+    fn a_window_that_arrived_with_no_size_is_asked_for_the_same_size_again() {
+        // A minimised or closing window reports nonsense rather than a scale
+        // factor, and dividing by it would produce nonsense of our own.
+        let wanted = Bounds::new(10, 20, 800, 600);
+        let corrected = corrected_request(wanted, Bounds::new(10, 20, 0, 0), display());
+        assert_eq!((corrected.width, corrected.height), (800, 600));
+    }
+
+    #[test]
+    fn scaling_is_reported_as_a_percentage() {
+        let monitor = MonitorInfo {
+            id: "test".into(),
+            bounds: display(),
+            work_area: display(),
+            is_primary: true,
+            dpi: 144,
+        };
+        assert_eq!(monitor.scaling_percent(), 150);
     }
 }
