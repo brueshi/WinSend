@@ -169,6 +169,91 @@ struct Displaced {
     fullscreen_key: Option<KeyChord>,
 }
 
+/// How far from where it was put a window may sit before that counts as
+/// drift. Two pixels of slack for the rounding a scaling change introduces,
+/// which is arithmetic rather than the application changing its mind.
+const SETTLE_SLACK: i32 = 2;
+
+/// How many times a placement is re-asserted before the drift is reported
+/// instead.
+///
+/// The first placement can cross a scaling boundary, and that is the one that
+/// gets undone: the application is told its DPI changed and resizes itself
+/// afterwards. A re-assertion cannot cross anything — by then the window is
+/// already on the destination display — so one is normally enough and two is
+/// generous. It is a cap rather than a loop that runs until it wins, because
+/// past this the application is not losing an argument, it is having one, and
+/// a window flickering between two sizes on camera is worse than a window
+/// that is the wrong size and said so.
+const SETTLE_CORRECTIONS: u32 = 2;
+
+/// Consecutive identical looks at a wrong rectangle before it is corrected.
+/// A window caught mid-move has not drifted, and correcting one spends a
+/// correction on nothing.
+const SETTLE_STILL: u32 = 2;
+
+/// Whether a window is close enough to where it was put.
+fn settled_at(actual: Bounds, wanted: Bounds) -> bool {
+    (actual.x - wanted.x).abs() <= SETTLE_SLACK
+        && (actual.y - wanted.y).abs() <= SETTLE_SLACK
+        && (actual.width - wanted.width).abs() <= SETTLE_SLACK
+        && (actual.height - wanted.height).abs() <= SETTLE_SLACK
+}
+
+/// What is wrong with where a window ended up, in the terms that actually
+/// differ. A window that is the right size in the wrong place should not be
+/// reported by its size.
+fn describe_drift(wanted: Bounds, actual: Bounds) -> String {
+    let resized = (actual.width, actual.height) != (wanted.width, wanted.height);
+    let moved = (actual.x, actual.y) != (wanted.x, wanted.y);
+    let size = format!("{}x{} rather than {}x{}", actual.width, actual.height, wanted.width, wanted.height);
+    let place = format!("{},{} rather than {},{}", actual.x, actual.y, wanted.x, wanted.y);
+    match (resized, moved) {
+        (true, true) => format!("{size}, at {place}"),
+        (true, false) => size,
+        _ => format!("at {place}"),
+    }
+}
+
+/// A placement whose result is still being measured.
+///
+/// Placing a window is not over when `place_window` returns. A window moved
+/// between displays of different scaling is told so afterwards, on the
+/// application's own thread, and resizes itself then — by the scaling ratio,
+/// which is how a window restored to 1280x800 comes back at 1920x1200 and
+/// takes over the screen. Nothing measured inside the placement call can see
+/// that, because it has not happened yet. So the placement is watched for a
+/// beat and re-asserted if it did not hold.
+struct Settle {
+    handle: u64,
+    /// How the eventual complaint starts: "Sent" or "Restored".
+    what: &'static str,
+    /// Re-asserted verbatim. The correction is the same request again, not a
+    /// cleverer one: by the time it is made the window is already on the
+    /// destination display, so there is no scaling boundary left to cross and
+    /// nothing to compensate for.
+    placement: Placement,
+    /// The last rectangle seen, to tell a window that has stopped moving from
+    /// one still on its way.
+    last_seen: Option<Bounds>,
+    still: u32,
+    corrections: u32,
+}
+
+/// The last placement and what became of it, for the diagnostics.
+///
+/// Kept because the interesting question after a bad restore is not what the
+/// desktop looks like now but what was asked for, what arrived, and how many
+/// times it had to be asked — none of which survives anywhere else.
+#[derive(Debug, Clone, Copy)]
+struct PlacementRecord {
+    what: &'static str,
+    requested: Bounds,
+    landed: Bounds,
+    corrections: u32,
+    settled: bool,
+}
+
 /// A player put back by Retrieve whose full-screen state is still being
 /// watched.
 ///
@@ -227,6 +312,10 @@ pub struct Core {
     /// Outcomes from players that finished while others were still being
     /// watched, held so the eventual report covers all of them.
     reentry_outcomes: Vec<String>,
+    /// The placement still being measured, if there is one.
+    settling: Option<Settle>,
+    /// What the last placement asked for and got. Diagnostics only.
+    last_placement: Option<PlacementRecord>,
 }
 
 impl Core {
@@ -239,6 +328,8 @@ impl Core {
             displaced: Vec::new(),
             pending_reentry: Vec::new(),
             reentry_outcomes: Vec::new(),
+            settling: None,
+            last_placement: None,
         }
     }
 
@@ -586,6 +677,110 @@ impl Core {
         }
     }
 
+    /// Begin measuring a placement that has just been made.
+    ///
+    /// One at a time by design: the only window this ever places is the Zoom
+    /// window, so a second placement is not something to queue behind the
+    /// first, it is the answer to what the first should have been.
+    fn watch_placement(&mut self, handle: u64, what: &'static str, placement: Placement) {
+        self.settling = Some(Settle {
+            handle,
+            what,
+            placement,
+            last_seen: None,
+            still: 0,
+            corrections: 0,
+        });
+        self.last_placement = Some(PlacementRecord {
+            what,
+            requested: placement.bounds,
+            landed: placement.bounds,
+            corrections: 0,
+            settled: false,
+        });
+    }
+
+    pub fn placement_settling(&self) -> bool {
+        self.settling.is_some()
+    }
+
+    /// One look at the window that was last placed, and a correction if it has
+    /// come to rest somewhere other than where it was put.
+    ///
+    /// Every branch is a measurement, the same rule the full-screen watch
+    /// follows. Nothing here predicts what the application will do with a
+    /// scaling change — it reads what it did.
+    pub fn settle_look(&mut self) {
+        let Some(mut settle) = self.settling.take() else {
+            return;
+        };
+        let Ok(actual) = self.platform.window_bounds(settle.handle) else {
+            // Closed while it was being watched. There is nothing left to
+            // measure and nothing worth saying about a window that has gone.
+            return;
+        };
+        if let Some(record) = self.last_placement.as_mut() {
+            record.landed = actual;
+        }
+
+        if settled_at(actual, settle.placement.bounds) {
+            settle.still = 0;
+            settle.last_seen = Some(actual);
+            self.settling = Some(settle);
+            return;
+        }
+
+        settle.still = if settle.last_seen == Some(actual) { settle.still + 1 } else { 1 };
+        settle.last_seen = Some(actual);
+
+        if settle.still >= SETTLE_STILL && settle.corrections < SETTLE_CORRECTIONS {
+            settle.corrections += 1;
+            settle.still = 0;
+            settle.last_seen = None;
+            let _ = self.platform.place_window(settle.handle, settle.placement);
+            if let Some(record) = self.last_placement.as_mut() {
+                record.corrections = settle.corrections;
+            }
+        }
+
+        self.settling = Some(settle);
+    }
+
+    /// Stop watching, and say what to tell the user — which is nothing at all
+    /// unless the window is still somewhere it was not put.
+    ///
+    /// Silence on success is deliberate. "Sent" already said what happened,
+    /// and a second line confirming that a window is the size it was asked to
+    /// be is noise on a strip that has room for three messages.
+    pub fn finish_settle(&mut self) -> Option<String> {
+        let settle = self.settling.take()?;
+        let wanted = settle.placement.bounds;
+        let actual = self.platform.window_bounds(settle.handle).ok()?;
+        let settled = settled_at(actual, wanted);
+        if let Some(record) = self.last_placement.as_mut() {
+            record.landed = actual;
+            record.settled = settled;
+        }
+        if settled {
+            return None;
+        }
+        Some(format!(
+            "{}, but the window is holding {}",
+            settle.what,
+            describe_drift(wanted, actual)
+        ))
+    }
+
+    /// Abandon the watch without a word.
+    ///
+    /// For the moments when the placement being watched has been superseded
+    /// rather than failed: a Retrieve starting cancels the Send it is undoing,
+    /// and re-asserting that Send's bounds part-way through the fade would put
+    /// the window back on the display it is being taken off.
+    fn stop_settling(&mut self) {
+        self.settling = None;
+    }
+
     /// Everything this code can see, in the terms it reasons about.
     ///
     /// Exists because five attempts at getting the sent window in front of
@@ -678,6 +873,44 @@ impl Core {
             Err(failure) => writeln!(out, "  located now: NO ({})", failure.message),
         };
         let _ = writeln!(out, "  restore point held: {}", self.can_retrieve());
+        let _ = writeln!(out);
+
+        // What the last placement asked for and what became of it. The one
+        // question a screenshot of the desktop cannot answer after a window
+        // has come back the wrong size.
+        let _ = writeln!(out, "LAST PLACEMENT");
+        match &self.last_placement {
+            Some(record) => {
+                let _ = writeln!(
+                    out,
+                    "  {}: asked {},{} {}x{}",
+                    record.what,
+                    record.requested.x,
+                    record.requested.y,
+                    record.requested.width,
+                    record.requested.height
+                );
+                let _ = writeln!(
+                    out,
+                    "  landed {},{} {}x{} after {} correction(s), {}",
+                    record.landed.x,
+                    record.landed.y,
+                    record.landed.width,
+                    record.landed.height,
+                    record.corrections,
+                    if self.settling.is_some() {
+                        "still settling"
+                    } else if record.settled {
+                        "settled"
+                    } else {
+                        "NOT where it was put"
+                    }
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  nothing placed this session");
+            }
+        }
         let _ = writeln!(out);
 
         // The verdicts, computed exactly as Send computes them.
@@ -1092,24 +1325,23 @@ impl Core {
             });
         }
 
+        let placement = Placement {
+            bounds: destination,
+            borderless: self.config.borderless,
+            // The window is being put on a monitor that may already have
+            // something full-screen on it.
+            topmost: true,
+        };
         self.platform
-            .place_window(
-                window.handle,
-                Placement {
-                    bounds: destination,
-                    borderless: self.config.borderless,
-                    // The window is being put on a monitor that may already
-                    // have something full-screen on it.
-                    topmost: true,
-                },
-            )
+            .place_window(window.handle, placement)
             .map_err(|e| Failure::plain(format!("Could not move the window: {e}")))?;
 
-        // Whether the window actually ended up filling the display. An
-        // application that resizes itself afterwards, or coordinates scaled on
-        // a display the process was told the wrong DPI for, both show up here,
-        // and neither should be discovered by squinting at the screen.
-        let landed = self.platform.window_bounds(window.handle).ok();
+        // Whether the window actually ends up filling the display is not
+        // knowable yet. Sending it to a display of a different scaling makes
+        // the application resize itself once it has been told, which is after
+        // this returns, so the answer is measured over the next second by the
+        // settle watch rather than read once here and believed.
+        self.watch_placement(window.handle, "Sent", placement);
 
         // Only after the move has succeeded. Pushing another application's
         // window aside for a Send that then failed would be interference with
@@ -1128,12 +1360,6 @@ impl Core {
         if still_in_front > 0 {
             return Ok(format!(
                 "Sent to {label}, but {still_in_front} window(s) will not move out of the way"
-            ));
-        }
-        if let Some(landed) = landed.filter(|landed| *landed != destination) {
-            return Ok(format!(
-                "Sent to {label}, but it settled at {}x{} rather than {}x{}",
-                landed.width, landed.height, destination.width, destination.height
             ));
         }
         Ok(format!("Sent to {label}"))
@@ -1162,6 +1388,11 @@ impl Core {
 
         let window = self.locate()?;
         self.ensure_visible(&window)?;
+
+        // The Send being undone is no longer worth measuring, and a watch that
+        // outlived it would re-assert the sent bounds part-way through the
+        // fade — putting the window back on the display it is being taken off.
+        self.stop_settling();
 
         // Before the sent window moves, not after.
         //
@@ -1194,9 +1425,17 @@ impl Core {
             Failure::plain("Nothing has been sent yet, so there is no position to restore.")
         })?;
 
+        let placement = Placement { bounds, borderless: false, topmost: false };
         self.platform
-            .place_window(handle, Placement { bounds, borderless: false, topmost: false })
+            .place_window(handle, placement)
             .map_err(|e| Failure::plain(format!("Could not restore the window: {e}")))?;
+
+        // The half of the restore that cannot be done synchronously. Coming
+        // back from a larger display usually means coming back across a
+        // scaling boundary, and the application resizes itself by that ratio
+        // once it has been told — after this returns, and by enough to take
+        // over the screen it was restored to.
+        self.watch_placement(handle, "Restored", placement);
 
         // Consumed: the next Send captures a fresh restore point rather than
         // reusing a position that may no longer mean anything.
@@ -1954,6 +2193,158 @@ mod tests {
 
     /// Pressing Send again while a watch is running supersedes it: pressing
     /// the player back to full screen mid-Send would fight the Send.
+    /// The mixed-scaling desktop this app is actually used on: the primary at
+    /// 150%, the big second display at 100%. Every Send and every Retrieve
+    /// crosses that boundary.
+    fn mixed_scaling(core: &Core) {
+        let mock = core.platform.as_mock().expect("the tests run on the mock");
+        mock.set_monitor_dpi(r"\\.\DISPLAY1", 144);
+        // The window starts on the primary, which is where a Retrieve has to
+        // put it back.
+        mock.set_bounds(VIDEO_WINDOW, Bounds::new(120, 80, 1280, 800));
+    }
+
+    /// Drive the watch the way the interface does: one look per tick, for the
+    /// length of the watch window.
+    fn settle(core: &mut Core) -> Option<String> {
+        for _ in 0..(SETTLE_WATCH_LOOKS) {
+            core.settle_look();
+        }
+        core.finish_settle()
+    }
+
+    /// 1200ms of watching at one look every 50ms, matching `app.rs`.
+    const SETTLE_WATCH_LOOKS: usize = 24;
+
+    #[test]
+    fn a_window_that_shrinks_itself_on_arrival_is_pushed_back_out_to_fill_the_display() {
+        let mut core = core_with_confirmed_video_window();
+        mixed_scaling(&core);
+
+        assert!(core.send().is_ok());
+        // Measured the moment the move returns, the window looks right. It is
+        // the next look that catches the application scaling itself down to
+        // two thirds, because it was moved onto a display at 100% from one at
+        // 150% and told so afterwards.
+        assert_eq!(
+            core.platform.window_bounds(VIDEO_WINDOW),
+            Ok(Bounds::new(2560, 0, 1280, 720)),
+            "the mock models the rescale as landing after the placement"
+        );
+
+        assert_eq!(settle(&mut core), None, "the watch has nothing to complain about");
+        assert_eq!(
+            core.platform.window_bounds(VIDEO_WINDOW),
+            Ok(Bounds::new(2560, 0, 1920, 1080)),
+            "and the window fills the target display"
+        );
+    }
+
+    #[test]
+    fn a_window_that_inflates_itself_on_the_way_back_is_put_back_to_the_saved_size() {
+        let mut core = core_with_confirmed_video_window();
+        mixed_scaling(&core);
+        let before = core.platform.window_bounds(VIDEO_WINDOW).unwrap();
+
+        assert!(core.send().is_ok());
+        assert_eq!(settle(&mut core), None);
+
+        assert!(core.retrieve().is_ok());
+        // The failure this whole watch exists for: restored to 1280x800 and a
+        // beat later holding 1920x1200, because coming back onto the 150%
+        // display scales it by half again and takes over the screen.
+        assert_eq!(
+            core.platform.window_bounds(VIDEO_WINDOW),
+            Ok(Bounds::new(120, 80, 1920, 1200))
+        );
+
+        assert_eq!(settle(&mut core), None, "the watch has nothing to complain about");
+        assert_eq!(
+            core.platform.window_bounds(VIDEO_WINDOW),
+            Ok(before),
+            "the window is back at the size it was sent from"
+        );
+    }
+
+    #[test]
+    fn a_correction_is_not_spent_on_a_window_that_is_still_moving() {
+        let mut core = core_with_confirmed_video_window();
+        mixed_scaling(&core);
+        assert!(core.send().is_ok());
+
+        let placements = |core: &Core| {
+            core.platform
+                .as_mock()
+                .unwrap()
+                .calls()
+                .into_iter()
+                .filter(|call| *call == Call::Placed(VIDEO_WINDOW))
+                .count()
+        };
+        let after_send = placements(&core);
+
+        // One look at a wrong rectangle is not evidence that the window has
+        // come to rest at it.
+        core.settle_look();
+        assert_eq!(placements(&core), after_send, "nothing corrected on the first look");
+
+        // Seeing the same wrong rectangle twice is.
+        core.settle_look();
+        assert_eq!(placements(&core), after_send + 1, "corrected once it held still");
+    }
+
+    #[test]
+    fn a_window_that_will_not_hold_the_size_is_reported_rather_than_fought() {
+        let mut core = core_with_confirmed_video_window();
+        core.platform
+            .as_mock()
+            .unwrap()
+            .set_rescales_itself(VIDEO_WINDOW, 1.5);
+
+        assert!(core.send().is_ok());
+        let complaint = settle(&mut core).expect("the watch says the window would not take it");
+        assert!(complaint.starts_with("Sent, but the window is holding"), "got: {complaint}");
+        assert!(complaint.contains("2880x1620 rather than 1920x1080"), "got: {complaint}");
+
+        let placements = core
+            .platform
+            .as_mock()
+            .unwrap()
+            .calls()
+            .into_iter()
+            .filter(|call| *call == Call::Placed(VIDEO_WINDOW))
+            .count();
+        assert_eq!(
+            placements,
+            1 + SETTLE_CORRECTIONS as usize,
+            "the placement itself and a capped number of corrections, and then it stops"
+        );
+    }
+
+    #[test]
+    fn starting_a_retrieve_drops_the_watch_on_the_send_it_undoes() {
+        let mut core = core_with_confirmed_video_window();
+        mixed_scaling(&core);
+        assert!(core.send().is_ok());
+        assert!(core.placement_settling());
+
+        // Between `begin` and `finish` the interface is fading the window out.
+        // A watch still running on the Send would re-assert the sent bounds
+        // mid-fade and put the window back on the display it is leaving.
+        core.begin_retrieve().expect("the send left a restore point");
+        assert!(!core.placement_settling());
+    }
+
+    #[test]
+    fn a_window_that_closes_while_it_is_being_watched_is_not_complained_about() {
+        let mut core = core_with_confirmed_video_window();
+        mixed_scaling(&core);
+        assert!(core.send().is_ok());
+
+        core.platform.as_mock().unwrap().set_zoom_present(false);
+        assert_eq!(settle(&mut core), None, "a window that has gone is not a drift");
+    }
+
     #[test]
     fn the_diagnostics_name_the_scaling_of_each_display() {
         let core = core_with_confirmed_video_window();
@@ -1965,6 +2356,25 @@ mod tests {
         let report = core.diagnostics();
         assert!(report.contains("144 dpi (150%)"), "the scaling of each display:\n{report}");
         assert!(report.contains("scaled differently"), "and that they differ:\n{report}");
+    }
+
+    #[test]
+    fn the_diagnostics_report_what_became_of_the_last_placement() {
+        let mut core = core_with_confirmed_video_window();
+        mixed_scaling(&core);
+        assert!(core.send().is_ok());
+        let _ = settle(&mut core);
+
+        let report = core.diagnostics();
+        assert!(report.contains("LAST PLACEMENT"), "{report}");
+        assert!(
+            report.contains("Sent: asked 2560,0 1920x1080"),
+            "what was asked for:\n{report}"
+        );
+        assert!(
+            report.contains("landed 2560,0 1920x1080 after 1 correction(s), settled"),
+            "and what became of it:\n{report}"
+        );
     }
 
     #[test]

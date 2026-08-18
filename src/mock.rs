@@ -95,6 +95,19 @@ pub struct MockPlatform {
     /// modelling it everywhere would make every other test read as if DPI
     /// were part of what it was about.
     monitor_dpi: RefCell<HashMap<String, u32>>,
+    /// Windows that are about to rescale themselves, and by what ratio.
+    ///
+    /// This is the whole reason DPI is modelled here. A window moved between
+    /// displays of different scaling is not resized by the move: the
+    /// application is told its scaling changed and resizes itself *afterwards*,
+    /// on its own thread. Anything that measures the window in between sees
+    /// the size it asked for and concludes all is well. Applied on the next
+    /// look at the window's bounds, which is exactly that "afterwards".
+    pending_rescale: RefCell<HashMap<u64, f32>>,
+    /// Windows that resize themselves by a fixed ratio after *every*
+    /// placement, whatever the scaling. The application that will not be told,
+    /// for testing that the watch gives up rather than fighting it.
+    rescales: RefCell<HashMap<u64, f32>>,
 }
 
 impl Default for MockPlatform {
@@ -121,6 +134,8 @@ impl MockPlatform {
             windowed_from: RefCell::new(HashMap::new()),
             never_resumes: RefCell::new(Vec::new()),
             monitor_dpi: RefCell::new(HashMap::new()),
+            pending_rescale: RefCell::new(HashMap::new()),
+            rescales: RefCell::new(HashMap::new()),
         }
     }
 
@@ -129,6 +144,22 @@ impl MockPlatform {
     #[cfg(test)]
     pub fn set_monitor_dpi(&self, id: &str, dpi: u32) {
         self.monitor_dpi.borrow_mut().insert(id.to_string(), dpi);
+    }
+
+    /// Make a window resize itself by `ratio` after every placement, however
+    /// often it is put back.
+    #[cfg(test)]
+    pub fn set_rescales_itself(&self, handle: u64, ratio: f32) {
+        self.rescales.borrow_mut().insert(handle, ratio);
+    }
+
+    /// Put a window somewhere without going through `place_window`, for tests
+    /// that need a starting layout rather than a placement to observe.
+    #[cfg(test)]
+    pub fn set_bounds(&self, handle: u64, bounds: Bounds) {
+        if let Some(window) = self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle) {
+            window.bounds = bounds;
+        }
     }
 
     /// The display a rectangle sits on, by its centre. Falls back to the
@@ -149,6 +180,22 @@ impl MockPlatform {
             .or_else(|| monitors.iter().find(|m| m.is_primary))
             .cloned()
             .unwrap_or_else(|| monitors[0].clone())
+    }
+
+    /// Apply a rescale the window was told about on its last move. One look
+    /// later than the move, which is the point of it.
+    fn apply_pending_rescale(&self, handle: u64) {
+        let Some(ratio) = self.pending_rescale.borrow_mut().remove(&handle) else {
+            return;
+        };
+        if let Some(window) = self.windows.borrow_mut().iter_mut().find(|w| w.handle == handle) {
+            window.bounds = Bounds::new(
+                window.bounds.x,
+                window.bounds.y,
+                (window.bounds.width as f32 * ratio).round() as i32,
+                (window.bounds.height as f32 * ratio).round() as i32,
+            );
+        }
     }
 
     /// Whether the window is being held above everything else.
@@ -722,6 +769,10 @@ impl Platform for MockPlatform {
         if !self.zoom_present() {
             return Err(PlatformError::WindowGone);
         }
+        // Before the read, not after: the point of the model is that the
+        // first look at a window that has crossed a DPI boundary already
+        // shows the size the application chose, not the size it was given.
+        self.apply_pending_rescale(handle);
         self.windows
             .borrow()
             .iter()
@@ -913,14 +964,38 @@ impl Platform for MockPlatform {
         if !self.zoom_present() {
             return Err(PlatformError::WindowGone);
         }
+        // Worked out before the move, since it is a comparison between where
+        // the window is and where it is going.
+        let crossing = self
+            .windows
+            .borrow()
+            .iter()
+            .find(|w| w.handle == handle)
+            .map(|w| (self.monitor_of(w.bounds).dpi, self.monitor_of(placement.bounds).dpi));
+
         let mut windows = self.windows.borrow_mut();
         let window = windows
             .iter_mut()
             .find(|w| w.handle == handle)
             .ok_or(PlatformError::WindowGone)?;
         window.bounds = placement.bounds;
+        window.monitor_id = self.monitor_of(placement.bounds).id;
 
         window.topmost = placement.topmost;
+
+        // A placement supersedes whatever the last one told the window to do,
+        // and only a placement that changes the scaling schedules anything.
+        self.pending_rescale.borrow_mut().remove(&handle);
+        if let Some((from, to)) = crossing {
+            if from != to && from > 0 {
+                self.pending_rescale
+                    .borrow_mut()
+                    .insert(handle, to as f32 / from as f32);
+            }
+        }
+        if let Some(ratio) = self.rescales.borrow().get(&handle).copied() {
+            self.pending_rescale.borrow_mut().insert(handle, ratio);
+        }
         // Deliberately no restack. Whether placing a window actually brings it
         // in front of full-screen media is the thing that keeps turning out
         // not to be true, so the mock does not assume it either; the logic
