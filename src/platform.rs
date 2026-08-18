@@ -30,9 +30,25 @@ pub struct MonitorInfo {
     pub bounds: Bounds,
     pub work_area: Bounds,
     pub is_primary: bool,
+    /// Dots per inch, where 96 is 100% scaling.
+    ///
+    /// Recorded because a move between displays of different DPI is not an
+    /// ordinary move: the application is told its scaling changed and resizes
+    /// itself afterwards, which is invisible in the geometry alone and is what
+    /// makes a restored window come back the wrong size.
+    pub dpi: u32,
 }
 
+/// 96 dots per inch, which Windows calls 100% scaling. The baseline every
+/// other DPI is a ratio of.
+pub const BASE_DPI: u32 = 96;
+
 impl MonitorInfo {
+    /// Windows' scaling percentage for this display, as shown in Settings.
+    pub fn scaling_percent(&self) -> u32 {
+        self.dpi * 100 / BASE_DPI
+    }
+
     /// Human-readable label for the settings list, e.g.
     /// `2560x1440 at (2560, 0) — secondary`.
     pub fn label(&self) -> String {
@@ -208,6 +224,16 @@ pub trait Platform {
 
     fn window_bounds(&self, handle: u64) -> Result<Bounds, PlatformError>;
 
+    /// The scaling the window is currently being drawn at, in dots per inch.
+    ///
+    /// Only ever reported, never acted on: it is what turns "the window came
+    /// back the wrong size" into "the window came back scaled by 150%" in the
+    /// diagnostics, which is the difference between a guess and a reading.
+    /// `None` where the platform cannot say.
+    fn window_dpi(&self, _handle: u64) -> Option<u32> {
+        None
+    }
+
     /// Bring a minimised window back so its real bounds can be read. Called
     /// before capturing a restore point, since a minimised window reports
     /// off-screen coordinates that would make Retrieve useless.
@@ -375,5 +401,17 @@ mod tests {
         let wanted = Bounds::new(10, 20, 800, 600);
         let corrected = corrected_request(wanted, Bounds::new(10, 20, 0, 0), display());
         assert_eq!((corrected.width, corrected.height), (800, 600));
+    }
+
+    #[test]
+    fn scaling_is_reported_as_a_percentage() {
+        let monitor = MonitorInfo {
+            id: "test".into(),
+            bounds: display(),
+            work_area: display(),
+            is_primary: true,
+            dpi: 144,
+        };
+        assert_eq!(monitor.scaling_percent(), 150);
     }
 }

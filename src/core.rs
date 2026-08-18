@@ -612,10 +612,33 @@ impl Core {
         let _ = writeln!(out, "MONITORS");
         for monitor in &monitors {
             let chosen = if Some(monitor.bounds) == target { " <- TARGET" } else { "" };
-            let _ = writeln!(out, "  {} {}{}", monitor.id, monitor.label(), chosen);
+            let _ = writeln!(
+                out,
+                "  {} {} — {} dpi ({}%){}",
+                monitor.id,
+                monitor.label(),
+                monitor.dpi,
+                monitor.scaling_percent(),
+                chosen
+            );
         }
         if target.is_none() {
             let _ = writeln!(out, "  (no target monitor resolved)");
+        }
+        // Said outright rather than left to be spotted by comparing two
+        // numbers in a list. A window moved between displays of different
+        // scaling is resized by the application afterwards, by that ratio, and
+        // that is the difference between a restore that holds and one that
+        // comes back filling the screen.
+        if monitors.windows(2).any(|pair| pair[0].dpi != pair[1].dpi) {
+            let _ = writeln!(
+                out,
+                "  NOTE: the displays are scaled differently, so every Send and Retrieve"
+            );
+            let _ = writeln!(
+                out,
+                "        crosses a scaling boundary and the window is resized by the ratio"
+            );
         }
         let _ = writeln!(out);
 
@@ -636,12 +659,16 @@ impl Core {
         let _ = match &located {
             Ok(window) => writeln!(
                 out,
-                "  located now: handle 0x{:X} at {},{} {}x{}{}",
+                "  located now: handle 0x{:X} at {},{} {}x{} at {} dpi{}",
                 window.handle,
                 window.bounds.x,
                 window.bounds.y,
                 window.bounds.width,
                 window.bounds.height,
+                self.platform
+                    .window_dpi(window.handle)
+                    .map(|dpi| dpi.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 match target {
                     Some(bounds) if window.bounds == bounds => "  (filling the target)",
                     Some(_) => "  (NOT on the target)",
@@ -1235,6 +1262,7 @@ mod tests {
     use super::test_support::{core_with_confirmed_video_window, MEDIA_WINDOW, VIDEO_WINDOW};
     use super::*;
     use crate::mock::{Call, MockPlatform};
+    use crate::platform::BASE_DPI;
 
     /// The two Zoom windows in the mock are identical in every respect the
     /// config records, so tests address them by handle. `VIDEO_WINDOW` and
@@ -1927,6 +1955,19 @@ mod tests {
     /// Pressing Send again while a watch is running supersedes it: pressing
     /// the player back to full screen mid-Send would fight the Send.
     #[test]
+    fn the_diagnostics_name_the_scaling_of_each_display() {
+        let core = core_with_confirmed_video_window();
+        core.platform
+            .as_mock()
+            .unwrap()
+            .set_monitor_dpi(r"\\.\DISPLAY1", 144);
+
+        let report = core.diagnostics();
+        assert!(report.contains("144 dpi (150%)"), "the scaling of each display:\n{report}");
+        assert!(report.contains("scaled differently"), "and that they differ:\n{report}");
+    }
+
+    #[test]
     fn a_new_send_stops_the_watch() {
         let mut core = core_with_confirmed_video_window();
         let mock = core.platform.as_mock().unwrap();
@@ -2285,6 +2326,7 @@ mod tests {
             bounds: Bounds::new(9000, 0, 800, 600),
             work_area: Bounds::new(9000, 0, 800, 600),
             is_primary: false,
+            dpi: BASE_DPI,
         });
 
         let failure = core.send().unwrap_err();
@@ -2380,6 +2422,7 @@ mod tests {
             bounds: Bounds::new(9000, 0, 800, 600),
             work_area: Bounds::new(9000, 0, 800, 600),
             is_primary: false,
+            dpi: BASE_DPI,
         });
 
         let mut core = Core::new(Box::new(platform), config);

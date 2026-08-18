@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::hotkey::{Action, Hotkey, Hotkeys, KeyChord};
 use crate::platform::{
-    Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate,
+    Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate, BASE_DPI,
 };
 use crate::shell::{HotkeyReport, Shell, ShellEvent, TrayState, Waker};
 use crate::update::{Release, UpdateEvent, Updater};
@@ -90,6 +90,11 @@ pub struct MockPlatform {
     /// Windows that stay cloaked however often they are activated, the way a
     /// suspended application that never resumes in time does.
     never_resumes: RefCell<Vec<u64>>,
+    /// Scaling per display, in dots per inch. Both are 96 — plain 100% — until
+    /// a test says otherwise, because mixed scaling is the special case and
+    /// modelling it everywhere would make every other test read as if DPI
+    /// were part of what it was about.
+    monitor_dpi: RefCell<HashMap<String, u32>>,
 }
 
 impl Default for MockPlatform {
@@ -115,7 +120,35 @@ impl MockPlatform {
             returns_windowed: RefCell::new(HashMap::new()),
             windowed_from: RefCell::new(HashMap::new()),
             never_resumes: RefCell::new(Vec::new()),
+            monitor_dpi: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Give a display a scaling other than 100%, so a move onto or off it
+    /// crosses a DPI boundary the way a real mixed-scaling desktop does.
+    #[cfg(test)]
+    pub fn set_monitor_dpi(&self, id: &str, dpi: u32) {
+        self.monitor_dpi.borrow_mut().insert(id.to_string(), dpi);
+    }
+
+    /// The display a rectangle sits on, by its centre. Falls back to the
+    /// primary, the way `MONITOR_DEFAULTTONEAREST` does for a rectangle that
+    /// is off every screen.
+    fn monitor_of(&self, bounds: Bounds) -> MonitorInfo {
+        let centre_x = bounds.x + bounds.width / 2;
+        let centre_y = bounds.y + bounds.height / 2;
+        let monitors = self.monitors();
+        monitors
+            .iter()
+            .find(|m| {
+                centre_x >= m.bounds.x
+                    && centre_x < m.bounds.x + m.bounds.width
+                    && centre_y >= m.bounds.y
+                    && centre_y < m.bounds.y + m.bounds.height
+            })
+            .or_else(|| monitors.iter().find(|m| m.is_primary))
+            .cloned()
+            .unwrap_or_else(|| monitors[0].clone())
     }
 
     /// Whether the window is being held above everything else.
@@ -620,18 +653,21 @@ fn default_windows() -> Vec<WindowCandidate> {
 
 impl Platform for MockPlatform {
     fn monitors(&self) -> Vec<MonitorInfo> {
+        let dpi = |id: &str| self.monitor_dpi.borrow().get(id).copied().unwrap_or(BASE_DPI);
         vec![
             MonitorInfo {
                 id: r"\\.\DISPLAY1".into(),
                 bounds: Bounds::new(0, 0, 2560, 1440),
                 work_area: Bounds::new(0, 0, 2560, 1400),
                 is_primary: true,
+                dpi: dpi(r"\\.\DISPLAY1"),
             },
             MonitorInfo {
                 id: r"\\.\DISPLAY2".into(),
                 bounds: Bounds::new(2560, 0, 1920, 1080),
                 work_area: Bounds::new(2560, 0, 1920, 1040),
                 is_primary: false,
+                dpi: dpi(r"\\.\DISPLAY2"),
             },
         ]
     }
@@ -692,6 +728,12 @@ impl Platform for MockPlatform {
             .find(|w| w.handle == handle)
             .map(|w| w.bounds)
             .ok_or(PlatformError::WindowGone)
+    }
+
+    /// The scaling of whichever display the window is sitting on.
+    fn window_dpi(&self, handle: u64) -> Option<u32> {
+        let bounds = self.window_bounds(handle).ok()?;
+        Some(self.monitor_of(bounds).dpi)
     }
 
     /// Minimise the way Windows does, including the off-screen bounds it

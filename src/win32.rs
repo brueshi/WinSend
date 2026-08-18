@@ -29,9 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::HiDpi::{
-    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+    GetAwarenessFromDpiAwarenessContext, GetDpiForMonitor, GetDpiForWindow,
+    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+    DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
@@ -47,7 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::hotkey::KeyChord;
 use crate::platform::{
     corrected_request, Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail,
-    WindowCandidate,
+    WindowCandidate, BASE_DPI,
 };
 
 /// Renders the window's full content even when it is occluded or composited by
@@ -327,6 +328,7 @@ unsafe extern "system" fn collect_monitor(
             bounds: rect_to_bounds(info.monitorInfo.rcMonitor),
             work_area: rect_to_bounds(info.monitorInfo.rcWork),
             is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            dpi: effective_dpi(monitor),
         });
     }
     BOOL(1)
@@ -437,6 +439,19 @@ fn downsample_bgra(source: &[u8], width: u32, height: u32) -> Thumbnail {
     }
 
     Thumbnail { width: target_width, height: target_height, rgba }
+}
+
+/// The scaling a display is being drawn at. `MDT_EFFECTIVE_DPI` is the one
+/// that matches what the user chose in Settings, rather than the panel's
+/// physical density.
+unsafe fn effective_dpi(monitor: HMONITOR) -> u32 {
+    let mut x = 0u32;
+    let mut y = 0u32;
+    if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y).is_ok() && x > 0 {
+        x
+    } else {
+        BASE_DPI
+    }
 }
 
 /// The display a rectangle is aimed at, which is how far a correction is
@@ -797,6 +812,15 @@ impl Platform for Win32Platform {
         Ok(rect_to_bounds(rect))
     }
 
+    /// What Windows is currently scaling this window by. Reported in the
+    /// diagnostics, where it is the difference between "the window came back
+    /// the wrong size" and "the window came back scaled by 150%".
+    fn window_dpi(&self, handle: u64) -> Option<u32> {
+        let hwnd = handle_to_hwnd(handle);
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        (dpi > 0).then_some(dpi)
+    }
+
     fn place_window(&self, handle: u64, placement: Placement) -> Result<(), PlatformError> {
         let hwnd = handle_to_hwnd(handle);
 
@@ -874,6 +898,14 @@ impl Platform for Win32Platform {
             // to the move. Correcting by the observed error puts it right
             // whichever it was, and one attempt avoids fighting an application
             // that is determined to have its own way.
+            //
+            // What this cannot see is the resize that has not happened yet. A
+            // window moved onto a display of a different scaling is told so
+            // afterwards, on its own thread, and resizes itself then — long
+            // after this measurement has read the size it asked for and found
+            // nothing wrong. That case belongs to the settle watch in `Core`,
+            // which keeps looking for a second; this stays for the errors that
+            // are already visible by the time the call returns.
             let mut actual = RECT::default();
             if GetWindowRect(hwnd, &mut actual).is_ok() {
                 let actual = rect_to_bounds(actual);
