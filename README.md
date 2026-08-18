@@ -28,6 +28,15 @@ path cannot see — is built and tested against the mock, and unverified against
 a real player. `docs/media-restore.md` records the design and what a real
 desktop still has to answer.
 
+Retrieving a window onto a display scaled differently from the one it was sent
+to brought it back resized by the ratio between them, reported from a live
+production on v0.1.20. A window is now watched for a beat after being placed and
+the placement re-asserted if it did not hold, since the application is told its
+scaling changed only after the move has returned and resizes itself then.
+Built and tested against the mock; `docs/placement-and-scaling.md` records the
+mechanism, the bound now on the correction, and what a real desktop still has to
+answer.
+
 **Fade out when retrieving**, **Return full-screen video after Retrieve** and
 **Check for updates on startup** in Settings turn off the three pieces that
 touch anything outside this application.
@@ -233,6 +242,11 @@ That distinction matters. Six attempts at getting in front of full-screen media
 were each built on a guess about what was on screen, and a standalone probe that
 applied its own filters could not have settled it. The report is what showed the
 window in question was not being enumerated at all.
+
+It also reports each display's scaling and what became of the last placement —
+what was asked for, what it landed at, how many corrections it took and whether
+it ever settled. A window that comes back the wrong size leaves no other trace
+of what it was asked to be.
 
 It goes to the clipboard and to `%APPDATA%\WinSend\diagnostics.txt`.
 
