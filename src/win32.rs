@@ -45,7 +45,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::hotkey::KeyChord;
 use crate::platform::{
-    Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail, WindowCandidate,
+    corrected_request, Bounds, MonitorInfo, Placement, Platform, PlatformError, Thumbnail,
+    WindowCandidate,
 };
 
 /// Renders the window's full content even when it is occluded or composited by
@@ -435,29 +436,6 @@ fn downsample_bgra(source: &[u8], width: u32, height: u32) -> Thumbnail {
     }
 
     Thumbnail { width: target_width, height: target_height, rgba }
-}
-
-/// What to ask for, given what was asked for and what arrived.
-///
-/// Position is corrected by the difference and size by the ratio, because the
-/// two go wrong in different ways: an offset is added to a position, while a
-/// scale multiplies a size. Asking for the square of the request over the
-/// result cancels a scale factor exactly in one step, where adding the
-/// difference would only close part of the gap.
-fn corrected_request(wanted: Bounds, actual: Bounds) -> Bounds {
-    let scale = |wanted: i32, actual: i32| {
-        if actual <= 0 || wanted <= 0 {
-            wanted
-        } else {
-            ((wanted as i64 * wanted as i64) / actual as i64) as i32
-        }
-    };
-    Bounds::new(
-        wanted.x + (wanted.x - actual.x),
-        wanted.y + (wanted.y - actual.y),
-        scale(wanted.width, actual.width),
-        scale(wanted.height, actual.height),
-    )
 }
 
 fn handle_to_hwnd(handle: u64) -> HWND {

@@ -126,6 +126,34 @@ pub struct Placement {
     pub topmost: bool,
 }
 
+/// What to ask for next, given what was asked for and what arrived.
+///
+/// Position is corrected by the difference and size by the ratio, because the
+/// two go wrong in different ways: an offset is added to a position, while a
+/// scale multiplies a size. Asking for the square of the request over the
+/// result cancels a scale factor exactly in one step, where adding the
+/// difference would only close part of the gap.
+///
+/// Lives on this side of the seam rather than with the Win32 code that calls
+/// it because it is arithmetic, not an operating system call, and arithmetic
+/// that decides where a window ends up should be testable on any machine.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn corrected_request(wanted: Bounds, actual: Bounds) -> Bounds {
+    let scale = |wanted: i32, actual: i32| {
+        if actual <= 0 || wanted <= 0 {
+            wanted
+        } else {
+            ((wanted as i64 * wanted as i64) / actual as i64) as i32
+        }
+    };
+    Bounds::new(
+        wanted.x + (wanted.x - actual.x),
+        wanted.y + (wanted.y - actual.y),
+        scale(wanted.width, actual.width),
+        scale(wanted.height, actual.height),
+    )
+}
+
 /// RGBA8 preview of a window, sized by the platform layer.
 #[derive(Debug, Clone)]
 pub struct Thumbnail {
@@ -263,5 +291,42 @@ pub trait Platform {
     #[cfg(not(windows))]
     fn as_mock(&self) -> Option<&crate::mock::MockPlatform> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scale_factor_is_cancelled_in_one_step() {
+        // Asked for 1000 wide, arrived 1500: the window is being scaled by
+        // 1.5, so asking for 667 lands on 1000.
+        let corrected = corrected_request(
+            Bounds::new(100, 100, 1000, 600),
+            Bounds::new(100, 100, 1500, 900),
+        );
+        assert_eq!((corrected.width, corrected.height), (666, 400));
+        // Which is what lands on the size actually wanted once the window
+        // scales it by the same 1.5 again.
+        assert_eq!(corrected.height * 3 / 2, 600);
+    }
+
+    #[test]
+    fn an_offset_is_corrected_by_the_difference() {
+        let corrected = corrected_request(
+            Bounds::new(300, 200, 400, 300),
+            Bounds::new(280, 190, 400, 300),
+        );
+        assert_eq!((corrected.x, corrected.y), (320, 210));
+    }
+
+    #[test]
+    fn a_window_that_arrived_with_no_size_is_asked_for_the_same_size_again() {
+        // A minimised or closing window reports nonsense rather than a scale
+        // factor, and dividing by it would produce nonsense of our own.
+        let wanted = Bounds::new(10, 20, 800, 600);
+        let corrected = corrected_request(wanted, Bounds::new(10, 20, 0, 0));
+        assert_eq!((corrected.width, corrected.height), (800, 600));
     }
 }
