@@ -400,9 +400,11 @@ fn row(
     label: String,
     detail: Option<String>,
     right: gpui::AnyElement,
+    muted: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .group(id)
         .flex()
         .items_center()
         .gap_3()
@@ -413,7 +415,8 @@ fn row(
         .bg(rgb(ROW))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
-        .child(icon(glyph, 18.0, SUBDUED))
+        .active(|style| style.opacity(0.7))
+        .child(icon(glyph, 18.0, if muted { FAINT } else { SUBDUED }))
         .child(
             div()
                 .flex()
@@ -423,20 +426,44 @@ fn row(
                     div()
                         .text_size(px(13.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(if muted { SUBDUED } else { TEXT }))
                         .child(label),
                 )
                 .when_some(detail, |this, detail| {
                     this.child(div().text_size(px(10.5)).text_color(rgb(FAINT)).child(detail))
                 }),
         )
-        .child(right)
+        .child(
+            div()
+                .relative()
+                .flex()
+                .items_center()
+                .child(div().group_hover(id, |style| style.opacity(0.)).child(right))
+                // Sits on top of the chip and is invisible until the row is
+                // hovered, so the two never reflow past each other.
+                .child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .opacity(0.)
+                        .group_hover(id, |style| style.opacity(1.))
+                        .px_2()
+                        .py(px(3.))
+                        .rounded_full()
+                        .bg(tint(ACCENT, 0.16))
+                        .text_size(px(9.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(ACCENT))
+                        .child("CHANGE"),
+                ),
+        )
 }
 
 /// The one saturated control, and the only filled thing on the surface.
 fn cta(
     id: &'static str,
     label: &'static str,
+    hotkey: Option<String>,
     filled: bool,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
@@ -447,6 +474,7 @@ fn cta(
     };
     div()
         .id(id)
+        .relative()
         .flex()
         .justify_center()
         .items_center()
@@ -461,8 +489,31 @@ fn cta(
         .when(enabled, |this| {
             this.cursor_pointer()
                 .hover(|style| style.bg(rgb(if filled { ACCENT_HOVER } else { ROW_HOVER })))
+                // Presses register. Without it the only feedback that a click
+                // landed is whatever the action itself does, which for Send is
+                // a window moving on another display.
+                .active(|style| style.opacity(0.82))
         })
         .child(label)
+        // Absolute so the label stays centred in the button rather than being
+        // pushed off-centre by the length of a binding.
+        .when_some(hotkey, |this, binding| {
+            this.child(
+                div()
+                    .absolute()
+                    .right_4()
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if filled {
+                        tint(0xffffff, 0.65)
+                    } else if enabled {
+                        Hsla::from(rgb(FAINT))
+                    } else {
+                        tint(FAINT, 0.6)
+                    })
+                    .child(binding),
+            )
+        })
 }
 
 /// One of Loom's circular footer buttons.
@@ -473,11 +524,13 @@ fn footer_button(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .group(id)
         .flex()
         .flex_col()
         .items_center()
         .gap_1()
         .cursor_pointer()
+        .active(|style| style.opacity(0.7))
         .child(
             div()
                 .flex()
@@ -487,9 +540,16 @@ fn footer_button(
                 .h(px(38.))
                 .rounded_full()
                 .bg(rgb(ROW))
+                .group_hover(id, |style| style.bg(rgb(ROW_HOVER)))
                 .child(icon(glyph, 17.0, SUBDUED)),
         )
-        .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(label))
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(FAINT))
+                .group_hover(id, |style| style.text_color(rgb(SUBDUED)))
+                .child(label),
+        )
 }
 
 fn section(label: &'static str) -> impl IntoElement {
@@ -603,6 +663,9 @@ impl WinSendGpui {
         let zoom_set = self.core.config.zoom_window.is_some();
         let media_set = self.core.config.media_window.is_some();
         let picking = self.picking_display;
+        let send_key = self.core.config.hotkeys.binding(Action::Send).map(|h| h.to_string());
+        let retrieve_key =
+            self.core.config.hotkeys.binding(Action::Retrieve).map(|h| h.to_string());
 
         let zoom_label = self
             .core
@@ -645,6 +708,7 @@ impl WinSendGpui {
                             } else {
                                 chip(Chip::Needed).into_any_element()
                             },
+                            false,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.picking_display = !this.picking_display;
@@ -681,6 +745,7 @@ impl WinSendGpui {
                             } else {
                                 chip(Chip::Needed).into_any_element()
                             },
+                            false,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_picker(PickerFor::Zoom);
@@ -702,6 +767,7 @@ impl WinSendGpui {
                             } else {
                                 chip(Chip::Optional).into_any_element()
                             },
+                            !media_set,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_picker(PickerFor::Media);
@@ -716,7 +782,14 @@ impl WinSendGpui {
                     .gap_2()
                     .px_4()
                     .child(
-                        cta("send", "Send to Monitor", !sent && can_send, can_send).on_click(
+                        cta(
+                            "send",
+                            "Send to Monitor",
+                            send_key,
+                            !sent && can_send,
+                            can_send,
+                        )
+                        .on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.perform(Action::Send);
                                 cx.notify();
@@ -724,7 +797,7 @@ impl WinSendGpui {
                         ),
                     )
                     .child(
-                        cta("retrieve", "Retrieve", sent, can_retrieve).on_click(cx.listener(
+                        cta("retrieve", "Retrieve", retrieve_key, sent, can_retrieve).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.perform(Action::Retrieve);
                                 cx.notify();
@@ -743,7 +816,7 @@ impl WinSendGpui {
         let sent = self.state() == State::Sent;
         let (tone, label) = if sent { (ACCENT, "ON TARGET") } else { (FAINT, "IDLE") };
 
-        header_shell(cx)
+        header_shell()
             .child(
             div()
                 .flex()
@@ -767,7 +840,7 @@ impl WinSendGpui {
 
     /// A sub-surface's header: a way back, and what this is.
     fn sub_header(&self, title: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
-        header_shell(cx)
+        header_shell()
             .child(
             div()
                 .flex()
@@ -784,6 +857,7 @@ impl WinSendGpui {
                         .rounded_full()
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(ROW_HOVER)))
+                        .active(|style| style.opacity(0.6))
                         .child(icon("back", 15.0, SUBDUED))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -909,6 +983,7 @@ impl WinSendGpui {
                     .bg(rgb(ROW))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(ROW_HOVER)))
+                    .active(|style| style.opacity(0.7))
                     .text_size(px(12.))
                     .child("Copy diagnostics")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -978,7 +1053,7 @@ impl Setting {
 }
 
 /// The header both surfaces share: content on the left, window controls right.
-fn header_shell(cx: &mut Context<WinSendGpui>) -> gpui::Stateful<gpui::Div> {
+fn header_shell() -> gpui::Stateful<gpui::Div> {
     div()
         .id("header")
         .flex()
@@ -1041,6 +1116,7 @@ fn candidate_row(
         .bg(rgb(ROW))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .active(|style| style.opacity(0.7))
         .child(match thumbnail {
             Some(image) => img(image)
                 .w(px(96.))
@@ -1120,6 +1196,7 @@ fn setting_row(
         .bg(rgb(ROW))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .active(|style| style.opacity(0.7))
         .child(
             div()
                 .flex()
@@ -1248,6 +1325,7 @@ fn small_button(id: SharedString, label: &'static str) -> gpui::Stateful<gpui::D
         .border_color(rgb(BORDER))
         .cursor_pointer()
         .hover(|style| style.border_color(rgb(ACCENT)))
+        .active(|style| style.opacity(0.7))
         .text_size(px(11.))
         .child(label)
 }
@@ -1268,6 +1346,7 @@ fn chrome_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::
         .rounded_full()
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .active(|style| style.opacity(0.6))
         .child(icon(glyph, 15.0, SUBDUED))
         // Otherwise a press here starts dragging the window instead of
         // arming the button, and the click never lands.
@@ -1298,6 +1377,7 @@ fn picker_row(
         .border_color(rgb(if chosen { ACCENT } else { ROW }))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .active(|style| style.opacity(0.7))
         .child(div().text_size(px(12.5)).child(name))
         .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(detail))
         .on_click(cx.listener(move |this, _, _, cx| {
