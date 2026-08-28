@@ -787,39 +787,28 @@ impl WinSendGpui {
         self.fade_seq += 1;
         let seq = self.fade_seq;
 
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(FADE_STEP).await;
-                let carry_on = this
-                    .update(cx, |this, cx| {
-                        // Superseded: another press ended this fade and either
-                        // started a new one or finished the Retrieve outright.
-                        if this.fade_seq != seq {
-                            return false;
-                        }
-                        let Some(fade) = this.fading.take() else {
-                            return false;
-                        };
-                        match fade.advance(&mut this.core, std::time::Instant::now()) {
-                            None => {
-                                this.fading = Some(fade);
-                                true
-                            }
-                            Some(outcome) => {
-                                this.report(outcome, cx);
-                                this.arm_watches(cx);
-                                cx.notify();
-                                false
-                            }
-                        }
-                    })
-                    .unwrap_or(false);
-                if !carry_on {
-                    break;
+        Self::every(FADE_STEP, cx, move |this, cx| {
+            // Superseded: another press ended this fade and either started a
+            // new one or finished the Retrieve outright.
+            if this.fade_seq != seq {
+                return false;
+            }
+            let Some(fade) = this.fading.take() else {
+                return false;
+            };
+            match fade.advance(&mut this.core, std::time::Instant::now()) {
+                None => {
+                    this.fading = Some(fade);
+                    true
+                }
+                Some(outcome) => {
+                    this.report(outcome, cx);
+                    this.arm_watches(cx);
+                    cx.notify();
+                    false
                 }
             }
-        })
-        .detach();
+        });
     }
 
     /// End a fade now, wherever it had got to. Says whether there was one.
