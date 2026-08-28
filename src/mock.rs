@@ -494,7 +494,7 @@ impl Shell for MockShell {
         self.queue.borrow_mut().drain(..).collect()
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(not(windows), test))]
     fn as_mock(&self) -> Option<&MockShell> {
         Some(self)
     }
@@ -596,7 +596,7 @@ impl Updater for MockUpdater {
         self.queue.borrow_mut().drain(..).collect()
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(not(windows), test))]
     fn as_mock(&self) -> Option<&MockUpdater> {
         Some(self)
     }
@@ -1003,7 +1003,7 @@ impl Platform for MockPlatform {
         Ok(())
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(not(windows), test))]
     fn as_mock(&self) -> Option<&MockPlatform> {
         Some(self)
     }
