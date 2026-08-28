@@ -238,6 +238,7 @@ impl WinSendGpui {
         match std::env::var("WINSEND_SCREEN").as_deref() {
             Ok("select") => self.open_picker(PickerFor::Zoom),
             Ok("media") => self.open_picker(PickerFor::Media),
+            Ok("display") => self.picking_display = true,
             Ok("settings") => self.screen = Screen::Settings,
             Ok("hotkeys") => self.screen = Screen::Hotkeys,
             _ => {}
@@ -389,7 +390,7 @@ fn tint(colour: u32, alpha: f32) -> Hsla {
     Hsla::from(rgb(colour)).opacity(alpha)
 }
 
-fn icon(name: &'static str, size: f32, colour: u32) -> impl IntoElement {
+fn icon(name: &'static str, size: f32, colour: u32) -> gpui::Svg {
     svg()
         .path(format!("icons/{name}.svg"))
         .w(px(size))
@@ -417,24 +418,28 @@ fn display_detail(monitor: &MonitorInfo) -> String {
 }
 
 /// The chip on the right of a row: Loom's "Off"/"On" pill.
-fn chip(kind: Chip, group: &'static str) -> impl IntoElement {
+fn chip(kind: Chip, on_accent: bool) -> impl IntoElement {
     let (label, colour) = match kind {
         Chip::Set => ("SET", OK),
         Chip::Needed => ("NEEDED", WARN),
         Chip::Optional => ("OPTIONAL", FAINT),
         Chip::Likely => ("LIKELY", ACCENT),
     };
+    // Solid rather than tinted, the way Loom's "Off" is solid red: a chip that
+    // is a wash of its own colour reads as decoration. On an accent row it
+    // inverts to white, since the fill it was carrying is now the row.
+    let (fill, text) = if on_accent { (0xffffff, ACCENT) } else { (colour, BG) };
+
     div()
         .flex_none()
         .whitespace_nowrap()
-        .px_2p5()
-        .py(px(4.))
-        .rounded_full()
-        .bg(tint(colour, 0.14))
-        .group_hover(group, |style| style.bg(tint(colour, 0.28)))
+        .px_2()
+        .py(px(3.))
+        .rounded_md()
+        .bg(rgb(fill))
         .text_size(px(9.))
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(colour))
+        .text_color(rgb(text))
         .child(label)
 }
 
@@ -448,7 +453,18 @@ fn row(
     label: String,
     right: gpui::AnyElement,
     muted: bool,
+    open: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    // The row it is standing in becomes the selection, the way Loom's camera
+    // row fills solid while its picker is showing. It is a much louder signal
+    // than a border, and it ties the panel that opened to the thing that
+    // opened it without an arrow drawn between them.
+    let (fill, hover_fill, glyph_tone, label_tone) = match (open, muted) {
+        (true, _) => (ACCENT, ACCENT, 0xffffff, 0xffffff),
+        (false, true) => (ROW, ROW_HOVER, SUBDUED, SUBDUED),
+        (false, false) => (ROW, ROW_HOVER, TEXT, TEXT),
+    };
+
     div()
         .id(id)
         .group(id)
@@ -459,19 +475,16 @@ fn row(
         .h(px(ROW_HEIGHT))
         .pl_4()
         .pr_3()
-        // A pill, like the actions under it. One radius for everything that
-        // is a control, rather than rows in one geometry and buttons in
-        // another, which is what made the surface read as assembled from
-        // parts rather than designed.
-        .rounded_full()
-        .bg(rgb(ROW))
+        // A rounded rectangle, not a pill. Only the action underneath is a
+        // pill, which is what makes it read as the one thing to press.
+        .rounded_xl()
+        .bg(rgb(fill))
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(ROW_HOVER)))
-        .active(|style| style.opacity(0.7))
-        .child(icon(glyph, 19.0, if muted { SUBDUED } else { TEXT }))
+        .hover(|style| style.bg(rgb(hover_fill)))
+        .active(|style| style.opacity(0.8))
+        .child(icon(glyph, 19.0, glyph_tone))
         // One line. The value is the label, the way Loom's row says "No
-        // Camera" rather than saying "Camera" and putting the answer
-        // underneath it.
+        // Camera" rather than "Camera" with the answer underneath.
         .child(
             div()
                 .flex_1()
@@ -479,7 +492,7 @@ fn row(
                 .truncate()
                 .text_size(px(13.5))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(if muted { SUBDUED } else { TEXT }))
+                .text_color(rgb(label_tone))
                 .child(label),
         )
         .child(right)
@@ -521,7 +534,11 @@ fn cta(
         .child(label)
 }
 
-/// One of Loom's circular footer buttons.
+/// A footer button: an icon over a label, and nothing drawn around it.
+///
+/// Loom's Effects, Notes and More are bare glyphs. A circle around each one
+/// gave three more filled shapes to a surface that already has rows and a
+/// button, and made the least important controls the heaviest.
 fn footer_button(
     id: &'static str,
     glyph: &'static str,
@@ -533,26 +550,20 @@ fn footer_button(
         .flex()
         .flex_col()
         .items_center()
-        .gap_1()
+        .gap_1p5()
+        .px_3()
+        .py_1()
         .cursor_pointer()
-        .active(|style| style.opacity(0.7))
+        .active(|style| style.opacity(0.6))
         .child(
-            div()
-                .flex()
-                .justify_center()
-                .items_center()
-                .w(px(38.))
-                .h(px(38.))
-                .rounded_full()
-                .bg(rgb(ROW))
-                .group_hover(id, |style| style.bg(rgb(ROW_HOVER)))
-                .child(icon(glyph, 17.0, SUBDUED)),
+            icon(glyph, 19.0, SUBDUED)
+                .group_hover(id, |style| style.text_color(rgb(TEXT))),
         )
         .child(
             div()
                 .text_size(px(10.))
-                .text_color(rgb(FAINT))
-                .group_hover(id, |style| style.text_color(rgb(SUBDUED)))
+                .text_color(rgb(SUBDUED))
+                .group_hover(id, |style| style.text_color(rgb(TEXT)))
                 .child(label),
         )
 }
@@ -707,11 +718,12 @@ impl WinSendGpui {
                                 .map(display_name)
                                 .unwrap_or_else(|| "Choose a display".to_string()),
                             if target.is_some() {
-                                chip(Chip::Set, "row-display").into_any_element()
+                                chip(Chip::Set, picking).into_any_element()
                             } else {
-                                chip(Chip::Needed, "row-display").into_any_element()
+                                chip(Chip::Needed, picking).into_any_element()
                             },
                             target.is_none(),
+                            picking,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.picking_display = !this.picking_display;
@@ -739,11 +751,12 @@ impl WinSendGpui {
                             "video",
                             zoom_label,
                             if zoom_set {
-                                chip(Chip::Set, "row-zoom").into_any_element()
+                                chip(Chip::Set, false).into_any_element()
                             } else {
-                                chip(Chip::Needed, "row-zoom").into_any_element()
+                                chip(Chip::Needed, false).into_any_element()
                             },
                             !zoom_set,
+                            false,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_picker(PickerFor::Zoom);
@@ -756,11 +769,12 @@ impl WinSendGpui {
                             "media",
                             media_label,
                             if media_set {
-                                chip(Chip::Set, "row-media").into_any_element()
+                                chip(Chip::Set, false).into_any_element()
                             } else {
-                                chip(Chip::Optional, "row-media").into_any_element()
+                                chip(Chip::Optional, false).into_any_element()
                             },
                             !media_set,
+                            false,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_picker(PickerFor::Media);
@@ -1162,7 +1176,7 @@ fn candidate_row(
                 ),
         )
         .when(candidate.likely_zoom && picker == PickerFor::Zoom, |this| {
-            this.child(chip(Chip::Likely, "candidate"))
+            this.child(chip(Chip::Likely, false))
         })
         .on_click(cx.listener(move |this, _, _, cx| {
             this.confirm(picker, &candidate, cx);
