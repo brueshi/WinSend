@@ -25,8 +25,8 @@
 use std::borrow::Cow;
 
 use gpui::{
-    AssetSource, Context, FontWeight, Hsla, IntoElement, Render, SharedString, Window, div,
-    prelude::*, px, rgb, size, svg,
+    AssetSource, Context, FontWeight, Hsla, IntoElement, MouseButton, Render, SharedString, Window,
+    div, prelude::*, px, rgb, size, svg,
 };
 
 use crate::core::{Core, Failure};
@@ -68,9 +68,10 @@ const HEADER_HEIGHT: f32 = 52.0;
 /// Where the drawn header's own content starts.
 ///
 /// With the system titlebar transparent, macOS still draws its close, minimise
-/// and zoom buttons on top of whatever is there — so the title has to begin to
-/// the right of them. Windows draws nothing, and the title sits at the normal
-/// margin.
+/// and zoom buttons over whatever is there, so the header's content has to
+/// begin to the right of them. Windows draws none and starts at the normal
+/// margin. That is also why the window carries its own minimise and close: on
+/// Windows they are the only ones there are.
 #[cfg(target_os = "macos")]
 const TITLE_INSET: f32 = 78.0;
 #[cfg(not(target_os = "macos"))]
@@ -106,7 +107,10 @@ macro_rules! icons {
     };
 }
 
-icons!["display", "video", "media", "keyboard", "settings", "info", "close", "check", "alert"];
+icons![
+    "display", "video", "media", "keyboard", "settings", "info", "minimize", "close", "check",
+    "alert",
+];
 
 /// What the surface is currently able to do.
 ///
@@ -572,57 +576,69 @@ fn header(sent: bool, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
     let (tone, label) = if sent { (ACCENT, "ON TARGET") } else { (FAINT, "IDLE") };
 
     div()
+        .id("header")
         .flex()
         .items_center()
         .justify_between()
         .w_full()
         .h(px(HEADER_HEIGHT))
-        .pr_4()
+        .pr_2()
         .pl(px(TITLE_INSET))
+        // The system titlebar is transparent, which takes the window's drag
+        // handle with it. This puts it back on the header, where it was.
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap_1p5()
+                .px_2()
+                .py(px(4.))
+                .rounded_full()
+                .bg(tint(tone, 0.16))
+                .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(tone)))
                 .child(
                     div()
-                        .text_size(px(16.))
+                        .text_size(px(9.5))
                         .font_weight(FontWeight::BOLD)
-                        .child("WinSend"),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py(px(3.))
-                        .rounded_full()
-                        .bg(tint(tone, 0.16))
-                        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(tone)))
-                        .child(
-                            div()
-                                .text_size(px(9.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(tone))
-                                .child(label),
-                        ),
+                        .text_color(rgb(tone))
+                        .child(label),
                 ),
         )
         .child(
             div()
-                .id("close")
                 .flex()
-                .justify_center()
                 .items_center()
-                .w(px(26.))
-                .h(px(26.))
-                .rounded_full()
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(ROW)))
-                .child(icon("close", 15.0, SUBDUED))
-                .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+                .gap_1()
+                .child(chrome_button("minimize", "minimize").on_click(cx.listener(
+                    |_, _, window, _| window.minimize_window(),
+                )))
+                .child(chrome_button("close", "close").on_click(cx.listener(
+                    |_, _, window, _| window.remove_window(),
+                ))),
         )
+}
+
+/// A window control in the drawn header.
+///
+/// Present on every platform because on Windows they are the only close and
+/// minimise there are; macOS shows its own beside them, which is a cost paid
+/// only on the machine this is developed on.
+fn chrome_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .justify_center()
+        .items_center()
+        .w(px(28.))
+        .h(px(28.))
+        .rounded_full()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .child(icon(glyph, 15.0, SUBDUED))
+        // Otherwise a press here starts dragging the window instead of
+        // arming the button, and the click never lands.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
 /// One display in the in-place picker.

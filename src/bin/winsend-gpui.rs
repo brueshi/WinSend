@@ -34,9 +34,10 @@ fn main() {
                         appears_transparent: true,
                         // Clear of the drawn header's own content, and roughly
                         // where the eye expects them on macOS.
-                        // Vertically centred in the drawn header, which is
-                        // 52px tall and about 14px of button.
-                        traffic_light_position: Some(point(px(16.), px(19.))),
+                        // Aligned with the state chip and the window controls
+                        // the header draws for itself, rather than with the
+                        // titlebar that is no longer there.
+                        traffic_light_position: Some(point(px(16.), px(13.))),
                     }),
                     // Resizable, matching the eframe surface: the window is
                     // sized to its content and grows when a panel opens, but
