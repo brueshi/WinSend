@@ -35,6 +35,7 @@ use gpui::{
 use crate::core::{Core, Failure};
 use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::{MonitorInfo, WindowCandidate};
+use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
 
 pub const WIDTH: f32 = 340.0;
 
@@ -199,6 +200,19 @@ const TOAST_OUT: std::time::Duration = std::time::Duration::from_millis(160);
 const TOAST_LIFE: std::time::Duration = std::time::Duration::from_secs(3);
 const TOAST_LIFE_FAILED: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// How often the shell is drained.
+///
+/// eframe's waker is `ctx.request_repaint()`, which any thread may call. GPUI
+/// has no equivalent: `AsyncApp` is `!Send`, so nothing the hotkey thread holds
+/// can reach the main loop. The waker it is handed is therefore a no-op and
+/// this timer is the wake — a task that drains the queue and only calls
+/// `notify` when it found something, so an idle window stays idle.
+///
+/// Fifty milliseconds is a third of the rate eframe polls at, and well under
+/// the time it takes to notice a keypress did nothing. `Shell::poll` drains a
+/// mutex-guarded `Vec` and costs nothing when it is empty.
+const SHELL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 const HEADER_HEIGHT: f32 = 44.0;
 
 /// Where the drawn header's own content starts.
@@ -316,6 +330,12 @@ enum Side {
 
 pub struct WinSendGpui {
     core: Core,
+    /// Global hotkeys and the tray icon. Polled rather than pushed; see
+    /// [`SHELL_POLL`].
+    shell: Box<dyn Shell>,
+    /// Which bindings the shell refused, so the offending row can say so
+    /// rather than the reason living only in a toast that has since gone.
+    hotkey_report: HotkeyReport,
     /// The message currently showing, if any. One at a time and transient:
     /// a strip reserved for messages costs the live surface its height every
     /// day for something that is on screen for three seconds.
@@ -360,8 +380,16 @@ impl WinSendGpui {
             let _ = core.platform.raise(handle, true);
         }
 
+        // The waker is a no-op on purpose: nothing GPUI exposes can be called
+        // from the shell's thread to wake this one, so `poll_shell` below is
+        // what the queue is drained by. See [`SHELL_POLL`].
+        let shell = shell::create(Arc::new(|| {}));
+        shell.apply_hotkeys(core.config.hotkeys);
+
         let mut app = Self {
             core,
+            shell,
+            hotkey_report: HotkeyReport::default(),
             toast: None,
             toast_seq: 0,
             toast_leaving: false,
@@ -375,7 +403,92 @@ impl WinSendGpui {
         };
         set_palette(app.core.config.light_theme);
         app.open_requested_screen();
+        app.poll_shell(cx);
         app
+    }
+
+    /// Drain the shell for as long as this window exists.
+    ///
+    /// One task rather than one per source, and in the same order
+    /// `app.rs`'s frame runs them in: what arrived from outside is taken in
+    /// first, then the tray is told what to say about the state that left it.
+    fn poll_shell(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SHELL_POLL).await;
+                let updated = this
+                    .update_in(cx, |this, window, cx| {
+                        let events = this.shell.poll();
+                        let anything = !events.is_empty();
+                        for event in events {
+                            this.handle(event, window, cx);
+                        }
+                        // Cheap every time: the shell drops a state that has
+                        // not moved rather than talking to the OS about it.
+                        this.refresh_tray();
+                        if anything {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                // A failed update is not on its own a reason to stop: the app
+                // can be mid-borrow, or on its way down. The view having gone
+                // is, and it is the only thing that ends this loop.
+                if !updated && this.upgrade().is_none() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Something the user asked for from outside the window.
+    fn handle(&mut self, event: ShellEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            ShellEvent::Trigger(action) => self.perform(action, cx),
+            // A refusal is shown the moment it is known. A binding the user
+            // believes is live but which never registered is the one failure
+            // this feature cannot afford.
+            ShellEvent::HotkeysApplied(report) => {
+                if let Some(summary) = report.summary() {
+                    self.note(&summary, true, cx);
+                }
+                self.hotkey_report = report;
+            }
+            ShellEvent::ShowWindow => window.activate_window(),
+            ShellEvent::ShowSettings => {
+                self.screen = Screen::Settings;
+                self.close_side();
+                window.activate_window();
+            }
+            // The only path that actually exits.
+            ShellEvent::Quit => cx.quit(),
+        }
+    }
+
+    /// Keep the tray icon in step with the window.
+    fn refresh_tray(&self) {
+        self.shell.set_tray_state(tray_state(&self.core));
+    }
+
+    /// Begin capturing a combination for `action`.
+    ///
+    /// The registered bindings are dropped first. A registered hotkey is
+    /// swallowed by the OS and never reaches this window, so without this,
+    /// rebinding a key to itself — or to the other action's key — would look
+    /// like the capture had simply stopped working.
+    fn start_capture(&mut self, action: Action) {
+        self.capturing = Some(action);
+        self.shell.apply_hotkeys(Default::default());
+    }
+
+    /// Stop capturing, however it ended, and put the bindings back.
+    ///
+    /// The one way out, so a capture abandoned by pressing Cancel or by
+    /// leaving the screen cannot leave the hotkeys unregistered.
+    fn end_capture(&mut self) {
+        self.capturing = None;
+        self.shell.apply_hotkeys(self.core.config.hotkeys);
     }
 
     /// Open straight onto a surface, the same way the eframe binary does.
@@ -472,9 +585,11 @@ impl WinSendGpui {
             win: modifiers.platform,
             key,
         };
-        self.capturing = None;
         let outcome = self.core.set_hotkey(action, Some(hotkey));
         self.report(outcome, cx);
+        // After the config has the new binding, so what is registered is what
+        // was just set rather than what it replaced.
+        self.end_capture();
     }
 
     fn state(&self) -> State {
@@ -608,6 +723,18 @@ fn own_window_handle(window: &Window) -> Option<u64> {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as u64),
         _ => None,
     }
+}
+
+/// What the tray icon should show for the current state.
+///
+/// The tooltip carries the target monitor because that is the one setting worth
+/// confirming without opening the window, which is the whole point of the icon.
+fn tray_state(core: &Core) -> TrayState {
+    let tooltip = match core.config.resolve_monitor(&core.monitors()) {
+        Some(monitor) => format!("WinSend — sends to {}", monitor.label()),
+        None => "WinSend — no target monitor selected".to_string(),
+    };
+    TrayState { can_retrieve: core.can_retrieve(), tooltip }
 }
 
 fn tint(colour: u32, alpha: f32) -> Hsla {
@@ -1093,7 +1220,7 @@ impl WinSendGpui {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.screen = Screen::Main;
-                            this.capturing = None;
+                            this.end_capture();
                             this.candidates.clear();
                             this.thumbnails.clear();
                             cx.notify();
@@ -1338,9 +1465,18 @@ impl WinSendGpui {
     /// The bindings, and the capture that sets them.
     fn hotkeys(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let capturing = self.capturing;
-        let bindings: Vec<(Action, Option<Hotkey>)> = Action::ALL
+        // The refusal travels with the row rather than only through a toast:
+        // a combination another application already owns is discovered by
+        // looking at the binding, which is where the user will look.
+        let bindings: Vec<(Action, Option<Hotkey>, Option<SharedString>)> = Action::ALL
             .into_iter()
-            .map(|action| (action, self.core.config.hotkeys.binding(action)))
+            .map(|action| {
+                (
+                    action,
+                    self.core.config.hotkeys.binding(action),
+                    self.hotkey_report.reason(action).map(SharedString::from),
+                )
+            })
             .collect();
 
         div()
@@ -1357,8 +1493,8 @@ impl WinSendGpui {
                     .pb_1()
                     .child("Work from inside Zoom, without focusing this window."),
             )
-            .children(bindings.into_iter().map(|(action, bound)| {
-                binding_row(action, bound, capturing == Some(action), cx)
+            .children(bindings.into_iter().map(|(action, bound, refused)| {
+                binding_row(action, bound, refused, capturing == Some(action), cx)
             }))
     }
 }
@@ -1577,6 +1713,7 @@ fn switch(on: bool) -> impl IntoElement {
 fn binding_row(
     action: Action,
     bound: Option<Hotkey>,
+    refused: Option<SharedString>,
     capturing: bool,
     cx: &mut Context<WinSendGpui>,
 ) -> impl IntoElement {
@@ -1612,6 +1749,15 @@ fn binding_row(
                         .text_color(rgb(ACCENT))
                         .child("press a combination")
                         .into_any_element()
+                } else if let Some(why) = refused {
+                    // Ahead of the binding it replaces, because a binding
+                    // shown as set when the OS refused it is the lie this
+                    // exists to prevent.
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(err()))
+                        .child(why)
+                        .into_any_element()
                 } else {
                     match &bound {
                         Some(hotkey) => div()
@@ -1632,6 +1778,9 @@ fn binding_row(
                 small_button(clear_id, "Clear").on_click(cx.listener(move |this, _, _, cx| {
                     let outcome = this.core.set_hotkey(action, None);
                     this.report(outcome, cx);
+                    // The binding is gone from the config; this is what takes
+                    // it off the OS as well.
+                    this.shell.apply_hotkeys(this.core.config.hotkeys);
                     cx.notify();
                 })),
             )
@@ -1639,7 +1788,11 @@ fn binding_row(
         .child(
             small_button(set_id, if capturing { "Cancel" } else if bound.is_some() { "Change" } else { "Set" })
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.capturing = if capturing { None } else { Some(action) };
+                    if capturing {
+                        this.end_capture();
+                    } else {
+                        this.start_capture(action);
+                    }
                     // The key listener sits on the root and only fires while
                     // the window holds focus, so capture has to take it.
                     window.focus(&this.focus_handle, cx);
