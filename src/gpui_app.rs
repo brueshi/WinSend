@@ -150,6 +150,7 @@ enum Chip {
     Likely,
 }
 
+#[derive(Clone)]
 struct Message {
     text: SharedString,
     failed: bool,
@@ -241,6 +242,7 @@ impl WinSendGpui {
             _ => {}
         }
     }
+
 
 
     fn open_picker(&mut self, picker: PickerFor) {
@@ -340,6 +342,16 @@ impl WinSendGpui {
             .ok();
         })
         .detach();
+    }
+
+    /// Take the toast down before its timer does.
+    ///
+    /// Bumps the sequence too, so the task still waiting on the dismissed
+    /// message cannot clear whatever is put up next.
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.toast_seq += 1;
+        self.toast = None;
+        cx.notify();
     }
 
     fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
@@ -674,7 +686,7 @@ impl Render for WinSendGpui {
                 Screen::Settings => self.settings(cx).into_any_element(),
                 Screen::Hotkeys => self.hotkeys(cx).into_any_element(),
             })
-            .when_some(self.toast.as_ref(), |this, message| this.child(toast(message)))
+            .when_some(self.toast.clone(), |this, message| this.child(toast(&message, cx)))
     }
 }
 
@@ -1433,10 +1445,11 @@ fn picker_row(
 /// covered for three seconds, and Retrieve is the control someone reaches for
 /// while a window is on air — the three buttons it hides instead are the ones
 /// that were chosen for the footer precisely because they are never urgent.
-fn toast(message: &Message) -> impl IntoElement {
+fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
     let (tone, glyph) = if message.failed { (ERR, "alert") } else { (OK, "check") };
 
     div()
+        .id("toast")
         .absolute()
         .bottom(px(20.))
         .left_3()
@@ -1451,6 +1464,11 @@ fn toast(message: &Message) -> impl IntoElement {
         .border_1()
         .border_color(tint(tone, 0.4))
         .shadow_lg()
+        .cursor_pointer()
+        // The whole thing dismisses, which also gives it a hitbox covering the
+        // footer buttons underneath. Without one a press meant for the toast
+        // would land on whatever it is sitting over.
+        .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx)))
         .child(icon(glyph, 13.0, tone))
         .child(
             div()
@@ -1460,6 +1478,18 @@ fn toast(message: &Message) -> impl IntoElement {
                 .text_size(px(11.5))
                 .text_color(rgb(TEXT))
                 .child(message.text.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .justify_center()
+                .items_center()
+                .w(px(18.))
+                .h(px(18.))
+                .rounded_full()
+                .hover(|style| style.bg(tint(TEXT, 0.12)))
+                .child(icon("close", 11.0, SUBDUED)),
         )
 }
 
