@@ -39,27 +39,28 @@ pub const WIDTH: f32 = 340.0;
 
 /// The height with nothing expanded: the shape that sits on screen during a
 /// broadcast, and the one worth keeping small.
-pub const HEIGHT: f32 = 408.0;
+pub const HEIGHT: f32 = 416.0;
 
 /// The sub-surfaces, each sized for its own content.
 /// A row plus the gap under it, measured rather than guessed.
 const CANDIDATE_ROW: f32 = 79.0;
 /// Beyond this the list scrolls rather than the window growing off the screen.
 const PICKER_MAX_HEIGHT: f32 = 620.0;
-const SETTINGS_HEIGHT: f32 = 462.0;
-const HOTKEYS_HEIGHT: f32 = 268.0;
+const SETTINGS_HEIGHT: f32 = 454.0;
+const HOTKEYS_HEIGHT: f32 = 260.0;
 
 /// What an expanded block adds.
 const PANEL_HEADING: f32 = 21.0;
-const PICKER_ROW: f32 = 34.0;
-const ROW_GAP: f32 = 8.0;
+const PICKER_ROW: f32 = 36.0;
+const ROW_HEIGHT: f32 = 56.0;
+const ROW_GAP: f32 = 10.0;
 const BLOCK_GAP: f32 = 12.0;
 
 const BG: u32 = 0x141414;
 /// The row fill. Loom's rows are a light grey against white; this is the same
 /// one-step lift against the panel.
-const ROW: u32 = 0x212121;
-const ROW_HOVER: u32 = 0x2a2a2a;
+const ROW: u32 = 0x232323;
+const ROW_HOVER: u32 = 0x2e2e2e;
 const BORDER: u32 = 0x303030;
 const TEXT: u32 = 0xf2f2f2;
 const SUBDUED: u32 = 0x8f8f8f;
@@ -78,7 +79,7 @@ const ERR: u32 = 0xe26a6a;
 const TOAST_LIFE: std::time::Duration = std::time::Duration::from_secs(3);
 const TOAST_LIFE_FAILED: std::time::Duration = std::time::Duration::from_secs(6);
 
-const HEADER_HEIGHT: f32 = 52.0;
+const HEADER_HEIGHT: f32 = 44.0;
 
 /// Where the drawn header's own content starts.
 ///
@@ -416,7 +417,7 @@ fn display_detail(monitor: &MonitorInfo) -> String {
 }
 
 /// The chip on the right of a row: Loom's "Off"/"On" pill.
-fn chip(kind: Chip) -> impl IntoElement {
+fn chip(kind: Chip, group: &'static str) -> impl IntoElement {
     let (label, colour) = match kind {
         Chip::Set => ("SET", OK),
         Chip::Needed => ("NEEDED", WARN),
@@ -426,10 +427,11 @@ fn chip(kind: Chip) -> impl IntoElement {
     div()
         .flex_none()
         .whitespace_nowrap()
-        .px_2()
-        .py(px(3.))
+        .px_2p5()
+        .py(px(4.))
         .rounded_full()
         .bg(tint(colour, 0.14))
+        .group_hover(group, |style| style.bg(tint(colour, 0.28)))
         .text_size(px(9.))
         .font_weight(FontWeight::BOLD)
         .text_color(rgb(colour))
@@ -444,7 +446,6 @@ fn row(
     id: &'static str,
     glyph: &'static str,
     label: String,
-    detail: Option<String>,
     right: gpui::AnyElement,
     muted: bool,
 ) -> gpui::Stateful<gpui::Div> {
@@ -455,45 +456,33 @@ fn row(
         .items_center()
         .gap_3()
         .w_full()
-        .h(px(52.))
-        .px_3()
-        .rounded_lg()
+        .h(px(ROW_HEIGHT))
+        .pl_4()
+        .pr_3()
+        // A pill, like the actions under it. One radius for everything that
+        // is a control, rather than rows in one geometry and buttons in
+        // another, which is what made the surface read as assembled from
+        // parts rather than designed.
+        .rounded_full()
         .bg(rgb(ROW))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
         .active(|style| style.opacity(0.7))
-        .child(icon(glyph, 18.0, if muted { FAINT } else { SUBDUED }))
+        .child(icon(glyph, 19.0, if muted { SUBDUED } else { TEXT }))
+        // One line. The value is the label, the way Loom's row says "No
+        // Camera" rather than saying "Camera" and putting the answer
+        // underneath it.
         .child(
             div()
-                .flex()
-                .flex_col()
                 .flex_1()
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(if muted { SUBDUED } else { TEXT }))
-                        .child(label),
-                )
-                .when_some(detail, |this, detail| {
-                    this.child(div().text_size(px(10.5)).text_color(rgb(FAINT)).child(detail))
-                }),
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(if muted { SUBDUED } else { TEXT }))
+                .child(label),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(right)
-                // Says the row opens something, without a word that could
-                // wrap. Faint until the row is hovered.
-                .child(
-                    div()
-                        .opacity(0.35)
-                        .group_hover(id, |style| style.opacity(1.))
-                        .child(icon("chevron", 14.0, SUBDUED)),
-                ),
-        )
+        .child(right)
 }
 
 /// The one saturated control, and the only filled thing on the surface.
@@ -713,14 +702,14 @@ impl WinSendGpui {
             .as_ref()
             .map(|w| w.title.clone())
             .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| "Zoom video window".to_string());
+            .unwrap_or_else(|| "Choose the Zoom video window".to_string());
         let media_label = self
             .core
             .config
             .media_window
             .as_ref()
             .map(|w| if w.title.is_empty() { w.process_name.clone() } else { w.title.clone() })
-            .unwrap_or_else(|| "Media player".to_string());
+            .unwrap_or_else(|| "No media player".to_string());
 
         div()
             .flex()
@@ -740,14 +729,13 @@ impl WinSendGpui {
                             target
                                 .as_ref()
                                 .map(display_name)
-                                .unwrap_or_else(|| "No target display".to_string()),
-                            target.as_ref().map(display_detail),
+                                .unwrap_or_else(|| "Choose a display".to_string()),
                             if target.is_some() {
-                                chip(Chip::Set).into_any_element()
+                                chip(Chip::Set, "row-display").into_any_element()
                             } else {
-                                chip(Chip::Needed).into_any_element()
+                                chip(Chip::Needed, "row-display").into_any_element()
                             },
-                            false,
+                            target.is_none(),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.picking_display = !this.picking_display;
@@ -774,17 +762,12 @@ impl WinSendGpui {
                             "row-zoom",
                             "video",
                             zoom_label,
-                            Some(if zoom_set {
-                                "confirmed".to_string()
-                            } else {
-                                "pin someone in Zoom, then choose".to_string()
-                            }),
                             if zoom_set {
-                                chip(Chip::Set).into_any_element()
+                                chip(Chip::Set, "row-zoom").into_any_element()
                             } else {
-                                chip(Chip::Needed).into_any_element()
+                                chip(Chip::Needed, "row-zoom").into_any_element()
                             },
-                            false,
+                            !zoom_set,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_picker(PickerFor::Zoom);
@@ -796,15 +779,10 @@ impl WinSendGpui {
                             "row-media",
                             "media",
                             media_label,
-                            Some(if media_set {
-                                "brought back by Restore Media".to_string()
-                            } else {
-                                "none selected".to_string()
-                            }),
                             if media_set {
-                                chip(Chip::Set).into_any_element()
+                                chip(Chip::Set, "row-media").into_any_element()
                             } else {
-                                chip(Chip::Optional).into_any_element()
+                                chip(Chip::Optional, "row-media").into_any_element()
                             },
                             !media_set,
                         )
@@ -1159,7 +1137,7 @@ fn candidate_row(
         .gap_3()
         .w_full()
         .p_2()
-        .rounded_lg()
+        .rounded_2xl()
         .bg(rgb(ROW))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
@@ -1168,7 +1146,7 @@ fn candidate_row(
             Some(image) => img(image)
                 .w(px(96.))
                 .h(px(54.))
-                .rounded_md()
+                .rounded_lg()
                 .into_any_element(),
             // A window that will not be captured is still a window that can be
             // chosen. GPU-composited ones routinely refuse.
@@ -1178,7 +1156,7 @@ fn candidate_row(
                 .items_center()
                 .w(px(96.))
                 .h(px(54.))
-                .rounded_md()
+                .rounded_lg()
                 .bg(rgb(BG))
                 .text_size(px(9.))
                 .text_color(rgb(FAINT))
@@ -1215,7 +1193,7 @@ fn candidate_row(
                 ),
         )
         .when(candidate.likely_zoom && picker == PickerFor::Zoom, |this| {
-            this.child(chip(Chip::Likely))
+            this.child(chip(Chip::Likely, "candidate"))
         })
         .on_click(cx.listener(move |this, _, _, cx| {
             this.confirm(picker, &candidate, cx);
@@ -1239,7 +1217,7 @@ fn setting_row(
         .gap_3()
         .w_full()
         .p_3()
-        .rounded_lg()
+        .rounded_2xl()
         .bg(rgb(ROW))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(ROW_HOVER)))
@@ -1301,8 +1279,8 @@ fn binding_row(
         .gap_2()
         .w_full()
         .h(px(52.))
-        .px_3()
-        .rounded_lg()
+        .px_4()
+        .rounded_2xl()
         .bg(rgb(ROW))
         .child(
             div()
@@ -1417,8 +1395,8 @@ fn picker_row(
         .justify_between()
         .w_full()
         .h(px(PICKER_ROW))
-        .px_3()
-        .rounded_lg()
+        .px_4()
+        .rounded_full()
         .bg(rgb(ROW))
         .border_1()
         .border_color(rgb(if chosen { ACCENT } else { ROW }))
@@ -1459,7 +1437,7 @@ fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
         .gap_2()
         .px_3()
         .py_2()
-        .rounded_lg()
+        .rounded_2xl()
         .bg(rgb(ROW_HOVER))
         .border_1()
         .border_color(tint(tone, 0.4))
