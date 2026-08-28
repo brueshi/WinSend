@@ -27,8 +27,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AssetSource, Context, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
-    RenderImage, SharedString, Window, div, img, prelude::*, px, rgb, size, svg,
+    Animation, AnimationExt, AssetSource, Context, FocusHandle, FontWeight, Hsla, IntoElement,
+    KeyDownEvent, MouseButton, RenderImage, SharedString, Window, div, ease_out_quint, img,
+    prelude::*, px, rgb, size, svg,
 };
 
 use crate::core::{Core, Failure};
@@ -170,6 +171,25 @@ const WARM: u32 = 0xe8593f;
 const WARM_HOVER: u32 = 0xf06a52;
 /// What sits on top of an accent or warm fill, in either palette.
 const ON_ACCENT: u32 = 0xffffff;
+
+/// How long things take to arrive.
+///
+/// Three things animate and nothing else. What rules them out is frequency
+/// rather than taste: Send and Retrieve are pressed over and over during a
+/// broadcast, and an animation seen a hundred times a day stops being feedback
+/// and becomes latency. The row hover is the same. What is left is the three
+/// things that appear occasionally and would otherwise pop into existence.
+///
+/// All three ease out, because all three are entering. Durations follow the
+/// size of the thing arriving: the panel is the largest and the chip the
+/// smallest. Nothing is animated that the operator is waiting on — the state
+/// has already changed by the time the first frame is drawn, and only its
+/// appearance is catching up.
+///
+/// GPUI skips these entirely when the system asks for reduced motion.
+const PANEL_IN: std::time::Duration = std::time::Duration::from_millis(200);
+const TOAST_IN: std::time::Duration = std::time::Duration::from_millis(200);
+const CHIP_IN: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// How long a toast stays up.
 ///
@@ -958,24 +978,34 @@ impl WinSendGpui {
     fn main_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sent = self.state() == State::Sent;
 
+        // A child rather than a `when`, because the animation wrapper is a
+        // different element type and both arms of a `when` have to agree.
+        let chip = sent.then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .py(px(4.))
+                .rounded_full()
+                .bg(tint(ACCENT, 0.16))
+                .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(ACCENT)))
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(ACCENT))
+                        .child("ON TARGET"),
+                )
+                .with_animation(
+                    "on-target-in",
+                    Animation::new(CHIP_IN).with_easing(ease_out_quint()),
+                    |this, delta| this.opacity(delta),
+                )
+        });
+
         header_shell()
-            .child(div().when(sent, |this| {
-                this.flex()
-                    .items_center()
-                    .gap_1p5()
-                    .px_2()
-                    .py(px(4.))
-                    .rounded_full()
-                    .bg(tint(ACCENT, 0.16))
-                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(ACCENT)))
-                    .child(
-                        div()
-                            .text_size(px(9.5))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(ACCENT))
-                            .child("ON TARGET"),
-                    )
-            }))
+            .child(div().children(chip))
             .child(header_controls(cx))
     }
 
@@ -1148,6 +1178,11 @@ impl WinSendGpui {
                         candidate_row(candidate, thumbnails.clone(), picker, cx)
                     })),
             }),
+            )
+            .with_animation(
+                "panel-in",
+                Animation::new(PANEL_IN).with_easing(ease_out_quint()),
+                |this, delta| this.opacity(delta),
             )
     }
 
@@ -1690,6 +1725,11 @@ fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
                 .rounded_full()
                 .hover(|style| style.bg(tint(text(), 0.12)))
                 .child(icon("close", 11.0, subdued())),
+        )
+        .with_animation(
+            "toast-in",
+            Animation::new(TOAST_IN).with_easing(ease_out_quint()),
+            |this, delta| this.opacity(delta).bottom(px(12. + 8. * delta)),
         )
 }
 
