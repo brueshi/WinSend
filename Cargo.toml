@@ -28,14 +28,15 @@ required-features = ["gpui-ui"]
 [features]
 default = ["eframe-ui", "gpui-ui"]
 eframe-ui = ["dep:eframe", "dep:raw-window-handle"]
-gpui-ui = ["dep:gpui", "dep:gpui_platform", "dep:image"]
+gpui-ui = ["dep:gpui", "dep:gpui_platform", "dep:image", "dep:raw-window-handle"]
 
 [dependencies]
 eframe = { version = "0.33.3", optional = true }
-# Only to read our own window's handle out of eframe, which hands it back as a
-# `RawWindowHandle` and does not re-export the crate that names the type. The
-# version tracks eframe's own, since a mismatched major would be a different
-# type entirely and the handle would not convert.
+# Only to read our own window's handle out of the toolkit. Both eframe and GPUI
+# hand it back as a `RawWindowHandle` and neither re-exports the crate that
+# names the type. The version tracks theirs, since a mismatched major would be a
+# different type entirely and the handle would not convert; they agree on 0.6,
+# which is what makes one dependency serve both.
 raw-window-handle = { version = "0.6.2", optional = true }
 # Pinned to a git revision rather than a version. crates.io stops at gpui
 # 0.2.2 from October 2025, and `gpui_platform` — which the current API needs to

@@ -347,7 +347,19 @@ pub struct WinSendGpui {
 }
 
 impl WinSendGpui {
-    pub fn new(core: Core, cx: &mut Context<Self>) -> Self {
+    pub fn new(core: Core, window: &Window, cx: &mut Context<Self>) -> Self {
+        // Once, here, because the window exists by the time this runs and
+        // neither of the two things below is something that needs
+        // re-asserting per frame.
+        if let Some(handle) = own_window_handle(window) {
+            core.platform.apply_window_chrome(handle);
+            // Always-on-top. eframe asks for it as a window flag; GPUI has no
+            // equivalent in WindowOptions, so it goes on through the handle —
+            // and `raise` is already exactly that call, so this needs no Win32
+            // of its own.
+            let _ = core.platform.raise(handle, true);
+        }
+
         let mut app = Self {
             core,
             toast: None,
@@ -578,6 +590,23 @@ impl WinSendGpui {
             Screen::Hotkeys => HOTKEYS_HEIGHT,
             Screen::Main => HEIGHT,
         }
+    }
+}
+
+/// Our own window's OS handle, in the same opaque form `Platform` speaks.
+///
+/// Kept free of `cfg` attributes: `RawWindowHandle` names every platform's
+/// variant on every platform, so this compiles as written on macOS and simply
+/// answers `None` there. Returning `None` is a normal answer and means only
+/// that there is no native frame to ask anything of.
+fn own_window_handle(window: &Window) -> Option<u64> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Called through the trait: `Window` has an inherent `window_handle` of
+    // its own, returning GPUI's `AnyWindowHandle`, which shadows this one.
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as u64),
+        _ => None,
     }
 }
 
