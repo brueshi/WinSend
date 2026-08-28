@@ -36,6 +36,7 @@ use crate::core::{Core, Failure};
 use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::{MonitorInfo, WindowCandidate};
 use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
+use crate::watch::{Fade, Started};
 
 pub const WIDTH: f32 = 340.0;
 
@@ -220,6 +221,14 @@ const TOAST_LIFE_FAILED: std::time::Duration = std::time::Duration::from_secs(6)
 /// mutex-guarded `Vec` and costs nothing when it is empty.
 const SHELL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How often a running fade is advanced.
+///
+/// The ramp is 200ms, so this is a dozen steps — enough that the opacity moves
+/// smoothly and few enough that the desktop is not being written to sixty
+/// times a second for a fifth of a second. `app.rs` steps its own per frame,
+/// which on a 60Hz display is this number.
+const FADE_STEP: std::time::Duration = std::time::Duration::from_millis(16);
+
 const HEADER_HEIGHT: f32 = 44.0;
 
 /// Where the drawn header's own content starts.
@@ -343,6 +352,12 @@ pub struct WinSendGpui {
     /// Which bindings the shell refused, so the offending row can say so
     /// rather than the reason living only in a toast that has since gone.
     hotkey_report: HotkeyReport,
+    /// A Retrieve fading the window out, if one is running.
+    fading: Option<Fade>,
+    /// Which fade the running stepper belongs to, so a fade ended early
+    /// cannot be advanced by the task armed for the one before it. The same
+    /// guard the toast uses, for the same reason.
+    fade_seq: u64,
     /// The message currently showing, if any. One at a time and transient:
     /// a strip reserved for messages costs the live surface its height every
     /// day for something that is on screen for three seconds.
@@ -397,6 +412,8 @@ impl WinSendGpui {
             core,
             shell,
             hotkey_report: HotkeyReport::default(),
+            fading: None,
+            fade_seq: 0,
             toast: None,
             toast_seq: 0,
             toast_leaving: false,
@@ -468,8 +485,14 @@ impl WinSendGpui {
                 self.close_side();
                 window.activate_window();
             }
-            // The only path that actually exits.
-            ShellEvent::Quit => cx.quit(),
+            // The only path that actually exits. The fade goes first: one
+            // abandoned here would leave Zoom's window translucent after this
+            // process has gone, with nothing left running that could put it
+            // back.
+            ShellEvent::Quit => {
+                self.finish_fade(cx);
+                cx.quit();
+            }
         }
     }
 
@@ -688,13 +711,109 @@ impl WinSendGpui {
         .detach();
     }
 
+    /// Run an action, however it was asked for. A hotkey press and a button
+    /// click are the same thing by the time they reach here.
     fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
-        let outcome = match action {
-            Action::Send => self.core.send(),
-            Action::Retrieve => self.core.retrieve(),
-            Action::RestoreMedia => self.core.restore_media(),
+        // A press arriving mid-fade finishes it at once rather than queueing
+        // behind it. The operator pressing a key twice means they want it
+        // done, not animated twice.
+        let interrupted_a_fade = self.finish_fade(cx);
+
+        match action {
+            // Send is the urgent half and still has to happen. It just acts on
+            // a window that has finished moving rather than on one caught part
+            // way through being moved.
+            Action::Send => {
+                let outcome = self.core.send();
+                self.report(outcome, cx);
+            }
+            // The fade that was just cut short *was* the Retrieve. Starting
+            // another would only produce "nothing has been sent yet".
+            Action::Retrieve if interrupted_a_fade => {}
+            Action::Retrieve => self.start_retrieve(cx),
+            Action::RestoreMedia => {
+                let outcome = self.core.restore_media();
+                self.report(outcome, cx);
+            }
+        }
+    }
+
+    /// Retrieve, with the fade when it is wanted and a hard cut when it is not.
+    fn start_retrieve(&mut self, cx: &mut Context<Self>) {
+        if !self.core.config.fade_on_retrieve {
+            let outcome = self.core.retrieve();
+            self.report(outcome, cx);
+            return;
+        }
+
+        match Fade::begin(&mut self.core, std::time::Instant::now()) {
+            Started::Fading(fade) => {
+                self.fading = Some(fade);
+                self.step_fade(cx);
+            }
+            Started::Cut(outcome) => self.report(outcome, cx),
+        }
+    }
+
+    /// Drive the running fade to its end.
+    ///
+    /// A task of its own rather than a branch of the shell poll: 200ms wants
+    /// a dozen steps, and pulling the whole poll loop up to that rate for the
+    /// one fifth of a second a fade lasts would be paying for it always.
+    fn step_fade(&mut self, cx: &mut Context<Self>) {
+        self.fade_seq += 1;
+        let seq = self.fade_seq;
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FADE_STEP).await;
+                let carry_on = this
+                    .update(cx, |this, cx| {
+                        // Superseded: another press ended this fade and either
+                        // started a new one or finished the Retrieve outright.
+                        if this.fade_seq != seq {
+                            return false;
+                        }
+                        let Some(fade) = this.fading.take() else {
+                            return false;
+                        };
+                        match fade.advance(&mut this.core, std::time::Instant::now()) {
+                            None => {
+                                this.fading = Some(fade);
+                                true
+                            }
+                            Some(outcome) => {
+                                this.report(outcome, cx);
+                                cx.notify();
+                                false
+                            }
+                        }
+                    })
+                    .unwrap_or(false);
+                if !carry_on {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// End a fade now, wherever it had got to. Says whether there was one.
+    ///
+    /// The interruption half of the guarantee in `watch.rs`: every path out of
+    /// the animation runs through `Fade::finish`, so the window lands opaque
+    /// whether the ramp completed, another press cut it short, or the
+    /// application is going down.
+    fn finish_fade(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(fade) = self.fading.take() else {
+            return false;
         };
+        // Supersede the stepper: its next tick finds a bumped sequence and
+        // stops rather than advancing a fade that is already over.
+        self.fade_seq += 1;
+        let outcome = fade.finish(&mut self.core);
         self.report(outcome, cx);
+        true
     }
     fn width(&self) -> f32 {
         if self.side.is_some() { WIDTH + PANEL_WIDTH } else { WIDTH }
@@ -742,6 +861,22 @@ fn tray_state(core: &Core) -> TrayState {
         None => "WinSend — no target monitor selected".to_string(),
     };
     TrayState { can_retrieve: core.can_retrieve(), tooltip }
+}
+
+/// The backstop under every exit path out of a fade.
+///
+/// Quit finishes one explicitly, and so does a press that interrupts it, but
+/// neither covers the window simply going away — which on macOS is what
+/// closing it means. The view is dropped either way, and the one thing that
+/// must not outlive this process is a Zoom window left at forty percent on
+/// camera. `Fade::finish` is idempotent about the opacity, so running here
+/// after it has already run costs a call that clears nothing.
+impl Drop for WinSendGpui {
+    fn drop(&mut self) {
+        if let Some(fade) = self.fading.take() {
+            let _ = fade.finish(&mut self.core);
+        }
+    }
 }
 
 fn tint(colour: u32, alpha: f32) -> Hsla {
