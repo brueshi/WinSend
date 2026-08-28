@@ -1,0 +1,7 @@
+# Pinned because the GPUI front end pulls in gpui from zed's tree, which is
+# edition 2024 and tracks the latest stable Rust. This is the version zed
+# itself pins at the revision Cargo.toml names; an older toolchain cannot
+# build it at all. The eframe front end is indifferent to the choice.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"

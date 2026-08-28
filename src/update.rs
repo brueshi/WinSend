@@ -133,7 +133,7 @@ pub trait Updater {
 
     /// Escape hatch for the mock-only debug controls, mirroring the one on
     /// `Platform` and `Shell`.
-    #[cfg(not(windows))]
+    #[cfg(any(not(windows), test))]
     fn as_mock(&self) -> Option<&crate::mock::MockUpdater> {
         None
     }

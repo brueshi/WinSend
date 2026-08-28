@@ -1180,6 +1180,11 @@ impl Core {
 
     /// Takes effect at the next launch, since the check only ever runs once
     /// per launch and this one has already had its.
+    pub fn set_light_theme(&mut self, light: bool) -> Result<(), String> {
+        self.config.light_theme = light;
+        self.config.save()
+    }
+
     pub fn set_check_for_updates(&mut self, check: bool) -> Result<(), String> {
         self.config.check_for_updates = check;
         self.config.save()
