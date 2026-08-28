@@ -47,6 +47,13 @@ pub const HEIGHT: f32 = 416.0;
 /// than a gap, so the two read as one window with two columns.
 const PANEL_WIDTH: f32 = 340.0;
 
+/// Deliberately the same with the mock controls compiled in as without.
+///
+/// `app.rs` buys room for its own, because they sit on the live surface, which
+/// does not scroll. These sit at the foot of a panel that already does, and a
+/// window grows downward from where it opened — so paying for them in height
+/// would push the foot of Settings under the dock to save a scroll that costs
+/// nothing.
 const SETTINGS_HEIGHT: f32 = 512.0;
 const HOTKEYS_HEIGHT: f32 = 260.0;
 
@@ -1370,6 +1377,7 @@ impl WinSendGpui {
 
     /// The settings, as toggles that write straight through `Core`.
     fn settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mock = self.mock_controls(cx);
         let config = &self.core.config;
         let rows = [
             (
@@ -1460,6 +1468,127 @@ impl WinSendGpui {
                         cx.notify();
                     })),
             )
+            .children(mock)
+    }
+
+    /// Mock-only: inject what only a real desktop could otherwise produce.
+    ///
+    /// The mock platform and shell exist so the surface can be driven on a
+    /// machine that is not Windows. Without these, everything the shell
+    /// delivers — a hotkey press, a tray choice — is unreachable here, and the
+    /// wiring behind it could only be exercised by shipping it.
+    ///
+    /// At the foot of Settings rather than on the live surface. `app.rs` puts
+    /// its own on the surface and pays for them in window height; this one is
+    /// a press away in a panel that already scrolls, and the shape that sits
+    /// on screen during a broadcast is left alone.
+    #[cfg(not(windows))]
+    fn mock_controls(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        // Both or neither: the mock platform and the mock shell are chosen
+        // together, so a surface offering half of these would be lying.
+        self.core.platform.as_mock()?;
+        let tray = self.shell.as_mock()?.tray();
+        let zoom_present = self.core.platform.as_mock()?.zoom_present();
+
+        let heading = |text: &'static str| {
+            div()
+                .text_size(px(10.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(faint()))
+                .child(text)
+        };
+        let strip = || div().flex().items_center().gap_1p5().w_full();
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .mt_4()
+                .pt_3()
+                .border_t_1()
+                .border_color(rgb(border()))
+                .child(heading("MOCK DESKTOP"))
+                .child(
+                    strip()
+                        .child(
+                            small_button(
+                                "mock-zoom".into(),
+                                if zoom_present { "Zoom: running" } else { "Zoom: gone" },
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(mock) = this.core.platform.as_mock() {
+                                    mock.set_zoom_present(!zoom_present);
+                                }
+                                cx.notify();
+                            })),
+                        )
+                        // The picker is the only way to confirm a window, so
+                        // every state that needs one is otherwise out of reach
+                        // of anything driving this from outside. Same shortcut
+                        // the picker takes, without the clicking.
+                        .child(small_button("mock-confirm".into(), "Confirm Zoom").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let found = this
+                                    .core
+                                    .candidates()
+                                    .into_iter()
+                                    .find(|candidate| candidate.likely_zoom);
+                                if let Some(candidate) = found {
+                                    let outcome = this.core.confirm_window(&candidate);
+                                    this.report(outcome, cx);
+                                }
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .child(heading("MOCK HOTKEY"))
+                .child(strip().children(Action::ALL.map(|action| {
+                    // Injected rather than performed directly, so the press
+                    // travels the same queue-and-drain path a real one takes.
+                    small_button(format!("mock-key-{}", action.label()).into(), action.label())
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            if let Some(mock) = this.shell.as_mock() {
+                                mock.trigger(action);
+                            }
+                        }))
+                })))
+                .child(heading("MOCK TRAY"))
+                .child(strip().children(
+                    [
+                        ("mock-tray-show", "Show", ShellEvent::ShowWindow),
+                        ("mock-tray-settings", "Settings", ShellEvent::ShowSettings),
+                        ("mock-tray-quit", "Quit", ShellEvent::Quit),
+                    ]
+                    .map(|(id, label, event)| {
+                        small_button(id.into(), label).on_click(cx.listener(
+                            move |this, _, _, _| {
+                                if let Some(mock) = this.shell.as_mock() {
+                                    mock.choose(event.clone());
+                                }
+                            },
+                        ))
+                    }),
+                ))
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(faint()))
+                        .child(format!(
+                            "{}  —  Retrieve {}",
+                            tray.tooltip,
+                            if tray.can_retrieve { "offered" } else { "greyed" }
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Nothing to inject on a real desktop, which has the real thing.
+    #[cfg(windows)]
+    fn mock_controls(&mut self, _cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        None
     }
 
     /// The bindings, and the capture that sets them.
