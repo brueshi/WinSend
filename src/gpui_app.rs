@@ -1,83 +1,133 @@
 //! GPUI front end. Presentation only: every decision lives in `Core`.
 //!
-//! Built to be looked at next to the eframe surface rather than to replace it
-//! yet. What it changes is the information architecture, not the renderer:
+//! Laid out after Loom's capture panel, which is the closest thing to what
+//! this is: a small always-there utility window with two or three pieces of
+//! state and one action that matters. What that borrows is the structure, not
+//! the palette —
 //!
-//! - The state of the world is the largest thing on screen, because the
-//!   question asked mid-broadcast is "is the window out there right now" and
-//!   the answer used to be inferable only from whether Retrieve was greyed.
-//! - The accent follows the state. Whichever action the operator is most
-//!   likely to reach for next is the filled one, and it is only ever one.
-//! - Send is gated on being able to succeed. A primary action that is always
-//!   live, and reports its own impossibility afterwards in small text, spends
-//!   the operator's attention at the worst moment.
-//! - What is missing is fixed where it is named. A blocked surface offers the
-//!   monitor list and the window confirmation inline, rather than sending the
-//!   operator into a settings screen to find them.
-//! - The bound hotkeys are on the live surface. They are how this is actually
-//!   driven, and they used to be visible only inside the configuration.
+//! - **The rows are the state and the control.** Loom's "No Camera" row both
+//!   reports the camera and changes it. Here the target display, the Zoom
+//!   window and the media window do the same, so there is no separate settings
+//!   screen for the three things that decide whether Send can work.
+//! - **One saturated colour, used once.** Loom spends its orange only on Start
+//!   recording. The accent here goes to whichever of Send or Retrieve is the
+//!   one to reach for, and to nothing else.
+//! - **A drawn header rather than the system titlebar**, so the window reads
+//!   as one designed object.
+//! - **A footer of icon buttons** for what is occasionally needed and never
+//!   urgent.
+//!
+//! It stays dark where Loom is light. `src/app.rs` records why, and the reason
+//! is specific to this application rather than a matter of taste: it sits on
+//! screen during a live broadcast, where a white panel spills light onto the
+//! operator and clashes with the rest of the production kit.
+
+use std::borrow::Cow;
 
 use gpui::{
-    Context, FontWeight, IntoElement, Render, SharedString, Window, div, prelude::*, px, rgb, size,
+    AssetSource, Context, FontWeight, Hsla, IntoElement, Render, SharedString, Window, div,
+    prelude::*, px, rgb, size, svg,
 };
 
 use crate::core::{Core, Failure};
 use crate::hotkey::Action;
 use crate::platform::MonitorInfo;
 
-pub const WIDTH: f32 = 360.0;
+pub const WIDTH: f32 = 340.0;
 
-/// The height with nothing to set up: the shape that sits on screen during a
+/// The height with nothing expanded: the shape that sits on screen during a
 /// broadcast, and the one worth keeping small.
-pub const HEIGHT: f32 = 344.0;
+pub const HEIGHT: f32 = 430.0;
 
-/// What the setup blocks add when they are showing.
-///
-/// The window grows to fit them and shrinks back, which is the same bargain
-/// the eframe surface strikes with its configuration disclosure: a live
-/// surface sized for a first-run state it will not be in again is a surface
-/// that is too tall every day after the first.
-const SECTION_HEADING: f32 = 21.0;
-const SETUP_ROW: f32 = 34.0;
+/// What an expanded block adds.
+const PANEL_HEADING: f32 = 21.0;
+const PICKER_ROW: f32 = 34.0;
 const ROW_GAP: f32 = 8.0;
 const BLOCK_GAP: f32 = 12.0;
 
 const BG: u32 = 0x141414;
-const RAISED: u32 = 0x1e1e1e;
-const BORDER: u32 = 0x2e2e2e;
-const TEXT: u32 = 0xf0f0f0;
-const SUBDUED: u32 = 0x8a8a8a;
-const FAINT: u32 = 0x5c5c5c;
+/// The row fill. Loom's rows are a light grey against white; this is the same
+/// one-step lift against the panel.
+const ROW: u32 = 0x212121;
+const ROW_HOVER: u32 = 0x2a2a2a;
+const BORDER: u32 = 0x303030;
+const TEXT: u32 = 0xf2f2f2;
+const SUBDUED: u32 = 0x8f8f8f;
+const FAINT: u32 = 0x5e5e5e;
 const ACCENT: u32 = 0x4e8ef0;
+const ACCENT_HOVER: u32 = 0x6ba2f5;
 const OK: u32 = 0x66bb7a;
 const WARN: u32 = 0xe0a458;
 const ERR: u32 = 0xe26a6a;
 
 /// How many recent messages the status strip keeps.
+const STATUS_HISTORY: usize = 2;
+
+const HEADER_HEIGHT: f32 = 52.0;
+
+/// Where the drawn header's own content starts.
 ///
-/// The same count the eframe surface settles on, for the same reason: enough
-/// that a message cannot be pushed out before it has been read, few enough
-/// that what is on screen is still status rather than history.
-const STATUS_HISTORY: usize = 3;
+/// With the system titlebar transparent, macOS still draws its close, minimise
+/// and zoom buttons on top of whatever is there — so the title has to begin to
+/// the right of them. Windows draws nothing, and the title sits at the normal
+/// margin.
+#[cfg(target_os = "macos")]
+const TITLE_INSET: f32 = 78.0;
+#[cfg(not(target_os = "macos"))]
+const TITLE_INSET: f32 = 16.0;
+
+/// The icons, compiled in rather than read from disk.
+///
+/// The same bargain the tray and window icons already strike: a few kilobytes
+/// in the executable, against a utility that cannot draw its own interface if
+/// someone moves the folder it shipped in.
+///
+/// GPUI paints an SVG as a mask tinted by the element's `text_color`, so
+/// whatever colour is written in the file is discarded. Icons are single solid
+/// shapes on a 24x24 viewBox for that reason.
+pub struct Icons;
+
+macro_rules! icons {
+    ($($name:literal),* $(,)?) => {
+        impl AssetSource for Icons {
+            fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+                Ok(match path {
+                    $(concat!("icons/", $name, ".svg") => Some(Cow::Borrowed(
+                        include_bytes!(concat!("../assets/icons/", $name, ".svg")).as_slice(),
+                    )),)*
+                    _ => None,
+                })
+            }
+
+            fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+                Ok(vec![$(concat!("icons/", $name, ".svg").into()),*])
+            }
+        }
+    };
+}
+
+icons!["display", "video", "media", "keyboard", "settings", "info", "close", "check", "alert"];
 
 /// What the surface is currently able to do.
 ///
 /// Derived on every render rather than stored, because every input to it —
 /// the confirmed window, the target monitor, the restore point — already lives
 /// in `Core` and a second copy would be a second thing to keep true.
+#[derive(PartialEq)]
 enum State {
-    /// Send cannot succeed yet, and this is what is missing.
-    Blocked(Vec<Missing>),
+    /// Send cannot succeed yet: a display, a window, or both are missing.
+    Blocked,
     /// Everything Send needs is in place, and nothing is currently out.
     Ready,
     /// A window is on the target display right now.
     Sent,
 }
 
-#[derive(PartialEq)]
-enum Missing {
-    TargetMonitor,
-    ZoomWindow,
+/// What a row reports about itself, in Loom's "Off"/"On" chip position.
+enum Chip {
+    Set,
+    Needed,
+    Optional,
 }
 
 struct Message {
@@ -85,31 +135,45 @@ struct Message {
     failed: bool,
 }
 
+/// Which footer panel is open, if any. Only one at a time: this is a small
+/// window and two open panels would be a screen.
+#[derive(PartialEq, Clone, Copy)]
+enum Panel {
+    Hotkeys,
+    Settings,
+}
+
 pub struct WinSendGpui {
     core: Core,
     status: Vec<Message>,
-    /// The height last asked for, so the window is resized when the state
+    /// Open only while the target display is being chosen, so the row reads as
+    /// a value most of the time and a picker briefly.
+    picking_display: bool,
+    panel: Option<Panel>,
+    /// The height last asked for, so the window is resized when the layout
     /// changes shape rather than on every frame.
     applied_height: f32,
 }
 
 impl WinSendGpui {
     pub fn new(core: Core) -> Self {
-        Self { core, status: Vec::new(), applied_height: HEIGHT }
+        Self {
+            core,
+            status: Vec::new(),
+            picking_display: false,
+            panel: None,
+            applied_height: HEIGHT,
+        }
     }
 
     fn state(&self) -> State {
         if self.core.can_retrieve() {
-            return State::Sent;
+            State::Sent
+        } else if self.target().is_none() || self.core.config.zoom_window.is_none() {
+            State::Blocked
+        } else {
+            State::Ready
         }
-        let mut missing = Vec::new();
-        if self.core.config.resolve_monitor(&self.core.monitors()).is_none() {
-            missing.push(Missing::TargetMonitor);
-        }
-        if self.core.config.zoom_window.is_none() {
-            missing.push(Missing::ZoomWindow);
-        }
-        if missing.is_empty() { State::Ready } else { State::Blocked(missing) }
     }
 
     fn target(&self) -> Option<MonitorInfo> {
@@ -125,6 +189,11 @@ impl WinSendGpui {
         self.status.truncate(STATUS_HISTORY);
     }
 
+    fn note(&mut self, text: &str, failed: bool) {
+        self.status.insert(0, Message { text: text.to_string().into(), failed });
+        self.status.truncate(STATUS_HISTORY);
+    }
+
     fn perform(&mut self, action: Action) {
         let outcome = match action {
             Action::Send => self.core.send(),
@@ -133,30 +202,51 @@ impl WinSendGpui {
         };
         self.report(outcome);
     }
+
+    /// The picker is not ported yet. This takes the same path it would, on the
+    /// candidate `Core` already considers most likely to be Zoom.
+    fn confirm_zoom(&mut self) {
+        match self.core.candidates().into_iter().find(|c| c.likely_zoom) {
+            Some(candidate) => {
+                let outcome = self.core.confirm_window(&candidate);
+                self.report(outcome);
+            }
+            None => self.note("No Zoom video window is open", true),
+        }
+    }
+
+    fn height(&self) -> f32 {
+        let mut height = HEIGHT;
+        if self.picking_display {
+            let rows = self.core.monitors().len() as f32;
+            height += BLOCK_GAP + PANEL_HEADING + rows * PICKER_ROW + (rows - 1.0).max(0.0) * ROW_GAP;
+        }
+        height += match self.panel {
+            Some(Panel::Hotkeys) => BLOCK_GAP + PANEL_HEADING + 3.0 * 18.0,
+            Some(Panel::Settings) => BLOCK_GAP + PANEL_HEADING + 4.0 * 24.0,
+            None => 0.0,
+        };
+        height
+    }
 }
 
-/// How tall the window has to be to show everything the state puts in it.
-fn wanted_height(state: &State, monitors: usize) -> f32 {
-    let State::Blocked(missing) = state else {
-        return HEIGHT;
-    };
-    let mut height = HEIGHT;
-    if missing.contains(&Missing::TargetMonitor) {
-        let rows = monitors as f32;
-        height += BLOCK_GAP + SECTION_HEADING + rows * SETUP_ROW + (rows - 1.0).max(0.0) * ROW_GAP;
-    }
-    if missing.contains(&Missing::ZoomWindow) {
-        height += BLOCK_GAP + SECTION_HEADING + SETUP_ROW;
-    }
-    height
+fn tint(colour: u32, alpha: f32) -> Hsla {
+    Hsla::from(rgb(colour)).opacity(alpha)
+}
+
+fn icon(name: &'static str, size: f32, colour: u32) -> impl IntoElement {
+    svg()
+        .path(format!("icons/{name}.svg"))
+        .w(px(size))
+        .h(px(size))
+        .text_color(rgb(colour))
 }
 
 /// "Display 2" out of `\\.\DISPLAY2`.
 ///
 /// The geometry is the detail, not the name. `MonitorInfo::label` reads as a
-/// diagnostic — which is right where it is used, in the picker and the
-/// diagnostics dump, and wrong as the text on a thing you click under
-/// pressure.
+/// diagnostic — right in the picker and the diagnostics dump, wrong on a thing
+/// clicked under pressure.
 fn display_name(monitor: &MonitorInfo) -> String {
     let digits: String = monitor.id.chars().filter(char::is_ascii_digit).collect();
     if digits.is_empty() { "Display".to_string() } else { format!("Display {digits}") }
@@ -171,103 +261,136 @@ fn display_detail(monitor: &MonitorInfo) -> String {
     )
 }
 
-/// The state banner: the largest thing on the surface, and the only thing that
-/// answers the question the operator actually has.
-///
-/// Tinted with the state's own colour rather than carrying a lone dot, so it
-/// reads from across a room at a glance rather than on inspection.
-fn banner(state: &State, target: Option<&MonitorInfo>) -> impl IntoElement {
-    let (tone, heading, detail) = match state {
-        State::Sent => (
-            ACCENT,
-            "ON TARGET",
-            target
-                .map(|m| format!("{} · {}", display_name(m), display_detail(m)))
-                .unwrap_or_else(|| "the target display".to_string()),
-        ),
-        State::Ready => (
-            OK,
-            "READY",
-            target
-                .map(|m| format!("{} · {}", display_name(m), display_detail(m)))
-                .unwrap_or_else(|| "no target display".to_string()),
-        ),
-        State::Blocked(_) => (WARN, "NOT READY", "finish the setup below".to_string()),
+/// The chip on the right of a row: Loom's "Off"/"On" pill.
+fn chip(kind: Chip) -> impl IntoElement {
+    let (label, colour) = match kind {
+        Chip::Set => ("SET", OK),
+        Chip::Needed => ("NEEDED", WARN),
+        Chip::Optional => ("OPTIONAL", FAINT),
     };
-
     div()
+        .px_2()
+        .py(px(3.))
+        .rounded_full()
+        .bg(tint(colour, 0.16))
+        .text_size(px(9.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(rgb(colour))
+        .child(label)
+}
+
+/// One of Loom's grey pill rows: an icon, a label, and the state on the right.
+///
+/// Clicking it is how the thing it reports gets changed, which is the whole
+/// reason there is no separate settings screen for these three.
+fn row(
+    id: &'static str,
+    glyph: &'static str,
+    label: String,
+    detail: Option<String>,
+    right: gpui::AnyElement,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
         .flex()
         .items_center()
         .gap_3()
         .w_full()
-        .p_3()
-        .rounded_md()
-        .bg(rgb(tone).opacity(0.10))
-        .border_1()
-        .border_color(rgb(tone).opacity(0.35))
-        .child(div().w(px(12.)).h(px(12.)).rounded_full().bg(rgb(tone)))
+        .h(px(52.))
+        .px_3()
+        .rounded_lg()
+        .bg(rgb(ROW))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .child(icon(glyph, 18.0, SUBDUED))
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap_1()
+                .flex_1()
                 .child(
                     div()
-                        .text_size(px(19.))
-                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(TEXT))
-                        .child(heading),
+                        .child(label),
                 )
-                .child(div().text_size(px(11.5)).text_color(rgb(SUBDUED)).child(detail)),
+                .when_some(detail, |this, detail| {
+                    this.child(div().text_size(px(10.5)).text_color(rgb(FAINT)).child(detail))
+                }),
         )
+        .child(right)
 }
 
-/// A full-width action button.
-///
-/// `accent` is what makes it the one to reach for, and the surface only ever
-/// gives it to one control at a time. A disabled button recedes rather than
-/// greys: it is still there, so pressing it is not a surprise later, but it
-/// does not compete with whatever is actually live.
-fn action_button(
+/// The one saturated control, and the only filled thing on the surface.
+fn cta(
     id: &'static str,
     label: &'static str,
-    accent: bool,
+    filled: bool,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    let (fill, text, border) = match (enabled, accent) {
-        (false, _) => (BG, FAINT, BORDER),
-        (true, true) => (ACCENT, 0xffffff, ACCENT),
-        (true, false) => (RAISED, TEXT, BORDER),
+    let (fill, text) = match (enabled, filled) {
+        (false, _) => (BG, FAINT),
+        (true, true) => (ACCENT, 0xffffff),
+        (true, false) => (ROW, TEXT),
     };
-
     div()
         .id(id)
         .flex()
         .justify_center()
         .items_center()
         .w_full()
-        .h(px(42.))
-        .rounded_md()
+        .h(px(46.))
+        .rounded_full()
         .bg(rgb(fill))
-        .border_1()
-        .border_color(rgb(border))
-        .text_size(px(14.))
-        .font_weight(if accent { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+        .when(!enabled, |this| this.border_1().border_color(rgb(BORDER)))
+        .text_size(px(14.5))
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(text))
-        // Only when it can actually be pressed. A hover that lights up a
-        // control which will not respond is a promise the surface cannot keep.
         .when(enabled, |this| {
             this.cursor_pointer()
-                .hover(|style| style.border_color(rgb(ACCENT)))
+                .hover(|style| style.bg(rgb(if filled { ACCENT_HOVER } else { ROW_HOVER })))
         })
         .child(label)
 }
 
-/// A small heading over a block of controls.
+/// One of Loom's circular footer buttons.
+fn footer_button(
+    id: &'static str,
+    glyph: &'static str,
+    label: &'static str,
+    active: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .cursor_pointer()
+        .child(
+            div()
+                .flex()
+                .justify_center()
+                .items_center()
+                .w(px(38.))
+                .h(px(38.))
+                .rounded_full()
+                .bg(rgb(if active { ROW_HOVER } else { ROW }))
+                .child(icon(glyph, 17.0, if active { ACCENT } else { SUBDUED })),
+        )
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(if active { TEXT } else { FAINT }))
+                .child(label),
+        )
+}
+
 fn section(label: &'static str) -> impl IntoElement {
     div()
-        .text_size(px(10.))
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(9.5))
+        .font_weight(FontWeight::BOLD)
         .text_color(rgb(FAINT))
         .child(label)
 }
@@ -276,134 +399,241 @@ impl Render for WinSendGpui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state();
         let target = self.target();
-        let can_send = !matches!(state, State::Blocked(_));
-        let can_retrieve = self.core.can_retrieve();
         let monitors = self.core.monitors();
-        let selected = target.as_ref().map(|m| m.id.clone());
-        let needs_monitor = matches!(&state, State::Blocked(m) if m.contains(&Missing::TargetMonitor));
-        let needs_window = matches!(&state, State::Blocked(m) if m.contains(&Missing::ZoomWindow));
-        // Exactly one control is the accent, and which one it is follows the
-        // state: Send while there is nothing out, Retrieve once there is.
-        // Pressing Send twice is already a no-op, so nothing is lost by
-        // demoting it, and the operator's eye lands on the half that matters.
-        let accent_on_retrieve = matches!(state, State::Sent);
+        let can_retrieve = self.core.can_retrieve();
+        let can_send = state != State::Blocked;
+        // Exactly one control is filled, and which one follows the state: Send
+        // while nothing is out, Retrieve once something is. Pressing Send twice
+        // is already a no-op, so nothing is lost by demoting it.
+        let sent = state == State::Sent;
 
         // Only when the shape actually changed. Resizing every frame would
         // fight the user's own drag on the window edge.
-        let wanted = wanted_height(&state, monitors.len());
+        let wanted = self.height();
         if (wanted - self.applied_height).abs() > 0.5 {
             window.resize(size(px(WIDTH), px(wanted)));
             self.applied_height = wanted;
         }
 
+        let zoom_label = self
+            .core
+            .config
+            .zoom_window
+            .as_ref()
+            .map(|w| w.title.clone())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "Zoom video window".to_string());
+        let media_label = self
+            .core
+            .config
+            .media_window
+            .as_ref()
+            .map(|w| if w.title.is_empty() { w.process_name.clone() } else { w.title.clone() })
+            .unwrap_or_else(|| "Media player".to_string());
+        let zoom_set = self.core.config.zoom_window.is_some();
+        let media_set = self.core.config.media_window.is_some();
+        let picking = self.picking_display;
+        let panel = self.panel;
+
         div()
             .flex()
             .flex_col()
             .size_full()
-            .gap_3()
-            .p_4()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .child(banner(&state, target.as_ref()))
-            // Fix what is missing where it is named, rather than in a screen
-            // the operator has to go and find.
-            .when(needs_monitor, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(section("TARGET DISPLAY"))
-                        .children(monitors.into_iter().map(|monitor| {
-                            let chosen = selected.as_deref() == Some(monitor.id.as_str());
-                            monitor_row(monitor, chosen, cx)
-                        })),
-                )
-            })
-            .when(needs_window, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(section("ZOOM VIDEO WINDOW"))
-                        .child(
-                            div()
-                                .id("confirm-zoom")
-                                .flex()
-                                .justify_center()
-                                .items_center()
-                                .w_full()
-                                .h(px(34.))
-                                .rounded_md()
-                                .bg(rgb(RAISED))
-                                .border_1()
-                                .border_color(rgb(ACCENT).opacity(0.5))
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .hover(|style| style.border_color(rgb(ACCENT)))
-                                .child("Confirm the pinned video window")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    // The picker is not ported yet. This takes
-                                    // the same path it would, on the candidate
-                                    // Core already considers most likely Zoom.
-                                    let candidate = this
-                                        .core
-                                        .candidates()
-                                        .into_iter()
-                                        .find(|candidate| candidate.likely_zoom);
-                                    match candidate {
-                                        Some(candidate) => {
-                                            let outcome = this.core.confirm_window(&candidate);
-                                            this.report(outcome);
-                                        }
-                                        None => this.status.insert(
-                                            0,
-                                            Message {
-                                                text: "No Zoom video window is open".into(),
-                                                failed: true,
-                                            },
-                                        ),
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
+            .child(header(sent, cx))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .px_4()
+                    .pb_3()
+                    // The row is the value, and opens the picker in place
+                    // rather than navigating anywhere.
                     .child(
-                        action_button("send", "Send to Monitor", !accent_on_retrieve && can_send, can_send)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.perform(Action::Send);
-                                cx.notify();
-                            })),
+                        row(
+                            "row-display",
+                            "display",
+                            target
+                                .as_ref()
+                                .map(display_name)
+                                .unwrap_or_else(|| "No target display".to_string()),
+                            target.as_ref().map(display_detail),
+                            if target.is_some() {
+                                chip(Chip::Set).into_any_element()
+                            } else {
+                                chip(Chip::Needed).into_any_element()
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.picking_display = !this.picking_display;
+                            cx.notify();
+                        })),
+                    )
+                    .when(picking, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .pt_1()
+                                .child(section("CHOOSE A DISPLAY"))
+                                .children(monitors.into_iter().map(|monitor| {
+                                    let chosen =
+                                        target.as_ref().map(|t| t.id.as_str()) == Some(&monitor.id);
+                                    picker_row(monitor, chosen, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        row(
+                            "row-zoom",
+                            "video",
+                            zoom_label,
+                            Some(if zoom_set {
+                                "confirmed".to_string()
+                            } else {
+                                "pin someone in Zoom, then confirm".to_string()
+                            }),
+                            if zoom_set {
+                                chip(Chip::Set).into_any_element()
+                            } else {
+                                chip(Chip::Needed).into_any_element()
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_zoom();
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        action_button("retrieve", "Retrieve", accent_on_retrieve, can_retrieve)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.perform(Action::Retrieve);
-                                cx.notify();
-                            })),
+                        row(
+                            "row-media",
+                            "media",
+                            media_label,
+                            Some(if media_set {
+                                "brought back by Restore Media".to_string()
+                            } else {
+                                "none selected".to_string()
+                            }),
+                            if media_set {
+                                chip(Chip::Set).into_any_element()
+                            } else {
+                                chip(Chip::Optional).into_any_element()
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.note("The media window picker is not ported yet", false);
+                            cx.notify();
+                        })),
                     ),
             )
-            .child(hotkey_strip(&self.core))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_4()
+                    .child(
+                        cta("send", "Send to Monitor", !sent && can_send, can_send).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.perform(Action::Send);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        cta("retrieve", "Retrieve", sent, can_retrieve).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.perform(Action::Retrieve);
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
             .child(status_strip(&self.status))
+            .when_some(panel, |this, panel| {
+                this.child(div().px_4().pb_2().child(match panel {
+                    Panel::Hotkeys => hotkeys_panel(&self.core).into_any_element(),
+                    Panel::Settings => settings_panel(&self.core).into_any_element(),
+                }))
+            })
+            .child(footer(panel, cx))
     }
 }
 
-/// One selectable display, named rather than described.
-fn monitor_row(
+/// The drawn header: name and live state on the left, close on the right.
+///
+/// Where Loom puts its logo. The state lives here rather than in a banner of
+/// its own, because with the rows carrying their own chips the only thing left
+/// to say at the top is whether a window is out right now.
+fn header(sent: bool, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
+    let (tone, label) = if sent { (ACCENT, "ON TARGET") } else { (FAINT, "IDLE") };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .h(px(HEADER_HEIGHT))
+        .pr_4()
+        .pl(px(TITLE_INSET))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("WinSend"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py(px(3.))
+                        .rounded_full()
+                        .bg(tint(tone, 0.16))
+                        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(tone)))
+                        .child(
+                            div()
+                                .text_size(px(9.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(tone))
+                                .child(label),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .id("close")
+                .flex()
+                .justify_center()
+                .items_center()
+                .w(px(26.))
+                .h(px(26.))
+                .rounded_full()
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(ROW)))
+                .child(icon("close", 15.0, SUBDUED))
+                .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+        )
+}
+
+/// One display in the in-place picker.
+fn picker_row(
     monitor: MonitorInfo,
     chosen: bool,
     cx: &mut Context<WinSendGpui>,
 ) -> impl IntoElement {
     let name = display_name(&monitor);
     let detail = display_detail(&monitor);
-    let id = SharedString::from(format!("monitor-{}", monitor.id));
+    let id = SharedString::from(format!("pick-{}", monitor.id));
 
     div()
         .id(id)
@@ -411,34 +641,49 @@ fn monitor_row(
         .items_center()
         .justify_between()
         .w_full()
-        .h(px(34.))
+        .h(px(PICKER_ROW))
         .px_3()
-        .rounded_md()
-        .bg(rgb(RAISED))
+        .rounded_lg()
+        .bg(rgb(ROW))
         .border_1()
-        .border_color(rgb(if chosen { ACCENT } else { BORDER }))
+        .border_color(rgb(if chosen { ACCENT } else { ROW }))
         .cursor_pointer()
-        .hover(|style| style.border_color(rgb(ACCENT)))
-        .child(
-            div()
-                .text_size(px(13.))
-                .font_weight(FontWeight::MEDIUM)
-                .child(name),
-        )
-        .child(div().text_size(px(10.5)).text_color(rgb(SUBDUED)).child(detail))
+        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .child(div().text_size(px(12.5)).child(name))
+        .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(detail))
         .on_click(cx.listener(move |this, _, _, cx| {
             let outcome = this.core.set_target_monitor(&monitor);
             this.report(outcome);
+            this.picking_display = false;
             cx.notify();
         }))
 }
 
-/// What is bound, on the live surface rather than inside the configuration.
+/// The most recent messages, newest first and brightest.
 ///
-/// These are how the application is driven during a broadcast — from inside
-/// Zoom, without focusing this window — so what they are is live state, not a
-/// setting. An unbound action says so rather than showing nothing.
-fn hotkey_strip(core: &Core) -> impl IntoElement {
+/// Keeps its height whether or not it has anything to say, so a message
+/// arriving never moves the controls above it.
+fn status_strip(status: &[Message]) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap_1()
+        .w_full()
+        .h(px(42.))
+        .px_4()
+        .children(status.iter().enumerate().map(|(age, message)| {
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(if message.failed { ERR } else { OK }))
+                .when(age > 0, |this| this.opacity(0.5))
+                .child(message.text.clone())
+        }))
+}
+
+/// What is bound. Behind a footer button rather than on the surface: with the
+/// rows carrying the setup, the live shape has room for what is urgent only.
+fn hotkeys_panel(core: &Core) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -461,28 +706,77 @@ fn hotkey_strip(core: &Core) -> impl IntoElement {
         }))
 }
 
-/// The most recent messages, newest first and brightest.
-///
-/// Older ones recede rather than disappear, which says which one just arrived
-/// without a clock the window would have to keep repainting to keep honest.
-/// The strip keeps its height whether or not it has anything to say, so a
-/// message arriving never moves the controls above it.
-fn status_strip(status: &[Message]) -> impl IntoElement {
+/// Read-only for now: the toggles write through `Core` in the eframe surface,
+/// and duplicating that here before the front end is chosen would be two
+/// places to keep one setting true.
+fn settings_panel(core: &Core) -> impl IntoElement {
+    let settings = [
+        ("Minimize others on target", core.config.clear_target),
+        ("Strip window frame", core.config.borderless),
+        ("Fade out on Retrieve", core.config.fade_on_retrieve),
+        ("Restore full-screen video", core.config.restore_fullscreen),
+    ];
+
     div()
         .flex()
         .flex_col()
-        .justify_end()
         .gap_1()
         .w_full()
-        .h(px(46.))
-        .pt_2()
+        .child(section("SETTINGS"))
+        .children(settings.into_iter().map(|(label, on)| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .h(px(22.))
+                .text_size(px(11.))
+                .child(div().text_color(rgb(SUBDUED)).child(label))
+                .child(if on {
+                    icon("check", 13.0, OK).into_any_element()
+                } else {
+                    div().text_size(px(10.)).text_color(rgb(FAINT)).child("off").into_any_element()
+                })
+        }))
+}
+
+/// Loom's row of circular buttons, for what is occasionally needed and never
+/// urgent.
+fn footer(open: Option<Panel>, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
+    div()
+        .flex()
+        .justify_around()
+        .items_center()
+        .w_full()
+        .pt_3()
+        .pb_3()
+        .px_4()
         .border_t_1()
         .border_color(rgb(BORDER))
-        .children(status.iter().enumerate().map(|(age, message)| {
-            div()
-                .text_size(px(11.5))
-                .text_color(rgb(if message.failed { ERR } else { OK }))
-                .when(age > 0, |this| this.opacity(0.55))
-                .child(message.text.clone())
-        }))
+        .child(
+            footer_button("f-hotkeys", "keyboard", "Hotkeys", open == Some(Panel::Hotkeys))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.panel = (this.panel != Some(Panel::Hotkeys)).then_some(Panel::Hotkeys);
+                    cx.notify();
+                })),
+        )
+        .child(
+            footer_button("f-settings", "settings", "Settings", open == Some(Panel::Settings))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.panel = (this.panel != Some(Panel::Settings)).then_some(Panel::Settings);
+                    cx.notify();
+                })),
+        )
+        .child(
+            footer_button("f-diagnostics", "info", "Diagnostics", false).on_click(cx.listener(
+                |this, _, _, cx| {
+                    // The clipboard first, because the file lands in AppData,
+                    // which Explorer hides by default.
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(this.core.diagnostics()));
+                    let saved = this.core.save_diagnostics();
+                    this.report(saved.map(|where_to| format!("Copied. {where_to}")));
+                    cx.notify();
+                },
+            )),
+        )
 }
