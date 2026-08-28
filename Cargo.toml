@@ -7,17 +7,30 @@ description = "Sends Zoom's dual-monitor video window to a chosen display and ba
 license = "MIT"
 repository = "https://github.com/brueshi/WinSend"
 
+[lib]
+name = "winsend"
+path = "src/lib.rs"
+
 [[bin]]
 name = "winsend"
-path = "src/main.rs"
+path = "src/bin/winsend.rs"
+required-features = ["eframe-ui"]
+
+# One feature per front end, so a second one can be added beside this without
+# either binary linking the other's toolkit. That matters for measuring: a size
+# or start-up number taken from a binary carrying both is not a number about
+# either of them.
+[features]
+default = ["eframe-ui"]
+eframe-ui = ["dep:eframe", "dep:raw-window-handle"]
 
 [dependencies]
-eframe = "0.33.3"
+eframe = { version = "0.33.3", optional = true }
 # Only to read our own window's handle out of eframe, which hands it back as a
 # `RawWindowHandle` and does not re-export the crate that names the type. The
 # version tracks eframe's own, since a mismatched major would be a different
 # type entirely and the handle would not convert.
-raw-window-handle = "0.6.2"
+raw-window-handle = { version = "0.6.2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 for checking a download against the digest the release publishes.

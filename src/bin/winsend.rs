@@ -1,50 +1,12 @@
-// No console window on Windows release builds; this is a GUI utility.
+//! The eframe front end.
+//!
+//! No console window on Windows release builds; this is a GUI utility.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod app;
-mod config;
-mod core;
-mod hotkey;
-mod identity;
-mod mock;
-mod platform;
-mod shell;
-mod update;
-#[cfg(windows)]
-mod github;
-#[cfg(windows)]
-mod win32;
-#[cfg(windows)]
-mod win32_shell;
-
-use app::WinSendApp;
-use config::Config;
-use core::Core;
-use platform::Platform;
-
-/// Real Win32 on Windows, the fake desktop everywhere else. Setting
-/// `WINSEND_MOCK=1` forces the mock on Windows too, which is useful for
-/// working on the UI without a meeting running.
-fn select_platform() -> Box<dyn Platform> {
-    let forced_mock = std::env::var("WINSEND_MOCK").is_ok_and(|v| v == "1");
-
-    #[cfg(windows)]
-    if !forced_mock {
-        return Box::new(win32::Win32Platform::new());
-    }
-
-    let _ = forced_mock;
-    Box::new(mock::MockPlatform::new())
-}
-
-/// The window and taskbar icon, as raw RGBA rather than an encoded image.
-///
-/// Written out already decoded by `tools/make_icon.py`, so setting it costs an
-/// include and two constants instead of an image decoder pulled in to unpack
-/// one 64-pixel square at startup. This is separate from the icon compiled into
-/// the executable's resources, which is what Explorer shows on the file.
-const WINDOW_ICON: &[u8] = include_bytes!("../assets/winsend-64.rgba");
-const WINDOW_ICON_SIZE: u32 = 64;
+use winsend::app::{self, WinSendApp};
+use winsend::config::Config;
+use winsend::core::Core;
+use winsend::{select_platform, update, WINDOW_ICON, WINDOW_ICON_SIZE};
 
 fn window_icon() -> eframe::egui::IconData {
     eframe::egui::IconData {
