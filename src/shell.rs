@@ -107,9 +107,9 @@ pub trait Shell {
     fn poll(&self) -> Vec<ShellEvent>;
 
     /// Escape hatch for the mock-only debug controls, mirroring
-    /// [`crate::platform::Platform::as_mock`]. Absent from Windows builds, so
-    /// it cannot leak into the shipped binary.
-    #[cfg(not(windows))]
+    /// [`crate::platform::Platform::as_mock`]. Absent from a shipped Windows
+    /// binary, present when its tests are compiled.
+    #[cfg(any(not(windows), test))]
     fn as_mock(&self) -> Option<&crate::mock::MockShell> {
         None
     }

@@ -327,9 +327,11 @@ pub trait Platform {
     /// the hard cut this replaced was merely unremarkable.
     fn clear_window_opacity(&self, handle: u64) -> Result<(), PlatformError>;
 
-    /// Escape hatch for the mock-only debug controls. Absent from Windows
-    /// builds entirely, so it cannot leak into the shipped binary.
-    #[cfg(not(windows))]
+    /// Escape hatch for the mock-only debug controls. Absent from a shipped
+    /// Windows binary, so it cannot leak into one — but present when that
+    /// binary's tests are compiled, which is the only way the suite can run on
+    /// Windows at all.
+    #[cfg(any(not(windows), test))]
     fn as_mock(&self) -> Option<&crate::mock::MockPlatform> {
         None
     }
