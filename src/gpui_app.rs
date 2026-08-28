@@ -36,6 +36,7 @@ use crate::core::{Core, Failure};
 use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::{MonitorInfo, WindowCandidate};
 use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
+use crate::update::{self, Release, UpdateEvent, Updater};
 use crate::watch::{Fade, MediaRestore, SettleClock, Started, Tick, SETTLE_LOOK};
 
 pub const WIDTH: f32 = 340.0;
@@ -307,6 +308,25 @@ enum Chip {
     Optional,
 }
 
+/// What the updater has found, and how far the user has got with it.
+///
+/// Nothing here happens on its own. The check makes an indicator appear and
+/// that is the whole of its effect; every step after it is a click, because
+/// the one thing this feature must never do is restart the application in the
+/// middle of a broadcast.
+enum UpdateState {
+    /// Nothing to say. Either the check found nothing newer, or it never
+    /// answered at all — which look the same on purpose.
+    Quiet,
+    /// A newer release is waiting to be asked for.
+    Available(Release),
+    /// Asked for while a window was still sent, so the warning is up.
+    Confirming(Release),
+    /// Downloading and swapping. The release is kept so a failure can put the
+    /// offer back rather than losing it.
+    Installing(Release),
+}
+
 #[derive(Clone)]
 struct Message {
     text: SharedString,
@@ -367,6 +387,11 @@ pub struct WinSendGpui {
     /// The full-screen watch on put-back players, if one is running.
     media_restore: Option<MediaRestore>,
     media_seq: u64,
+    updater: Box<dyn Updater>,
+    update: UpdateState,
+    /// Set when an update has been installed, so `main` can start the new
+    /// executable after this one has finished putting the desktop back.
+    relaunch: Arc<std::sync::atomic::AtomicBool>,
     /// Which fade the running stepper belongs to, so a fade ended early
     /// cannot be advanced by the task armed for the one before it. The same
     /// guard the toast uses, for the same reason.
@@ -402,7 +427,12 @@ pub struct WinSendGpui {
 }
 
 impl WinSendGpui {
-    pub fn new(core: Core, window: &Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        core: Core,
+        relaunch: Arc<std::sync::atomic::AtomicBool>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Once, here, because the window exists by the time this runs and
         // neither of the two things below is something that needs
         // re-asserting per frame.
@@ -421,6 +451,16 @@ impl WinSendGpui {
         let shell = shell::create(Arc::new(|| {}));
         shell.apply_hotkeys(core.config.hotkeys);
 
+        // The same no-op waker, for the same reason: the updater answers from
+        // a thread of its own and `poll_shell` drains it on the same timer.
+        let updater = update::create(Arc::new(|| {}));
+        // Once per launch, and only if the user has not turned it off. Never
+        // blocking: this returns immediately and the answer arrives later or
+        // not at all.
+        if core.config.check_for_updates {
+            updater.check();
+        }
+
         let mut app = Self {
             core,
             shell,
@@ -431,6 +471,9 @@ impl WinSendGpui {
             settle_seq: 0,
             media_restore: None,
             media_seq: 0,
+            updater,
+            update: UpdateState::Quiet,
+            relaunch,
             toast: None,
             toast_seq: 0,
             toast_leaving: false,
@@ -460,9 +503,13 @@ impl WinSendGpui {
                 let updated = this
                     .update_in(cx, |this, window, cx| {
                         let events = this.shell.poll();
-                        let anything = !events.is_empty();
+                        let found = this.updater.poll();
+                        let anything = !events.is_empty() || !found.is_empty();
                         for event in events {
                             this.handle(event, window, cx);
+                        }
+                        for event in found {
+                            this.handle_update(event, cx);
                         }
                         // Cheap every time: the shell drops a state that has
                         // not moved rather than talking to the OS about it.
@@ -511,6 +558,48 @@ impl WinSendGpui {
                 cx.quit();
             }
         }
+    }
+
+    /// Take in whatever the updater has found.
+    fn handle_update(&mut self, event: UpdateEvent, cx: &mut Context<Self>) {
+        match event {
+            UpdateEvent::Available(release) => self.update = UpdateState::Available(release),
+            // The executable on disk is the new one now, so this process has
+            // to give way to it. `main` starts the replacement once this one
+            // has finished putting the desktop back.
+            UpdateEvent::Installed => {
+                self.relaunch.store(true, std::sync::atomic::Ordering::SeqCst);
+                cx.quit();
+            }
+            // The old executable is still the one on disk, so the offer goes
+            // back up rather than disappearing with the explanation.
+            UpdateEvent::Failed(why) => {
+                self.note(&why, true, cx);
+                if let UpdateState::Installing(release) =
+                    std::mem::replace(&mut self.update, UpdateState::Quiet)
+                {
+                    self.update = UpdateState::Available(release);
+                }
+            }
+        }
+    }
+
+    /// Ask for the update, or warn first when warning is the point.
+    ///
+    /// `Core` holds the restore point in memory and it is session-scoped by
+    /// design, so restarting while a window is still sent leaves Zoom on the
+    /// wrong monitor with nothing left able to put it back.
+    fn ask_to_install(&mut self, release: Release) {
+        if self.core.can_retrieve() {
+            self.update = UpdateState::Confirming(release);
+            return;
+        }
+        self.install(release);
+    }
+
+    fn install(&mut self, release: Release) {
+        self.updater.install(release.clone());
+        self.update = UpdateState::Installing(release);
     }
 
     /// Keep the tray icon in step with the window.
@@ -1254,6 +1343,8 @@ impl Render for WinSendGpui {
         let capturing = self.capturing;
 
         let panel = self.side.map(|side| self.side_panel(side, cx).into_any_element());
+        // Over the surface, so the decision it asks for cannot be missed.
+        let confirm = self.confirm_restart(cx);
 
         div()
             .track_focus(&self.focus_handle)
@@ -1291,7 +1382,8 @@ impl Render for WinSendGpui {
             })
                     .when_some(self.toast.clone(), |this, message| {
                         this.child(toast(&message, self.toast_leaving, cx))
-                    }),
+                    })
+                    .children(confirm),
             )
             .children(panel)
     }
@@ -1465,8 +1557,153 @@ impl WinSendGpui {
         });
 
         header_shell()
-            .child(div().children(chip))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .children(chip)
+                    .children(self.update_pill(cx)),
+            )
             .child(header_controls(cx))
+    }
+
+    /// The update indicator, and every state after it.
+    ///
+    /// In the header rather than on the surface, because it is the only thing
+    /// here that appears without being asked for and the header is already
+    /// where this window puts what it has to volunteer. Nothing is shown until
+    /// a check has found something, and the click is the whole of what it
+    /// does: downloading and restarting never happen on their own.
+    fn update_pill(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let pill = |tone: u32, label: String| {
+            div()
+                .flex()
+                .items_center()
+                .px_2()
+                .py(px(4.))
+                .rounded_full()
+                .bg(tint(tone, 0.16))
+                .text_size(px(9.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(tone))
+                .child(label)
+        };
+
+        match &self.update {
+            UpdateState::Quiet | UpdateState::Confirming(_) => None,
+            UpdateState::Installing(_) => {
+                Some(pill(ACCENT, "UPDATING".to_string()).into_any_element())
+            }
+            UpdateState::Available(release) => {
+                let release = release.clone();
+                Some(
+                    pill(WARM, format!("UPDATE {}", release.version))
+                        .id("update")
+                        .cursor_pointer()
+                        .hover(|style| style.bg(tint(WARM, 0.28)))
+                        .active(|style| style.opacity(0.7))
+                        // Otherwise the press drags the window from the header
+                        // instead of arming the button.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ask_to_install(release.clone());
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                )
+            }
+        }
+    }
+
+    /// The warning, over the surface, because it is a decision and not a
+    /// setting.
+    ///
+    /// `Core` holds the restore point in memory and it is session-scoped by
+    /// design, so restarting while a window is still sent leaves Zoom on the
+    /// target display with nothing left able to put it back.
+    fn confirm_restart(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let UpdateState::Confirming(release) = &self.update else {
+            return None;
+        };
+        let release = release.clone();
+        let (retrieving, anyway) = (release.clone(), release.clone());
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .px_4()
+                // A scrim rather than a bare card: what is underneath is still
+                // the live surface, and a decision this one must not be
+                // answerable by clicking past it.
+                .bg(tint(0x000000, 0.62))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .w_full()
+                        .p_4()
+                        .rounded_2xl()
+                        .bg(rgb(row_fill()))
+                        .border_1()
+                        .border_color(rgb(border()))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format!("Update to {}", release.version)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(subdued()))
+                                .pb_1()
+                                .child(
+                                    "A window is still sent. Where it came from is only \
+                                     remembered for as long as this is running, so restarting \
+                                     now leaves it on the target display with nothing able to \
+                                     put it back.",
+                                ),
+                        )
+                        .child(
+                            cta("update-retrieve", "Retrieve, then update", Some(ACCENT), true)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // Straight through Core rather than the
+                                    // fade: the point is to be finished before
+                                    // anything restarts, and an animation would
+                                    // only put 200ms between the decision and
+                                    // the thing it was guarding.
+                                    let outcome = this.core.retrieve();
+                                    let restored = outcome.is_ok();
+                                    this.report(outcome, cx);
+                                    this.arm_watches(cx);
+                                    if restored {
+                                        this.install(retrieving.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(cta("update-anyway", "Update anyway", None, true).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.install(anyway.clone());
+                                cx.notify();
+                            }),
+                        ))
+                        .child(cta("update-later", "Not now", None, true).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.update = UpdateState::Available(release.clone());
+                                cx.notify();
+                            },
+                        ))),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A sub-surface's header: a way back, and what this is.
@@ -1836,6 +2073,31 @@ impl WinSendGpui {
                             },
                         ))
                     }),
+                ))
+                .child(heading("MOCK UPDATE"))
+                // Walks the whole update flow without the network: the canned
+                // response goes through the same parsing and comparison the
+                // real updater uses, so what is exercised here is the real
+                // decision.
+                .child(strip().children(
+                    [("mock-offer", "Offer", false), ("mock-offer-fails", "Offer, fails", true)]
+                        .map(|(id, label, fails)| {
+                            small_button(id.into(), label).on_click(cx.listener(
+                                move |this, _, _, _| {
+                                    if let Some(mock) = this.updater.as_mock() {
+                                        if fails {
+                                            mock.set_install_failure(
+                                                "the download did not match its checksum",
+                                            );
+                                        }
+                                        mock.set_response(
+                                            &crate::mock::MockUpdater::release_list("99.0.0"),
+                                        );
+                                        mock.check();
+                                    }
+                                },
+                            ))
+                        }),
                 ))
                 .child(
                     div()
