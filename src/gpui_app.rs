@@ -65,8 +65,17 @@ const BORDER: u32 = 0x303030;
 const TEXT: u32 = 0xf2f2f2;
 const SUBDUED: u32 = 0x8f8f8f;
 const FAINT: u32 = 0x5e5e5e;
+/// Selection, and the action that puts something out.
 const ACCENT: u32 = 0x4e8ef0;
 const ACCENT_HOVER: u32 = 0x6ba2f5;
+/// Retrieve, once there is something to retrieve.
+///
+/// Warm because of what it is for. Send is the considered half — nothing is on
+/// air yet and there is time. Retrieve is the half pressed when something is
+/// already out and needs to come back, which is the closest thing this has to
+/// an emergency, and it is worth being the one warm thing on the surface.
+const WARM: u32 = 0xe8593f;
+const WARM_HOVER: u32 = 0xf06a52;
 const OK: u32 = 0x66bb7a;
 const WARN: u32 = 0xe0a458;
 const ERR: u32 = 0xe26a6a;
@@ -239,6 +248,19 @@ impl WinSendGpui {
             Ok("select") => self.open_picker(PickerFor::Zoom),
             Ok("media") => self.open_picker(PickerFor::Media),
             Ok("display") => self.picking_display = true,
+            // Goes through Core against the mock desktop, so what is on
+            // screen afterwards is the real sent state rather than a flag.
+            // The window has to be confirmed first: the config remembers what
+            // it was, but a handle does not survive a restart, and Send
+            // re-validates one on every use.
+            Ok("sent") => {
+                if let Some(candidate) =
+                    self.core.candidates().into_iter().find(|c| c.likely_zoom)
+                {
+                    drop(self.core.confirm_window(&candidate));
+                    drop(self.core.send());
+                }
+            }
             Ok("settings") => self.screen = Screen::Settings,
             Ok("hotkeys") => self.screen = Screen::Hotkeys,
             _ => {}
@@ -502,13 +524,18 @@ fn row(
 fn cta(
     id: &'static str,
     label: &'static str,
-    filled: bool,
+    filled: Option<u32>,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
     let (fill, text) = match (enabled, filled) {
         (false, _) => (BG, FAINT),
-        (true, true) => (ACCENT, 0xffffff),
-        (true, false) => (ROW, TEXT),
+        (true, Some(accent)) => (accent, 0xffffff),
+        (true, None) => (ROW, TEXT),
+    };
+    let hover = match filled {
+        Some(ACCENT) => ACCENT_HOVER,
+        Some(_) => WARM_HOVER,
+        None => ROW_HOVER,
     };
     div()
         .id(id)
@@ -525,7 +552,7 @@ fn cta(
         .text_color(rgb(text))
         .when(enabled, |this| {
             this.cursor_pointer()
-                .hover(|style| style.bg(rgb(if filled { ACCENT_HOVER } else { ROW_HOVER })))
+                .hover(|style| style.bg(rgb(hover)))
                 // Presses register. Without it the only feedback that a click
                 // landed is whatever the action itself does, which for Send is
                 // a window moving on another display.
@@ -790,7 +817,16 @@ impl WinSendGpui {
                     .px_4()
                     .pb_4()
                     .child(
-                        cta("send", "Send to Monitor", !sent && can_send, can_send).on_click(
+                        cta(
+                            "send",
+                            "Send to Monitor",
+                            // Quiet while a picker is open: nothing is sent
+                            // mid-configuration, and the open row already owns
+                            // the accent.
+                            (!sent && can_send && !picking).then_some(ACCENT),
+                            can_send,
+                        )
+                        .on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.perform(Action::Send, cx);
                                 cx.notify();
@@ -798,7 +834,7 @@ impl WinSendGpui {
                         ),
                     )
                     .child(
-                        cta("retrieve", "Retrieve", sent, can_retrieve).on_click(cx.listener(
+                        cta("retrieve", "Retrieve", sent.then_some(WARM), can_retrieve).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.perform(Action::Retrieve, cx);
                                 cx.notify();
