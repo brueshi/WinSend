@@ -46,7 +46,7 @@ pub const HEIGHT: f32 = 416.0;
 const CANDIDATE_ROW: f32 = 79.0;
 /// Beyond this the list scrolls rather than the window growing off the screen.
 const PICKER_MAX_HEIGHT: f32 = 620.0;
-const SETTINGS_HEIGHT: f32 = 454.0;
+const SETTINGS_HEIGHT: f32 = 512.0;
 const HOTKEYS_HEIGHT: f32 = 260.0;
 
 /// What an expanded block adds.
@@ -56,16 +56,113 @@ const ROW_HEIGHT: f32 = 56.0;
 const ROW_GAP: f32 = 10.0;
 const BLOCK_GAP: f32 = 12.0;
 
-const BG: u32 = 0x141414;
-/// The row fill. Loom's rows are a light grey against white; this is the same
-/// one-step lift against the panel.
-const ROW: u32 = 0x232323;
-const ROW_HOVER: u32 = 0x2e2e2e;
-const BORDER: u32 = 0x303030;
-const TEXT: u32 = 0xf2f2f2;
-const SUBDUED: u32 = 0x8f8f8f;
-const FAINT: u32 = 0x5e5e5e;
-/// Selection, and the action that puts something out.
+/// The colours the surface is drawn from.
+///
+/// Read through functions rather than named as constants, because the whole
+/// point is that they change: a parameter threaded through forty layout
+/// helpers would be forty signatures describing a thing none of them decide.
+/// GPUI's own theme is a global for the same reason.
+struct Palette {
+    bg: u32,
+    /// The row fill, one step off the panel.
+    row: u32,
+    row_hover: u32,
+    border: u32,
+    text: u32,
+    subdued: u32,
+    faint: u32,
+    /// What a chip's own colour is read against.
+    chip_text: u32,
+    ok: u32,
+    warn: u32,
+    err: u32,
+}
+
+/// Dark is the default, and the reason is specific to this application rather
+/// than a matter of taste: it sits on screen during a live broadcast, where a
+/// white panel spills light onto the operator and clashes with the rest of the
+/// production kit. Light is offered for everywhere else.
+const DARK: Palette = Palette {
+    bg: 0x141414,
+    row: 0x232323,
+    row_hover: 0x2e2e2e,
+    border: 0x303030,
+    text: 0xf2f2f2,
+    subdued: 0x8f8f8f,
+    faint: 0x5e5e5e,
+    chip_text: 0x141414,
+    ok: 0x66bb7a,
+    warn: 0xe0a458,
+    err: 0xe26a6a,
+};
+
+/// Loom's own panel, near enough: a white surface with rows a step darker
+/// rather than a step lighter. The status colours are darkened, because the
+/// dark ones were chosen to carry against near-black and wash out on white.
+const LIGHT: Palette = Palette {
+    bg: 0xffffff,
+    row: 0xf1f2f4,
+    row_hover: 0xe6e8ec,
+    border: 0xdfe1e6,
+    text: 0x1a1c1f,
+    subdued: 0x6b7280,
+    faint: 0x9aa1ac,
+    chip_text: 0xffffff,
+    ok: 0x2e8b4f,
+    warn: 0xb26a12,
+    err: 0xc4322a,
+};
+
+/// Which palette is live. A `u8` rather than a lock: it is written when the
+/// setting is toggled and read while laying out, both on the one thread GPUI
+/// renders from.
+static PALETTE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn set_palette(light: bool) {
+    PALETTE.store(u8::from(light), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn palette() -> &'static Palette {
+    if PALETTE.load(std::sync::atomic::Ordering::Relaxed) == 1 { &LIGHT } else { &DARK }
+}
+
+fn bg() -> u32 {
+    palette().bg
+}
+fn row_fill() -> u32 {
+    palette().row
+}
+fn row_hover() -> u32 {
+    palette().row_hover
+}
+fn border() -> u32 {
+    palette().border
+}
+fn text() -> u32 {
+    palette().text
+}
+fn subdued() -> u32 {
+    palette().subdued
+}
+fn faint() -> u32 {
+    palette().faint
+}
+fn chip_text() -> u32 {
+    palette().chip_text
+}
+fn ok() -> u32 {
+    palette().ok
+}
+fn warn() -> u32 {
+    palette().warn
+}
+fn err() -> u32 {
+    palette().err
+}
+
+/// Selection, and the action that puts something out. The same in both
+/// palettes: it is the one thing that should read identically wherever this
+/// is running.
 const ACCENT: u32 = 0x4e8ef0;
 const ACCENT_HOVER: u32 = 0x6ba2f5;
 /// Retrieve, once there is something to retrieve.
@@ -76,9 +173,8 @@ const ACCENT_HOVER: u32 = 0x6ba2f5;
 /// an emergency, and it is worth being the one warm thing on the surface.
 const WARM: u32 = 0xe8593f;
 const WARM_HOVER: u32 = 0xf06a52;
-const OK: u32 = 0x66bb7a;
-const WARN: u32 = 0xe0a458;
-const ERR: u32 = 0xe26a6a;
+/// What sits on top of an accent or warm fill, in either palette.
+const ON_ACCENT: u32 = 0xffffff;
 
 /// How long a toast stays up.
 ///
@@ -234,6 +330,7 @@ impl WinSendGpui {
             focus_handle: cx.focus_handle(),
             applied_height: HEIGHT,
         };
+        set_palette(app.core.config.light_theme);
         app.open_requested_screen();
         app
     }
@@ -442,15 +539,16 @@ fn display_detail(monitor: &MonitorInfo) -> String {
 /// The chip on the right of a row: Loom's "Off"/"On" pill.
 fn chip(kind: Chip, on_accent: bool) -> impl IntoElement {
     let (label, colour) = match kind {
-        Chip::Set => ("SET", OK),
-        Chip::Needed => ("NEEDED", WARN),
-        Chip::Optional => ("OPTIONAL", FAINT),
+        Chip::Set => ("SET", ok()),
+        Chip::Needed => ("NEEDED", warn()),
+        Chip::Optional => ("OPTIONAL", faint()),
         Chip::Likely => ("LIKELY", ACCENT),
     };
     // Solid rather than tinted, the way Loom's "Off" is solid red: a chip that
     // is a wash of its own colour reads as decoration. On an accent row it
     // inverts to white, since the fill it was carrying is now the row.
-    let (fill, text) = if on_accent { (0xffffff, ACCENT) } else { (colour, BG) };
+    let (fill, label_tone) =
+        if on_accent { (ON_ACCENT, ACCENT) } else { (colour, chip_text()) };
 
     div()
         .flex_none()
@@ -461,7 +559,7 @@ fn chip(kind: Chip, on_accent: bool) -> impl IntoElement {
         .bg(rgb(fill))
         .text_size(px(9.))
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(text))
+        .text_color(rgb(label_tone))
         .child(label)
 }
 
@@ -482,9 +580,9 @@ fn row(
     // than a border, and it ties the panel that opened to the thing that
     // opened it without an arrow drawn between them.
     let (fill, hover_fill, glyph_tone, label_tone) = match (open, muted) {
-        (true, _) => (ACCENT, ACCENT, 0xffffff, 0xffffff),
-        (false, true) => (ROW, ROW_HOVER, SUBDUED, SUBDUED),
-        (false, false) => (ROW, ROW_HOVER, TEXT, TEXT),
+        (true, _) => (ACCENT, ACCENT, ON_ACCENT, ON_ACCENT),
+        (false, true) => (row_fill(), row_hover(), subdued(), subdued()),
+        (false, false) => (row_fill(), row_hover(), text(), text()),
     };
 
     div()
@@ -528,14 +626,14 @@ fn cta(
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
     let (fill, text) = match (enabled, filled) {
-        (false, _) => (BG, FAINT),
-        (true, Some(accent)) => (accent, 0xffffff),
-        (true, None) => (ROW, TEXT),
+        (false, _) => (bg(), faint()),
+        (true, Some(accent)) => (accent, ON_ACCENT),
+        (true, None) => (row_fill(), text()),
     };
     let hover = match filled {
         Some(ACCENT) => ACCENT_HOVER,
         Some(_) => WARM_HOVER,
-        None => ROW_HOVER,
+        None => row_hover(),
     };
     div()
         .id(id)
@@ -546,7 +644,7 @@ fn cta(
         .h(px(46.))
         .rounded_full()
         .bg(rgb(fill))
-        .when(!enabled, |this| this.border_1().border_color(rgb(BORDER)))
+        .when(!enabled, |this| this.border_1().border_color(rgb(border())))
         .text_size(px(14.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(text))
@@ -583,14 +681,14 @@ fn footer_button(
         .cursor_pointer()
         .active(|style| style.opacity(0.6))
         .child(
-            icon(glyph, 19.0, SUBDUED)
-                .group_hover(id, |style| style.text_color(rgb(TEXT))),
+            icon(glyph, 19.0, subdued())
+                .group_hover(id, |style| style.text_color(rgb(text()))),
         )
         .child(
             div()
                 .text_size(px(10.))
-                .text_color(rgb(SUBDUED))
-                .group_hover(id, |style| style.text_color(rgb(TEXT)))
+                .text_color(rgb(subdued()))
+                .group_hover(id, |style| style.text_color(rgb(text())))
                 .child(label),
         )
 }
@@ -599,7 +697,7 @@ fn section(label: &'static str) -> impl IntoElement {
     div()
         .text_size(px(9.5))
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(FAINT))
+        .text_color(rgb(faint()))
         .child(label)
 }
 
@@ -665,8 +763,8 @@ impl Render for WinSendGpui {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(rgb(bg()))
+            .text_color(rgb(text()))
             // Armed only while a binding is being captured, so ordinary typing
             // in the window is never swallowed.
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -897,9 +995,9 @@ impl WinSendGpui {
                         .h(px(26.))
                         .rounded_full()
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(ROW_HOVER)))
+                        .hover(|style| style.bg(rgb(row_hover())))
                         .active(|style| style.opacity(0.6))
-                        .child(icon("back", 15.0, SUBDUED))
+                        .child(icon("back", 15.0, subdued()))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.screen = Screen::Main;
@@ -941,7 +1039,7 @@ impl WinSendGpui {
             .px_4()
             .pb_4()
             .overflow_y_scroll()
-            .child(div().text_size(px(11.)).text_color(rgb(SUBDUED)).pb_1().child(hint))
+            .child(div().text_size(px(11.)).text_color(rgb(subdued())).pb_1().child(hint))
             .when(candidates.is_empty(), |this| {
                 this.child(
                     div()
@@ -949,7 +1047,7 @@ impl WinSendGpui {
                         .justify_center()
                         .py_8()
                         .text_size(px(12.))
-                        .text_color(rgb(FAINT))
+                        .text_color(rgb(faint()))
                         .child("Nothing to choose from"),
                 )
             })
@@ -991,6 +1089,13 @@ impl WinSendGpui {
                 Setting::RestoreFullscreen,
             ),
             (
+                "set-theme",
+                "Light theme",
+                "Dark avoids spilling light in a broadcast",
+                config.light_theme,
+                Setting::LightTheme,
+            ),
+            (
                 "set-updates",
                 "Check for updates on startup",
                 "Nothing downloads until you click it",
@@ -1021,9 +1126,9 @@ impl WinSendGpui {
                     .h(px(38.))
                     .mt_2()
                     .rounded_full()
-                    .bg(rgb(ROW))
+                    .bg(rgb(row_fill()))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(ROW_HOVER)))
+                    .hover(|style| style.bg(rgb(row_hover())))
                     .active(|style| style.opacity(0.7))
                     .text_size(px(12.))
                     .child("Copy diagnostics")
@@ -1063,7 +1168,7 @@ impl WinSendGpui {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(SUBDUED))
+                    .text_color(rgb(subdued()))
                     .pb_1()
                     .child("Work from inside Zoom, without focusing this window."),
             )
@@ -1077,6 +1182,7 @@ impl WinSendGpui {
 /// list above stays a table of what exists rather than a list of callbacks.
 #[derive(Clone, Copy)]
 enum Setting {
+    LightTheme,
     ClearTarget,
     Borderless,
     Fade,
@@ -1087,6 +1193,12 @@ enum Setting {
 impl Setting {
     fn apply(self, core: &mut Core, on: bool) -> Result<(), String> {
         match self {
+            Setting::LightTheme => {
+                // The palette is read while laying out, so it has to change
+                // before the frame that follows this press.
+                set_palette(on);
+                core.set_light_theme(on)
+            }
             Setting::ClearTarget => core.set_clear_target(on),
             Setting::Borderless => core.set_borderless(on),
             Setting::Fade => core.set_fade_on_retrieve(on),
@@ -1157,9 +1269,9 @@ fn candidate_row(
         .w_full()
         .p_2()
         .rounded_2xl()
-        .bg(rgb(ROW))
+        .bg(rgb(row_fill()))
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .hover(|style| style.bg(rgb(row_hover())))
         .active(|style| style.opacity(0.7))
         .child(match thumbnail {
             Some(image) => img(image)
@@ -1176,9 +1288,9 @@ fn candidate_row(
                 .w(px(96.))
                 .h(px(54.))
                 .rounded_lg()
-                .bg(rgb(BG))
+                .bg(rgb(bg()))
                 .text_size(px(9.))
-                .text_color(rgb(FAINT))
+                .text_color(rgb(faint()))
                 .child("no preview")
                 .into_any_element(),
         })
@@ -1199,14 +1311,14 @@ fn candidate_row(
                 .child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(SUBDUED))
+                        .text_color(rgb(subdued()))
                         .truncate()
                         .child(detail),
                 )
                 .child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(FAINT))
+                        .text_color(rgb(faint()))
                         .truncate()
                         .child(where_to),
                 ),
@@ -1237,9 +1349,9 @@ fn setting_row(
         .w_full()
         .p_3()
         .rounded_2xl()
-        .bg(rgb(ROW))
+        .bg(rgb(row_fill()))
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .hover(|style| style.bg(rgb(row_hover())))
         .active(|style| style.opacity(0.7))
         .child(
             div()
@@ -1254,7 +1366,7 @@ fn setting_row(
                         .font_weight(FontWeight::MEDIUM)
                         .child(label),
                 )
-                .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(detail)),
+                .child(div().text_size(px(10.)).text_color(rgb(faint())).child(detail)),
         )
         .child(switch(on))
         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1274,10 +1386,10 @@ fn switch(on: bool) -> impl IntoElement {
         .h(px(20.))
         .p(px(2.))
         .rounded_full()
-        .bg(if on { rgb(ACCENT).into() } else { tint(TEXT, 0.12) })
+        .bg(if on { rgb(ACCENT).into() } else { tint(text(), 0.12) })
         .when(!on, |this| this.justify_start())
         .when(on, |this| this.justify_end())
-        .child(div().w(px(16.)).h(px(16.)).rounded_full().bg(rgb(0xffffff)))
+        .child(div().w(px(16.)).h(px(16.)).rounded_full().bg(rgb(ON_ACCENT)))
 }
 
 /// One action, its binding, and the controls that change it.
@@ -1300,7 +1412,7 @@ fn binding_row(
         .h(px(52.))
         .px_4()
         .rounded_2xl()
-        .bg(rgb(ROW))
+        .bg(rgb(row_fill()))
         .child(
             div()
                 .flex()
@@ -1323,12 +1435,12 @@ fn binding_row(
                     match &bound {
                         Some(hotkey) => div()
                             .text_size(px(10.5))
-                            .text_color(rgb(SUBDUED))
+                            .text_color(rgb(subdued()))
                             .child(hotkey.to_string())
                             .into_any_element(),
                         None => div()
                             .text_size(px(10.5))
-                            .text_color(rgb(FAINT))
+                            .text_color(rgb(faint()))
                             .child("not set")
                             .into_any_element(),
                     }
@@ -1364,9 +1476,9 @@ fn small_button(id: SharedString, label: &'static str) -> gpui::Stateful<gpui::D
         .h(px(26.))
         .px_3()
         .rounded_full()
-        .bg(rgb(BG))
+        .bg(rgb(bg()))
         .border_1()
-        .border_color(rgb(BORDER))
+        .border_color(rgb(border()))
         .cursor_pointer()
         .hover(|style| style.border_color(rgb(ACCENT)))
         .active(|style| style.opacity(0.7))
@@ -1389,9 +1501,9 @@ fn chrome_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::
         .h(px(28.))
         .rounded_full()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .hover(|style| style.bg(rgb(row_hover())))
         .active(|style| style.opacity(0.6))
-        .child(icon(glyph, 15.0, SUBDUED))
+        .child(icon(glyph, 15.0, subdued()))
         // Otherwise a press here starts dragging the window instead of
         // arming the button, and the click never lands.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1416,14 +1528,14 @@ fn picker_row(
         .h(px(PICKER_ROW))
         .px_4()
         .rounded_full()
-        .bg(rgb(ROW))
+        .bg(rgb(row_fill()))
         .border_1()
-        .border_color(rgb(if chosen { ACCENT } else { ROW }))
+        .border_color(rgb(if chosen { ACCENT } else { row_fill() }))
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .hover(|style| style.bg(rgb(row_hover())))
         .active(|style| style.opacity(0.7))
         .child(div().text_size(px(12.5)).child(name))
-        .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(detail))
+        .child(div().text_size(px(10.)).text_color(rgb(faint())).child(detail))
         .on_click(cx.listener(move |this, _, _, cx| {
             let outcome = this.core.set_target_monitor(&monitor);
             this.report(outcome, cx);
@@ -1443,7 +1555,7 @@ fn picker_row(
 /// while a window is on air — the three buttons it hides instead are the ones
 /// that were chosen for the footer precisely because they are never urgent.
 fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
-    let (tone, glyph) = if message.failed { (ERR, "alert") } else { (OK, "check") };
+    let (tone, glyph) = if message.failed { (err(), "alert") } else { (ok(), "check") };
 
     div()
         .id("toast")
@@ -1457,7 +1569,7 @@ fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
         .px_3()
         .py_2()
         .rounded_2xl()
-        .bg(rgb(ROW_HOVER))
+        .bg(rgb(row_hover()))
         .border_1()
         .border_color(tint(tone, 0.4))
         .shadow_lg()
@@ -1473,7 +1585,7 @@ fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
                 .min_w_0()
                 .truncate()
                 .text_size(px(11.5))
-                .text_color(rgb(TEXT))
+                .text_color(rgb(text()))
                 .child(message.text.clone()),
         )
         .child(
@@ -1485,8 +1597,8 @@ fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
                 .w(px(18.))
                 .h(px(18.))
                 .rounded_full()
-                .hover(|style| style.bg(tint(TEXT, 0.12)))
-                .child(icon("close", 11.0, SUBDUED)),
+                .hover(|style| style.bg(tint(text(), 0.12)))
+                .child(icon("close", 11.0, subdued())),
         )
 }
 
@@ -1503,7 +1615,7 @@ fn footer(cx: &mut Context<WinSendGpui>) -> impl IntoElement {
         .pb_3()
         .px_4()
         .border_t_1()
-        .border_color(rgb(BORDER))
+        .border_color(rgb(border()))
         .child(
             footer_button("f-hotkeys", "keyboard", "Hotkeys").on_click(cx.listener(
                 |this, _, _, cx| {

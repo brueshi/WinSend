@@ -82,6 +82,15 @@ pub struct Config {
     /// never runs at all, for a machine that should not be talking to the
     /// internet unprompted.
     pub check_for_updates: bool,
+    /// Draw the interface light rather than dark.
+    ///
+    /// Off by default, and the reason is the application rather than taste:
+    /// this sits on screen during a live broadcast, where a white panel spills
+    /// light onto the operator and clashes with the rest of the production
+    /// kit. Read only by the GPUI front end; the eframe one is dark either
+    /// way, and `serde(default)` means a config written by one still loads in
+    /// the other.
+    pub light_theme: bool,
     #[serde(with = "hotkeys_as_text")]
     pub hotkeys: Hotkeys,
 }
@@ -96,6 +105,7 @@ impl Default for Config {
             clear_target: false,
             fade_on_retrieve: true,
             restore_fullscreen: true,
+            light_theme: false,
             media_keys: HashMap::new(),
             media_default_key: None,
             check_for_updates: true,
