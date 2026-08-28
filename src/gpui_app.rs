@@ -237,6 +237,11 @@ const FADE_STEP: std::time::Duration = std::time::Duration::from_millis(16);
 /// desktop, so the cost is bounded by the watch rather than by the frame rate.
 const MEDIA_RESTORE_LOOK: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// Closing hides to the tray only where there is a tray to hide to. On macOS
+/// the notification area does not exist and the mock has no icon to click, so
+/// a hidden window would be unreachable; there, closing still quits.
+const CLOSE_HIDES_TO_TRAY: bool = cfg!(windows);
+
 const HEADER_HEIGHT: f32 = 44.0;
 
 /// Where the drawn header's own content starts.
@@ -392,6 +397,14 @@ pub struct WinSendGpui {
     /// Set when an update has been installed, so `main` can start the new
     /// executable after this one has finished putting the desktop back.
     relaunch: Arc<std::sync::atomic::AtomicBool>,
+    /// Our own window, in the form `Platform` speaks. `None` off Windows,
+    /// which is a normal answer and means there is no native frame to ask
+    /// anything of.
+    own_handle: Option<u64>,
+    /// Hidden to the tray. The process is still running and still listening.
+    hidden: bool,
+    /// Set only by Quit, and the only thing that lets a close through.
+    quitting: bool,
     /// Which fade the running stepper belongs to, so a fade ended early
     /// cannot be advanced by the task armed for the one before it. The same
     /// guard the toast uses, for the same reason.
@@ -436,7 +449,8 @@ impl WinSendGpui {
         // Once, here, because the window exists by the time this runs and
         // neither of the two things below is something that needs
         // re-asserting per frame.
-        if let Some(handle) = own_window_handle(window) {
+        let own_handle = own_window_handle(window);
+        if let Some(handle) = own_handle {
             core.platform.apply_window_chrome(handle);
             // Always-on-top. eframe asks for it as a window flag; GPUI has no
             // equivalent in WindowOptions, so it goes on through the handle —
@@ -474,6 +488,9 @@ impl WinSendGpui {
             updater,
             update: UpdateState::Quiet,
             relaunch,
+            own_handle,
+            hidden: false,
+            quitting: false,
             toast: None,
             toast_seq: 0,
             toast_leaving: false,
@@ -488,6 +505,7 @@ impl WinSendGpui {
         set_palette(app.core.config.light_theme);
         app.open_requested_screen();
         app.poll_shell(cx);
+        app.intercept_close(window, cx);
         app
     }
 
@@ -543,11 +561,13 @@ impl WinSendGpui {
                 }
                 self.hotkey_report = report;
             }
-            ShellEvent::ShowWindow => window.activate_window(),
+            // A left click on the icon toggles, which is what makes the icon
+            // a way to get the window back rather than only a way to lose it.
+            ShellEvent::ShowWindow => self.set_hidden(!self.hidden, window, cx),
             ShellEvent::ShowSettings => {
                 self.screen = Screen::Settings;
                 self.close_side();
-                window.activate_window();
+                self.set_hidden(false, window, cx);
             }
             // The only path that actually exits. The fade goes first: one
             // abandoned here would leave Zoom's window translucent after this
@@ -555,6 +575,7 @@ impl WinSendGpui {
             // back.
             ShellEvent::Quit => {
                 self.finish_fade(cx);
+                self.quitting = true;
                 cx.quit();
             }
         }
@@ -600,6 +621,67 @@ impl WinSendGpui {
     fn install(&mut self, release: Release) {
         self.updater.install(release.clone());
         self.update = UpdateState::Installing(release);
+    }
+
+    /// Hide to the tray, or come back from it.
+    ///
+    /// Through `Platform` rather than through GPUI, which has no per-window
+    /// hide: `hide` and `show` are already on the trait, already the
+    /// ShowWindow calls this needs, and already answered by the mock.
+    fn set_hidden(&mut self, hidden: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(handle) = self.own_handle else {
+            return;
+        };
+        self.hidden = hidden;
+        let _ = if hidden {
+            self.core.platform.hide(handle)
+        } else {
+            self.core.platform.show(handle)
+        };
+        if !hidden {
+            window.activate_window();
+        }
+        cx.notify();
+    }
+
+    /// Turn the system close into hide-to-tray.
+    ///
+    /// Registered once, and only where there is a tray: `on_window_should_close`
+    /// returning false is what cancels the close, and a window that could not
+    /// be got back would be worse than one that quit.
+    fn intercept_close(&self, window: &Window, cx: &mut Context<Self>) {
+        if !CLOSE_HIDES_TO_TRAY {
+            return;
+        }
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, app| {
+            this.update(app, |this, cx| {
+                if this.quitting {
+                    // Going down for real, so the same guarantee as Quit
+                    // applies: a fade abandoned here would leave Zoom's window
+                    // translucent with nothing left able to put it back.
+                    this.finish_fade(cx);
+                    return true;
+                }
+                this.set_hidden(true, window, cx);
+                false
+            })
+            .unwrap_or(true)
+        });
+    }
+
+    /// The drawn close button.
+    ///
+    /// It has to mean what the system one means, because on Windows the system
+    /// titlebar is transparent and this is the only close there is.
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if CLOSE_HIDES_TO_TRAY {
+            self.set_hidden(true, window, cx);
+            return;
+        }
+        // No tray to hide to, so this is the way out. The fade goes with it.
+        self.finish_fade(cx);
+        window.remove_window();
     }
 
     /// Keep the tray icon in step with the window.
@@ -2213,7 +2295,7 @@ fn header_controls(cx: &mut Context<WinSendGpui>) -> impl IntoElement {
             |_, _, window, _| window.minimize_window(),
         )))
         .child(chrome_button("close", "close").on_click(cx.listener(
-            |_, _, window, _| window.remove_window(),
+            |this, _, window, cx| this.request_close(window, cx),
         )))
 }
 
