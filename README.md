@@ -66,6 +66,8 @@ src/hotkey.rs     key combinations and the rules for binding them
 src/identity.rs   persisting and re-finding the confirmed window
 src/config.rs     settings, stored as JSON under %APPDATA%
 src/core.rs       Send and Retrieve, free of any UI
+src/watch.rs      the clocks over it: the fade, and the two watches that
+                  run on after an action has already reported
 src/app.rs        egui front end
 ```
 

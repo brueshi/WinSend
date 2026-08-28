@@ -17,6 +17,7 @@ pub mod mock;
 pub mod platform;
 pub mod shell;
 pub mod update;
+pub mod watch;
 
 #[cfg(feature = "eframe-ui")]
 pub mod app;
