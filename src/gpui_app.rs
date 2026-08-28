@@ -172,24 +172,24 @@ const WARM_HOVER: u32 = 0xf06a52;
 /// What sits on top of an accent or warm fill, in either palette.
 const ON_ACCENT: u32 = 0xffffff;
 
-/// How long things take to arrive.
+/// How long the toast takes to arrive and to leave.
 ///
-/// Three things animate and nothing else. What rules them out is frequency
-/// rather than taste: Send and Retrieve are pressed over and over during a
-/// broadcast, and an animation seen a hundred times a day stops being feedback
-/// and becomes latency. The row hover is the same. What is left is the three
-/// things that appear occasionally and would otherwise pop into existence.
+/// One thing animates, and it is the only thing that can be animated honestly.
+/// GPUI fires an animation when an element appears and offers no hook for one
+/// being removed, so anything whose disappearance it does not control fades in
+/// and then vanishes — and a one-sided animation draws the eye to exactly the
+/// half that could not be animated. The toast is the exception because its
+/// whole life is already on a timer here, which is what makes an exit possible
+/// at all.
 ///
-/// All three ease out, because all three are entering. Durations follow the
-/// size of the thing arriving: the panel is the largest and the chip the
-/// smallest. Nothing is animated that the operator is waiting on — the state
-/// has already changed by the time the first frame is drawn, and only its
-/// appearance is catching up.
+/// The panel is not animated for a different reason: the window jumps to its
+/// new width in a single step, and a fade drawn over that leaves an empty
+/// column visible until it catches up. The window growing is the motion.
 ///
-/// GPUI skips these entirely when the system asks for reduced motion.
-const PANEL_IN: std::time::Duration = std::time::Duration::from_millis(200);
+/// Out is quicker than in, which is the usual ratio: an exit that takes as
+/// long as an entrance feels like the interface is reluctant.
 const TOAST_IN: std::time::Duration = std::time::Duration::from_millis(200);
-const CHIP_IN: std::time::Duration = std::time::Duration::from_millis(150);
+const TOAST_OUT: std::time::Duration = std::time::Duration::from_millis(160);
 
 /// How long a toast stays up.
 ///
@@ -323,6 +323,9 @@ pub struct WinSendGpui {
     /// Which toast the pending dismissal belongs to, so a newer message is not
     /// cleared by the timer armed for the one it replaced.
     toast_seq: u64,
+    /// Set while the toast is fading out. It is still mounted through this —
+    /// an element GPUI has already removed cannot be animated.
+    toast_leaving: bool,
     screen: Screen,
     /// The chooser open beside the surface, if any.
     side: Option<Side>,
@@ -349,6 +352,7 @@ impl WinSendGpui {
             core,
             toast: None,
             toast_seq: 0,
+            toast_leaving: false,
             screen: Screen::Main,
             side: None,
             candidates: Vec::new(),
@@ -491,15 +495,28 @@ impl WinSendGpui {
         self.toast_seq += 1;
         let seq = self.toast_seq;
         self.toast = Some(Message { text: text.to_string().into(), failed });
+        self.toast_leaving = false;
 
         let life = if failed { TOAST_LIFE_FAILED } else { TOAST_LIFE };
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(life).await;
+            // Two steps, because the fade has to happen while the toast is
+            // still mounted. The first marks it leaving and the second takes
+            // it away once the fade has run.
             this.update(cx, |this, cx| {
                 // Only if nothing has been said since. A newer message owns
                 // the toast and its own timer.
                 if this.toast_seq == seq {
+                    this.toast_leaving = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+            cx.background_executor().timer(TOAST_OUT).await;
+            this.update(cx, |this, cx| {
+                if this.toast_seq == seq {
                     this.toast = None;
+                    this.toast_leaving = false;
                     cx.notify();
                 }
             })
@@ -513,9 +530,28 @@ impl WinSendGpui {
     /// Bumps the sequence too, so the task still waiting on the dismissed
     /// message cannot clear whatever is put up next.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
+        // A second press while it is already going does nothing, rather than
+        // restarting the fade from wherever it had got to.
+        if self.toast.is_none() || self.toast_leaving {
+            return;
+        }
         self.toast_seq += 1;
-        self.toast = None;
+        let seq = self.toast_seq;
+        self.toast_leaving = true;
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOAST_OUT).await;
+            this.update(cx, |this, cx| {
+                if this.toast_seq == seq {
+                    this.toast = None;
+                    this.toast_leaving = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
@@ -825,7 +861,7 @@ impl Render for WinSendGpui {
                 Screen::Hotkeys => self.hotkeys(cx).into_any_element(),
             })
                     .when_some(self.toast.clone(), |this, message| {
-                        this.child(toast(&message, cx))
+                        this.child(toast(&message, self.toast_leaving, cx))
                     }),
             )
             .children(panel)
@@ -996,11 +1032,6 @@ impl WinSendGpui {
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(ACCENT))
                         .child("ON TARGET"),
-                )
-                .with_animation(
-                    "on-target-in",
-                    Animation::new(CHIP_IN).with_easing(ease_out_quint()),
-                    |this, delta| this.opacity(delta),
                 )
         });
 
@@ -1178,11 +1209,6 @@ impl WinSendGpui {
                         candidate_row(candidate, thumbnails.clone(), picker, cx)
                     })),
             }),
-            )
-            .with_animation(
-                "panel-in",
-                Animation::new(PANEL_IN).with_easing(ease_out_quint()),
-                |this, delta| this.opacity(delta),
             )
     }
 
@@ -1680,7 +1706,11 @@ fn picker_row(
 /// covered for three seconds, and Retrieve is the control someone reaches for
 /// while a window is on air — the three buttons it hides instead are the ones
 /// that were chosen for the footer precisely because they are never urgent.
-fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
+fn toast(
+    message: &Message,
+    leaving: bool,
+    cx: &mut Context<WinSendGpui>,
+) -> impl IntoElement {
     let (tone, glyph) = if message.failed { (err(), "alert") } else { (ok(), "check") };
 
     div()
@@ -1726,10 +1756,20 @@ fn toast(message: &Message, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
                 .hover(|style| style.bg(tint(text(), 0.12)))
                 .child(icon("close", 11.0, subdued())),
         )
+        // The id differs between the two, which is what makes the second one
+        // run: GPUI keys an animation to its element, so a changed id is a new
+        // element and a fresh start rather than a continuation.
         .with_animation(
-            "toast-in",
-            Animation::new(TOAST_IN).with_easing(ease_out_quint()),
-            |this, delta| this.opacity(delta).bottom(px(12. + 8. * delta)),
+            if leaving { "toast-out" } else { "toast-in" },
+            Animation::new(if leaving { TOAST_OUT } else { TOAST_IN })
+                .with_easing(ease_out_quint()),
+            move |this, delta| {
+                // Rises the last eight pixels on the way in and settles back
+                // on the way out, which it can do because it is absolutely
+                // positioned and nothing reflows around it.
+                let shown = if leaving { 1.0 - delta } else { delta };
+                this.opacity(shown).bottom(px(12. + 8. * shown))
+            },
         )
 }
 
