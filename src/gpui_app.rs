@@ -489,7 +489,6 @@ fn row(
 fn cta(
     id: &'static str,
     label: &'static str,
-    hotkey: Option<String>,
     filled: bool,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
@@ -500,7 +499,6 @@ fn cta(
     };
     div()
         .id(id)
-        .relative()
         .flex()
         .justify_center()
         .items_center()
@@ -521,25 +519,6 @@ fn cta(
                 .active(|style| style.opacity(0.82))
         })
         .child(label)
-        // Absolute so the label stays centred in the button rather than being
-        // pushed off-centre by the length of a binding.
-        .when_some(hotkey, |this, binding| {
-            this.child(
-                div()
-                    .absolute()
-                    .right_4()
-                    .text_size(px(10.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(if filled {
-                        tint(0xffffff, 0.65)
-                    } else if enabled {
-                        Hsla::from(rgb(FAINT))
-                    } else {
-                        tint(FAINT, 0.6)
-                    })
-                    .child(binding),
-            )
-        })
 }
 
 /// One of Loom's circular footer buttons.
@@ -691,9 +670,6 @@ impl WinSendGpui {
         let zoom_set = self.core.config.zoom_window.is_some();
         let media_set = self.core.config.media_window.is_some();
         let picking = self.picking_display;
-        let send_key = self.core.config.hotkeys.binding(Action::Send).map(|h| h.to_string());
-        let retrieve_key =
-            self.core.config.hotkeys.binding(Action::Retrieve).map(|h| h.to_string());
 
         let zoom_label = self
             .core
@@ -800,14 +776,7 @@ impl WinSendGpui {
                     .px_4()
                     .pb_4()
                     .child(
-                        cta(
-                            "send",
-                            "Send to Monitor",
-                            send_key,
-                            !sent && can_send,
-                            can_send,
-                        )
-                        .on_click(
+                        cta("send", "Send to Monitor", !sent && can_send, can_send).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.perform(Action::Send, cx);
                                 cx.notify();
@@ -815,7 +784,7 @@ impl WinSendGpui {
                         ),
                     )
                     .child(
-                        cta("retrieve", "Retrieve", retrieve_key, sent, can_retrieve).on_click(cx.listener(
+                        cta("retrieve", "Retrieve", sent, can_retrieve).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.perform(Action::Retrieve, cx);
                                 cx.notify();
