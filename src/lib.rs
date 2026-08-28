@@ -21,6 +21,9 @@ pub mod update;
 #[cfg(feature = "eframe-ui")]
 pub mod app;
 
+#[cfg(feature = "gpui-ui")]
+pub mod gpui_app;
+
 #[cfg(windows)]
 pub mod github;
 #[cfg(windows)]

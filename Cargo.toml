@@ -16,13 +16,19 @@ name = "winsend"
 path = "src/bin/winsend.rs"
 required-features = ["eframe-ui"]
 
+[[bin]]
+name = "winsend-gpui"
+path = "src/bin/winsend-gpui.rs"
+required-features = ["gpui-ui"]
+
 # One feature per front end, so a second one can be added beside this without
 # either binary linking the other's toolkit. That matters for measuring: a size
 # or start-up number taken from a binary carrying both is not a number about
 # either of them.
 [features]
-default = ["eframe-ui"]
+default = ["eframe-ui", "gpui-ui"]
 eframe-ui = ["dep:eframe", "dep:raw-window-handle"]
+gpui-ui = ["dep:gpui", "dep:gpui_platform"]
 
 [dependencies]
 eframe = { version = "0.33.3", optional = true }
@@ -31,6 +37,13 @@ eframe = { version = "0.33.3", optional = true }
 # version tracks eframe's own, since a mismatched major would be a different
 # type entirely and the handle would not convert.
 raw-window-handle = { version = "0.6.2", optional = true }
+# Pinned to a git revision rather than a version. crates.io stops at gpui
+# 0.2.2 from October 2025, and `gpui_platform` — which the current API needs to
+# create an Application at all — is not published there at all. A revision is
+# the only way to build against the API that upstream documents, and pinning it
+# is what keeps a `cargo update` from moving a pre-1.0 framework underneath us.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "8ee36b682cf1971e51032cbd932dd16def575364", optional = true }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 for checking a download against the digest the release publishes.
@@ -39,6 +52,15 @@ serde_json = "1"
 # cryptography, and RustCrypto's is the one everything else already trusts.
 sha2 = "0.10"
 ureq = "3.4"
+
+# gpui_platform picks the windowing and text backend for the host. font-kit is
+# needed on macOS or text lays out but rasterises no glyphs; on Windows it has
+# no effect, since windowing is Win32 and text is DirectWrite.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "8ee36b682cf1971e51032cbd932dd16def575364", default-features = false, features = ["font-kit"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "8ee36b682cf1971e51032cbd932dd16def575364", default-features = false, optional = true }
 
 # Win32 bindings are the only genuinely platform-bound dependency. Keeping them
 # target-scoped is what lets the UI, config and matching logic build and run on
