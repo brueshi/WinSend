@@ -39,15 +39,15 @@ pub const WIDTH: f32 = 340.0;
 
 /// The height with nothing expanded: the shape that sits on screen during a
 /// broadcast, and the one worth keeping small.
-pub const HEIGHT: f32 = 430.0;
+pub const HEIGHT: f32 = 408.0;
 
 /// The sub-surfaces, each sized for its own content.
 /// A row plus the gap under it, measured rather than guessed.
 const CANDIDATE_ROW: f32 = 79.0;
 /// Beyond this the list scrolls rather than the window growing off the screen.
 const PICKER_MAX_HEIGHT: f32 = 620.0;
-const SETTINGS_HEIGHT: f32 = 496.0;
-const HOTKEYS_HEIGHT: f32 = 300.0;
+const SETTINGS_HEIGHT: f32 = 462.0;
+const HOTKEYS_HEIGHT: f32 = 268.0;
 
 /// What an expanded block adds.
 const PANEL_HEADING: f32 = 21.0;
@@ -70,8 +70,13 @@ const OK: u32 = 0x66bb7a;
 const WARN: u32 = 0xe0a458;
 const ERR: u32 = 0xe26a6a;
 
-/// How many recent messages the status strip keeps.
-const STATUS_HISTORY: usize = 2;
+/// How long a toast stays up.
+///
+/// Long enough to read one line, short enough that it is gone before the
+/// operator needs the controls under it. A failure holds longer, because it is
+/// the one worth reading twice.
+const TOAST_LIFE: std::time::Duration = std::time::Duration::from_secs(3);
+const TOAST_LIFE_FAILED: std::time::Duration = std::time::Duration::from_secs(6);
 
 const HEADER_HEIGHT: f32 = 52.0;
 
@@ -119,7 +124,7 @@ macro_rules! icons {
 
 icons![
     "display", "video", "media", "keyboard", "settings", "info", "minimize", "close", "check",
-    "alert", "back",
+    "alert", "back", "chevron",
 ];
 
 /// What the surface is currently able to do.
@@ -176,7 +181,13 @@ enum Screen {
 
 pub struct WinSendGpui {
     core: Core,
-    status: Vec<Message>,
+    /// The message currently showing, if any. One at a time and transient:
+    /// a strip reserved for messages costs the live surface its height every
+    /// day for something that is on screen for three seconds.
+    toast: Option<Message>,
+    /// Which toast the pending dismissal belongs to, so a newer message is not
+    /// cleared by the timer armed for the one it replaced.
+    toast_seq: u64,
     screen: Screen,
     /// Open only while the target display is being chosen, so the row reads as
     /// a value most of the time and a picker briefly.
@@ -202,7 +213,8 @@ impl WinSendGpui {
     pub fn new(core: Core, cx: &mut Context<Self>) -> Self {
         let mut app = Self {
             core,
-            status: Vec::new(),
+            toast: None,
+            toast_seq: 0,
             screen: Screen::Main,
             picking_display: false,
             candidates: Vec::new(),
@@ -230,6 +242,7 @@ impl WinSendGpui {
         }
     }
 
+
     fn open_picker(&mut self, picker: PickerFor) {
         self.candidates = match picker {
             PickerFor::Zoom => self.core.candidates(),
@@ -246,12 +259,12 @@ impl WinSendGpui {
         self.screen = Screen::Picker(picker);
     }
 
-    fn confirm(&mut self, picker: PickerFor, candidate: &WindowCandidate) {
+    fn confirm(&mut self, picker: PickerFor, candidate: &WindowCandidate, cx: &mut Context<Self>) {
         let outcome = match picker {
             PickerFor::Zoom => self.core.confirm_window(candidate),
             PickerFor::Media => self.core.confirm_media_window(candidate),
         };
-        self.report(outcome);
+        self.report(outcome, cx);
         self.screen = Screen::Main;
         self.candidates.clear();
         self.thumbnails.clear();
@@ -263,7 +276,7 @@ impl WinSendGpui {
     /// because a global binding swallows it everywhere, and a duplicate is
     /// refused because two actions cannot share one combination. This only
     /// translates GPUI's keystroke into the shape those rules are written in.
-    fn capture(&mut self, action: Action, event: &KeyDownEvent) {
+    fn capture(&mut self, action: Action, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let modifiers = event.keystroke.modifiers;
         // A press that is only a modifier is the operator on their way to the
         // combination, not the combination.
@@ -279,7 +292,7 @@ impl WinSendGpui {
         };
         self.capturing = None;
         let outcome = self.core.set_hotkey(action, Some(hotkey));
-        self.report(outcome);
+        self.report(outcome, cx);
     }
 
     fn state(&self) -> State {
@@ -296,27 +309,46 @@ impl WinSendGpui {
         self.core.config.resolve_monitor(&self.core.monitors()).cloned()
     }
 
-    fn report(&mut self, outcome: Result<String, Failure>) {
-        let (text, failed) = match outcome {
-            Ok(message) => (message, false),
-            Err(failure) => (failure.to_string(), true),
-        };
-        self.status.insert(0, Message { text: text.into(), failed });
-        self.status.truncate(STATUS_HISTORY);
+    fn report(&mut self, outcome: Result<String, Failure>, cx: &mut Context<Self>) {
+        match outcome {
+            Ok(message) => self.note(&message, false, cx),
+            Err(failure) => self.note(&failure.to_string(), true, cx),
+        }
     }
 
-    fn note(&mut self, text: &str, failed: bool) {
-        self.status.insert(0, Message { text: text.to_string().into(), failed });
-        self.status.truncate(STATUS_HISTORY);
+    /// Put a message up, and take it down again on its own.
+    ///
+    /// The dismissal is a task rather than a clock checked each frame, so an
+    /// idle window stays idle instead of repainting to find out whether three
+    /// seconds have passed.
+    fn note(&mut self, text: &str, failed: bool, cx: &mut Context<Self>) {
+        self.toast_seq += 1;
+        let seq = self.toast_seq;
+        self.toast = Some(Message { text: text.to_string().into(), failed });
+
+        let life = if failed { TOAST_LIFE_FAILED } else { TOAST_LIFE };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(life).await;
+            this.update(cx, |this, cx| {
+                // Only if nothing has been said since. A newer message owns
+                // the toast and its own timer.
+                if this.toast_seq == seq {
+                    this.toast = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
-    fn perform(&mut self, action: Action) {
+    fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
         let outcome = match action {
             Action::Send => self.core.send(),
             Action::Retrieve => self.core.retrieve(),
             Action::RestoreMedia => self.core.restore_media(),
         };
-        self.report(outcome);
+        self.report(outcome, cx);
     }
     fn height(&self) -> f32 {
         match self.screen {
@@ -380,10 +412,12 @@ fn chip(kind: Chip) -> impl IntoElement {
         Chip::Likely => ("LIKELY", ACCENT),
     };
     div()
+        .flex_none()
+        .whitespace_nowrap()
         .px_2()
         .py(px(3.))
         .rounded_full()
-        .bg(tint(colour, 0.16))
+        .bg(tint(colour, 0.14))
         .text_size(px(9.))
         .font_weight(FontWeight::BOLD)
         .text_color(rgb(colour))
@@ -435,26 +469,17 @@ fn row(
         )
         .child(
             div()
-                .relative()
                 .flex()
                 .items_center()
-                .child(div().group_hover(id, |style| style.opacity(0.)).child(right))
-                // Sits on top of the chip and is invisible until the row is
-                // hovered, so the two never reflow past each other.
+                .gap_2()
+                .child(right)
+                // Says the row opens something, without a word that could
+                // wrap. Faint until the row is hovered.
                 .child(
                     div()
-                        .absolute()
-                        .right_0()
-                        .opacity(0.)
+                        .opacity(0.35)
                         .group_hover(id, |style| style.opacity(1.))
-                        .px_2()
-                        .py(px(3.))
-                        .rounded_full()
-                        .bg(tint(ACCENT, 0.16))
-                        .text_size(px(9.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(ACCENT))
-                        .child("CHANGE"),
+                        .child(icon("chevron", 14.0, SUBDUED)),
                 ),
         )
 }
@@ -618,6 +643,7 @@ impl Render for WinSendGpui {
 
         div()
             .track_focus(&self.focus_handle)
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -627,7 +653,7 @@ impl Render for WinSendGpui {
             // in the window is never swallowed.
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 if let Some(action) = capturing {
-                    this.capture(action, event);
+                    this.capture(action, event, cx);
                     cx.notify();
                 }
             }))
@@ -648,6 +674,7 @@ impl Render for WinSendGpui {
                 Screen::Settings => self.settings(cx).into_any_element(),
                 Screen::Hotkeys => self.hotkeys(cx).into_any_element(),
             })
+            .when_some(self.toast.as_ref(), |this, message| this.child(toast(message)))
     }
 }
 
@@ -781,6 +808,7 @@ impl WinSendGpui {
                     .flex_col()
                     .gap_2()
                     .px_4()
+                    .pb_4()
                     .child(
                         cta(
                             "send",
@@ -791,7 +819,7 @@ impl WinSendGpui {
                         )
                         .on_click(
                             cx.listener(|this, _, _, cx| {
-                                this.perform(Action::Send);
+                                this.perform(Action::Send, cx);
                                 cx.notify();
                             }),
                         ),
@@ -799,42 +827,46 @@ impl WinSendGpui {
                     .child(
                         cta("retrieve", "Retrieve", retrieve_key, sent, can_retrieve).on_click(cx.listener(
                             |this, _, _, cx| {
-                                this.perform(Action::Retrieve);
+                                this.perform(Action::Retrieve, cx);
                                 cx.notify();
                             },
                         )),
                     ),
             )
-            .child(status_strip(&self.status))
             .child(footer(cx))
     }
 }
 
 impl WinSendGpui {
-    /// The live surface's header: state on the left, window controls right.
+    /// The live surface's header: the state, when there is one, and the window
+    /// controls.
+    ///
+    /// Nothing is shown while nothing is out. An indicator that is always lit
+    /// is one the eye stops reading, and "idle" is not a thing the operator
+    /// needs telling — the two buttons below already say it. What is worth
+    /// interrupting for is a window being on another display right now, so
+    /// that is the only thing this ever says.
     fn main_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sent = self.state() == State::Sent;
-        let (tone, label) = if sent { (ACCENT, "ON TARGET") } else { (FAINT, "IDLE") };
 
         header_shell()
-            .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .px_2()
-                .py(px(4.))
-                .rounded_full()
-                .bg(tint(tone, 0.16))
-                .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(tone)))
-                .child(
-                    div()
-                        .text_size(px(9.5))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(tone))
-                        .child(label),
-                ),
-            )
+            .child(div().when(sent, |this| {
+                this.flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2()
+                    .py(px(4.))
+                    .rounded_full()
+                    .bg(tint(ACCENT, 0.16))
+                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(ACCENT)))
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(ACCENT))
+                            .child("ON TARGET"),
+                    )
+            }))
             .child(header_controls(cx))
     }
 
@@ -993,11 +1025,15 @@ impl WinSendGpui {
                             this.core.diagnostics(),
                         ));
                         let saved = this.core.save_diagnostics();
-                        this.report(saved.map(|where_to| format!("Copied. {where_to}")));
+                        // The path is real information and belongs in the
+                        // file, not in a line that is gone in three seconds.
+                        this.report(
+                            saved.map(|_| "Copied, and saved beside your config".to_string()),
+                            cx,
+                        );
                         cx.notify();
                     })),
             )
-            .child(status_strip(&self.status))
     }
 
     /// The bindings, and the capture that sets them.
@@ -1025,7 +1061,6 @@ impl WinSendGpui {
             .children(bindings.into_iter().map(|(action, bound)| {
                 binding_row(action, bound, capturing == Some(action), cx)
             }))
-            .child(status_strip(&self.status))
     }
 }
 
@@ -1171,7 +1206,7 @@ fn candidate_row(
             this.child(chip(Chip::Likely))
         })
         .on_click(cx.listener(move |this, _, _, cx| {
-            this.confirm(picker, &candidate);
+            this.confirm(picker, &candidate, cx);
             cx.notify();
         }))
 }
@@ -1215,7 +1250,7 @@ fn setting_row(
         .child(switch(on))
         .on_click(cx.listener(move |this, _, _, cx| {
             if let Err(message) = setting.apply(&mut this.core, !on) {
-                this.note(&message, true);
+                this.note(&message, true, cx);
             }
             cx.notify();
         }))
@@ -1294,7 +1329,7 @@ fn binding_row(
             this.child(
                 small_button(clear_id, "Clear").on_click(cx.listener(move |this, _, _, cx| {
                     let outcome = this.core.set_hotkey(action, None);
-                    this.report(outcome);
+                    this.report(outcome, cx);
                     cx.notify();
                 })),
             )
@@ -1382,32 +1417,50 @@ fn picker_row(
         .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(detail))
         .on_click(cx.listener(move |this, _, _, cx| {
             let outcome = this.core.set_target_monitor(&monitor);
-            this.report(outcome);
+            this.report(outcome, cx);
             this.picking_display = false;
             cx.notify();
         }))
 }
 
-/// The most recent messages, newest first and brightest.
+/// A message, over the surface rather than inside it.
 ///
-/// Keeps its height whether or not it has anything to say, so a message
-/// arriving never moves the controls above it.
-fn status_strip(status: &[Message]) -> impl IntoElement {
+/// Absolutely positioned, so nothing moves when one arrives and nothing is
+/// reserved for it when there is none. One line, truncated: anything needing
+/// more room than that is a report, and reports go to the file.
+///
+/// It sits over the footer rather than over the actions. Something has to be
+/// covered for three seconds, and Retrieve is the control someone reaches for
+/// while a window is on air — the three buttons it hides instead are the ones
+/// that were chosen for the footer precisely because they are never urgent.
+fn toast(message: &Message) -> impl IntoElement {
+    let (tone, glyph) = if message.failed { (ERR, "alert") } else { (OK, "check") };
+
     div()
+        .absolute()
+        .bottom(px(20.))
+        .left_3()
+        .right_3()
         .flex()
-        .flex_col()
-        .justify_center()
-        .gap_1()
-        .w_full()
-        .h(px(42.))
-        .px_4()
-        .children(status.iter().enumerate().map(|(age, message)| {
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .bg(rgb(ROW_HOVER))
+        .border_1()
+        .border_color(tint(tone, 0.4))
+        .shadow_lg()
+        .child(icon(glyph, 13.0, tone))
+        .child(
             div()
-                .text_size(px(11.))
-                .text_color(rgb(if message.failed { ERR } else { OK }))
-                .when(age > 0, |this| this.opacity(0.5))
-                .child(message.text.clone())
-        }))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(11.5))
+                .text_color(rgb(TEXT))
+                .child(message.text.clone()),
+        )
 }
 
 /// Loom's row of circular buttons, for what is occasionally needed and never
@@ -1447,7 +1500,12 @@ fn footer(cx: &mut Context<WinSendGpui>) -> impl IntoElement {
                     // which Explorer hides by default.
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(this.core.diagnostics()));
                     let saved = this.core.save_diagnostics();
-                    this.report(saved.map(|where_to| format!("Copied. {where_to}")));
+                    // The path is real information and belongs in the file,
+                    // not in a line that is gone in three seconds.
+                    this.report(
+                        saved.map(|_| "Copied, and saved beside your config".to_string()),
+                        cx,
+                    );
                     cx.notify();
                 },
             )),
