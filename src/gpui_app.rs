@@ -1057,19 +1057,16 @@ impl WinSendGpui {
             // floating beside a panel.
             .border_l_1()
             .border_color(rgb(border()))
+            // The same height as the surface's own header, so the title sits
+            // on the line the window controls sit on rather than a few pixels
+            // under it.
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .px_4()
-                    .pt_4()
-                    .pb_2()
-                    .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .h(px(HEADER_HEIGHT))
+                    .px_4()
                     .child(
                         div()
                             .flex()
@@ -1096,21 +1093,26 @@ impl WinSendGpui {
                             .flex()
                             .justify_center()
                             .items_center()
-                            .w(px(22.))
-                            .h(px(22.))
+                            .w(px(28.))
+                            .h(px(28.))
                             .rounded_full()
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(row_hover())))
-                            .child(icon("close", 12.0, subdued()))
+                            .active(|style| style.opacity(0.6))
+                            .child(icon("close", 15.0, subdued()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.close_side();
                                 cx.notify();
                             })),
                     ),
             )
-                    .child(
-                        div().text_size(px(10.5)).text_color(rgb(faint())).child(hint),
-                    ),
+            .child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .text_size(px(10.5))
+                    .text_color(rgb(faint()))
+                    .child(hint),
             )
             // Only the list scrolls, so the title and the way out of the panel
             // stay put however long it is.
