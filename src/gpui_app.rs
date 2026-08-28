@@ -41,23 +41,15 @@ pub const WIDTH: f32 = 340.0;
 /// broadcast, and the one worth keeping small.
 pub const HEIGHT: f32 = 416.0;
 
-/// The chooser beside the surface.
+/// The chooser beside the surface. Flush against it, divided by a rule rather
+/// than a gap, so the two read as one window with two columns.
 const PANEL_WIDTH: f32 = 340.0;
-const PANEL_GAP: f32 = 10.0;
-/// A panel's own margins and padding, its header and its hint, before any
-/// rows. Measured against the widest hint, which wraps to two lines.
-const PANEL_CHROME: f32 = 122.0;
 
-/// A row plus the gap under it, measured rather than guessed.
-const CANDIDATE_ROW: f32 = 74.0;
-/// Beyond this the list scrolls rather than the window growing off the screen.
-const PICKER_MAX_HEIGHT: f32 = 620.0;
 const SETTINGS_HEIGHT: f32 = 512.0;
 const HOTKEYS_HEIGHT: f32 = 260.0;
 
 const PICKER_ROW: f32 = 36.0;
 const ROW_HEIGHT: f32 = 56.0;
-const ROW_GAP: f32 = 10.0;
 
 /// The colours the surface is drawn from.
 ///
@@ -515,28 +507,21 @@ impl WinSendGpui {
         self.report(outcome, cx);
     }
     fn width(&self) -> f32 {
-        if self.side.is_some() { WIDTH + PANEL_GAP + PANEL_WIDTH } else { WIDTH }
+        if self.side.is_some() { WIDTH + PANEL_WIDTH } else { WIDTH }
     }
 
-    /// Tall enough for whichever column needs more.
+    /// The surface decides how tall the window is, and always.
+    ///
+    /// A chooser scrolls inside that rather than stretching the window to fit
+    /// its list. There is no bound on how many windows are open on a desktop,
+    /// and a window that grew to hold all of them would be a window taller
+    /// than the screen at the worst moment.
     fn height(&self) -> f32 {
-        let main = match self.screen {
+        match self.screen {
             Screen::Settings => SETTINGS_HEIGHT,
             Screen::Hotkeys => HOTKEYS_HEIGHT,
             Screen::Main => HEIGHT,
-        };
-        let panel = match self.side {
-            None => 0.0,
-            Some(Side::Display) => {
-                let rows = self.core.monitors().len() as f32;
-                PANEL_CHROME + rows * (PICKER_ROW + ROW_GAP)
-            }
-            Some(Side::Window(_)) => {
-                let rows = self.candidates.len().max(1) as f32;
-                PANEL_CHROME + rows * CANDIDATE_ROW
-            }
-        };
-        main.max(panel.min(PICKER_MAX_HEIGHT))
+        }
     }
 }
 
@@ -1056,37 +1041,54 @@ impl WinSendGpui {
         let selected = self.target().map(|m| m.id);
         let candidates = self.candidates.clone();
         let thumbnails = self.thumbnails.clone();
+        let count = match side {
+            Side::Display => monitors.len(),
+            Side::Window(_) => candidates.len(),
+        };
 
         div()
-            .id("side-panel")
             .flex()
             .flex_col()
             .w(px(PANEL_WIDTH))
             .h_full()
             .flex_none()
-            .ml(px(PANEL_GAP))
-            .my_3()
-            .mr_3()
-            .p_3()
-            .gap_2()
-            // Its own card, so it reads as a thing that opened rather than as
-            // more of the surface.
-            .rounded_2xl()
-            .bg(rgb(bg()))
-            .border_1()
+            // Flush against the surface and divided by a rule, so the window
+            // reads as one object with two columns rather than as a card
+            // floating beside a panel.
+            .border_l_1()
             .border_color(rgb(border()))
-            .shadow_lg()
-            .overflow_y_scroll()
             .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_4()
+                    .pt_4()
+                    .pb_2()
+                    .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(12.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            // Says how many there are when only some of them
+                            // fit, which is what tells you the list scrolls.
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(faint()))
+                                    .child(format!("{count}")),
+                            ),
                     )
                     .child(
                         div()
@@ -1106,8 +1108,24 @@ impl WinSendGpui {
                             })),
                     ),
             )
-            .child(div().text_size(px(10.5)).text_color(rgb(faint())).pb_1().child(hint))
-            .map(|this| match side {
+                    .child(
+                        div().text_size(px(10.5)).text_color(rgb(faint())).child(hint),
+                    ),
+            )
+            // Only the list scrolls, so the title and the way out of the panel
+            // stay put however long it is.
+            .child(
+                div()
+                    .id("panel-list")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .flex_1()
+                    .min_h_0()
+                    .px_4()
+                    .pb_4()
+                    .overflow_y_scroll()
+                    .map(|this| match side {
                 Side::Display => this.children(monitors.into_iter().map(|monitor| {
                     let chosen = selected.as_deref() == Some(monitor.id.as_str());
                     picker_row(monitor, chosen, cx)
@@ -1127,7 +1145,8 @@ impl WinSendGpui {
                     .children(candidates.into_iter().map(move |candidate| {
                         candidate_row(candidate, thumbnails.clone(), picker, cx)
                     })),
-            })
+            }),
+            )
     }
 
     /// The settings, as toggles that write straight through `Core`.
