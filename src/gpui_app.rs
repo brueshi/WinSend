@@ -36,7 +36,7 @@ use crate::core::{Core, Failure};
 use crate::hotkey::{Action, Hotkey, Key};
 use crate::platform::{MonitorInfo, WindowCandidate};
 use crate::shell::{self, HotkeyReport, Shell, ShellEvent, TrayState};
-use crate::watch::{Fade, Started};
+use crate::watch::{Fade, MediaRestore, SettleClock, Started, Tick, SETTLE_LOOK};
 
 pub const WIDTH: f32 = 340.0;
 
@@ -229,6 +229,13 @@ const SHELL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// which on a 60Hz display is this number.
 const FADE_STEP: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// How often a put-back player is looked at.
+///
+/// `app.rs` looks once per frame, which on a 60Hz display is this. The watch
+/// runs for at most two seconds and each look is one enumeration of the
+/// desktop, so the cost is bounded by the watch rather than by the frame rate.
+const MEDIA_RESTORE_LOOK: std::time::Duration = std::time::Duration::from_millis(16);
+
 const HEADER_HEIGHT: f32 = 44.0;
 
 /// Where the drawn header's own content starts.
@@ -354,6 +361,12 @@ pub struct WinSendGpui {
     hotkey_report: HotkeyReport,
     /// A Retrieve fading the window out, if one is running.
     fading: Option<Fade>,
+    /// The placement watch on the window last placed, if one is running.
+    settling: Option<SettleClock>,
+    settle_seq: u64,
+    /// The full-screen watch on put-back players, if one is running.
+    media_restore: Option<MediaRestore>,
+    media_seq: u64,
     /// Which fade the running stepper belongs to, so a fade ended early
     /// cannot be advanced by the task armed for the one before it. The same
     /// guard the toast uses, for the same reason.
@@ -414,6 +427,10 @@ impl WinSendGpui {
             hotkey_report: HotkeyReport::default(),
             fading: None,
             fade_seq: 0,
+            settling: None,
+            settle_seq: 0,
+            media_restore: None,
+            media_seq: 0,
             toast: None,
             toast_seq: 0,
             toast_leaving: false,
@@ -726,6 +743,7 @@ impl WinSendGpui {
             Action::Send => {
                 let outcome = self.core.send();
                 self.report(outcome, cx);
+                self.arm_watches(cx);
             }
             // The fade that was just cut short *was* the Retrieve. Starting
             // another would only produce "nothing has been sent yet".
@@ -734,6 +752,7 @@ impl WinSendGpui {
             Action::RestoreMedia => {
                 let outcome = self.core.restore_media();
                 self.report(outcome, cx);
+                self.arm_watches(cx);
             }
         }
     }
@@ -743,6 +762,7 @@ impl WinSendGpui {
         if !self.core.config.fade_on_retrieve {
             let outcome = self.core.retrieve();
             self.report(outcome, cx);
+            self.arm_watches(cx);
             return;
         }
 
@@ -751,7 +771,10 @@ impl WinSendGpui {
                 self.fading = Some(fade);
                 self.step_fade(cx);
             }
-            Started::Cut(outcome) => self.report(outcome, cx),
+            Started::Cut(outcome) => {
+                self.report(outcome, cx);
+                self.arm_watches(cx);
+            }
         }
     }
 
@@ -784,6 +807,7 @@ impl WinSendGpui {
                             }
                             Some(outcome) => {
                                 this.report(outcome, cx);
+                                this.arm_watches(cx);
                                 cx.notify();
                                 false
                             }
@@ -813,7 +837,125 @@ impl WinSendGpui {
         self.fade_seq += 1;
         let outcome = fade.finish(&mut self.core);
         self.report(outcome, cx);
+        self.arm_watches(cx);
         true
+    }
+
+    /// Start the clocks on whatever the action just queued.
+    ///
+    /// Both watches begin at the same moment and for the same reason: the
+    /// action has reported, so the window has finished moving and everything
+    /// that happens next is the desktop reacting rather than us acting. They
+    /// are separate watches because they measure different things — where the
+    /// sent window ended up, and whether a displaced player came back to full
+    /// screen — and either can be running without the other.
+    fn arm_watches(&mut self, cx: &mut Context<Self>) {
+        self.arm_media_restore(cx);
+        self.arm_settle(cx);
+    }
+
+    /// Watch where the window that was just placed comes to rest.
+    fn arm_settle(&mut self, cx: &mut Context<Self>) {
+        self.settling = SettleClock::begin(&self.core, std::time::Instant::now());
+        if self.settling.is_none() {
+            return;
+        }
+        // Supersedes any watch already running, the same way a new placement
+        // supersedes the one before it.
+        self.settle_seq += 1;
+        let seq = self.settle_seq;
+
+        Self::every(SETTLE_LOOK, cx, move |this, cx| {
+            if this.settle_seq != seq {
+                return false;
+            }
+            let Some(mut clock) = this.settling else {
+                return false;
+            };
+            match clock.tick(&mut this.core, std::time::Instant::now()) {
+                Tick::Watching => {
+                    this.settling = Some(clock);
+                    true
+                }
+                Tick::Done(report) => {
+                    this.settling = None;
+                    this.say(report, cx);
+                    false
+                }
+            }
+        });
+    }
+
+    /// Watch whether a player Retrieve gave the display back to takes it.
+    fn arm_media_restore(&mut self, cx: &mut Context<Self>) {
+        self.media_restore = MediaRestore::begin(&self.core, std::time::Instant::now());
+        if self.media_restore.is_none() {
+            return;
+        }
+        self.media_seq += 1;
+        let seq = self.media_seq;
+
+        Self::every(MEDIA_RESTORE_LOOK, cx, move |this, cx| {
+            if this.media_seq != seq {
+                return false;
+            }
+            let Some(mut watch) = this.media_restore else {
+                return false;
+            };
+            let fading = this.fading.is_some();
+            match watch.tick(&mut this.core, std::time::Instant::now(), fading) {
+                Tick::Watching => {
+                    this.media_restore = Some(watch);
+                    true
+                }
+                Tick::Done(report) => {
+                    this.media_restore = None;
+                    this.say(report, cx);
+                    false
+                }
+            }
+        });
+    }
+
+    /// Put what a watch had to say up, if it had anything.
+    ///
+    /// Silence is the common answer and the deliberate one: a placement that
+    /// held and a player that came back on its own both already had their
+    /// outcome reported by the action that started them.
+    fn say(&mut self, report: Option<crate::watch::Report>, cx: &mut Context<Self>) {
+        let Some(report) = report else {
+            return;
+        };
+        match report {
+            Ok(message) => self.note(&message, false, cx),
+            Err(message) => self.note(&message, true, cx),
+        }
+        // These arrive on a timer rather than out of a press, so there is no
+        // click on its way to redraw the window for them.
+        cx.notify();
+    }
+
+    /// Run `step` on a timer for as long as it says to carry on.
+    ///
+    /// The shape both watches share. A task rather than a clock read while
+    /// rendering, because a window with nothing to draw should not be drawing
+    /// frames to find out what time it is.
+    fn every(
+        interval: std::time::Duration,
+        cx: &mut Context<Self>,
+        step: impl Fn(&mut Self, &mut Context<Self>) -> bool + 'static,
+    ) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(interval).await;
+                // A released view answers `false`, which ends the watch along
+                // with the window it was watching for.
+                if !this.update(cx, |this, cx| step(this, cx)).unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
     fn width(&self) -> f32 {
         if self.side.is_some() { WIDTH + PANEL_WIDTH } else { WIDTH }
