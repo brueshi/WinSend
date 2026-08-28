@@ -7950,6 +7950,7 @@ dependencies = [
  "embed-resource",
  "gpui",
  "gpui_platform",
+ "image",
  "raw-window-handle",
  "serde",
  "serde_json",

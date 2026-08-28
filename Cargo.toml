@@ -28,7 +28,7 @@ required-features = ["gpui-ui"]
 [features]
 default = ["eframe-ui", "gpui-ui"]
 eframe-ui = ["dep:eframe", "dep:raw-window-handle"]
-gpui-ui = ["dep:gpui", "dep:gpui_platform"]
+gpui-ui = ["dep:gpui", "dep:gpui_platform", "dep:image"]
 
 [dependencies]
 eframe = { version = "0.33.3", optional = true }
@@ -44,6 +44,11 @@ raw-window-handle = { version = "0.6.2", optional = true }
 # is what keeps a `cargo update` from moving a pre-1.0 framework underneath us.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "8ee36b682cf1971e51032cbd932dd16def575364", optional = true }
 
+# Only to hand GPUI a window thumbnail. Its image element is typed in terms of
+# `image::Frame`, so there is no way to pass raw pixels without the crate that
+# names the type. The version tracks gpui's own: a mismatch would be a
+# different `Frame` and the frames would not convert.
+image = { version = "0.25", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 for checking a download against the digest the release publishes.

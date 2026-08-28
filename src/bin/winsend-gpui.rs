@@ -46,7 +46,7 @@ fn main() {
                     is_resizable: true,
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| WinSendGpui::new(core)),
+                |_, cx| cx.new(|cx| WinSendGpui::new(core, cx)),
             )
             .unwrap();
             cx.activate(true);

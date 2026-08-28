@@ -23,21 +23,31 @@
 //! operator and clashes with the rest of the production kit.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui::{
-    AssetSource, Context, FontWeight, Hsla, IntoElement, MouseButton, Render, SharedString, Window,
-    div, prelude::*, px, rgb, size, svg,
+    AssetSource, Context, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
+    RenderImage, SharedString, Window, div, img, prelude::*, px, rgb, size, svg,
 };
 
 use crate::core::{Core, Failure};
-use crate::hotkey::Action;
-use crate::platform::MonitorInfo;
+use crate::hotkey::{Action, Hotkey, Key};
+use crate::platform::{MonitorInfo, WindowCandidate};
 
 pub const WIDTH: f32 = 340.0;
 
 /// The height with nothing expanded: the shape that sits on screen during a
 /// broadcast, and the one worth keeping small.
 pub const HEIGHT: f32 = 430.0;
+
+/// The sub-surfaces, each sized for its own content.
+/// A row plus the gap under it, measured rather than guessed.
+const CANDIDATE_ROW: f32 = 79.0;
+/// Beyond this the list scrolls rather than the window growing off the screen.
+const PICKER_MAX_HEIGHT: f32 = 620.0;
+const SETTINGS_HEIGHT: f32 = 496.0;
+const HOTKEYS_HEIGHT: f32 = 300.0;
 
 /// What an expanded block adds.
 const PANEL_HEADING: f32 = 21.0;
@@ -73,7 +83,7 @@ const HEADER_HEIGHT: f32 = 52.0;
 /// margin. That is also why the window carries its own minimise and close: on
 /// Windows they are the only ones there are.
 #[cfg(target_os = "macos")]
-const TITLE_INSET: f32 = 78.0;
+const TITLE_INSET: f32 = 88.0;
 #[cfg(not(target_os = "macos"))]
 const TITLE_INSET: f32 = 16.0;
 
@@ -109,7 +119,7 @@ macro_rules! icons {
 
 icons![
     "display", "video", "media", "keyboard", "settings", "info", "minimize", "close", "check",
-    "alert",
+    "alert", "back",
 ];
 
 /// What the surface is currently able to do.
@@ -132,6 +142,7 @@ enum Chip {
     Set,
     Needed,
     Optional,
+    Likely,
 }
 
 struct Message {
@@ -139,35 +150,136 @@ struct Message {
     failed: bool,
 }
 
-/// Which footer panel is open, if any. Only one at a time: this is a small
-/// window and two open panels would be a screen.
+/// Which window the picker is choosing.
 #[derive(PartialEq, Clone, Copy)]
-enum Panel {
-    Hotkeys,
+pub enum PickerFor {
+    Zoom,
+    Media,
+}
+
+/// What the window is showing.
+///
+/// The live controls are never a screen away — `Main` is where the window
+/// opens and where it returns — but the picker, the settings and the hotkeys
+/// each take the whole surface when asked for. `src/app.rs` records why the
+/// eframe version refused to navigate: a window that resized on every
+/// navigation jumped size when nobody had asked it to. Here the only way into
+/// one of these is a press, so the resize is always something the user asked
+/// for.
+#[derive(PartialEq, Clone, Copy)]
+enum Screen {
+    Main,
+    Picker(PickerFor),
     Settings,
+    Hotkeys,
 }
 
 pub struct WinSendGpui {
     core: Core,
     status: Vec<Message>,
+    screen: Screen,
     /// Open only while the target display is being chosen, so the row reads as
     /// a value most of the time and a picker briefly.
     picking_display: bool,
-    panel: Option<Panel>,
+    /// The candidates the picker is showing, held rather than re-read each
+    /// frame: enumerating every window on the desktop is not a thing to do
+    /// sixty times a second, and a list that reordered under the pointer
+    /// would be worse than a slightly stale one.
+    candidates: Vec<WindowCandidate>,
+    /// Captured once when the picker opens. Zoom's main and video windows are
+    /// identical in process, class and title, so the picture is the only thing
+    /// that tells them apart — which is what makes this worth the trouble.
+    thumbnails: HashMap<u64, Arc<RenderImage>>,
+    /// The action whose binding is being captured, if any.
+    capturing: Option<Action>,
+    focus_handle: FocusHandle,
     /// The height last asked for, so the window is resized when the layout
     /// changes shape rather than on every frame.
     applied_height: f32,
 }
 
 impl WinSendGpui {
-    pub fn new(core: Core) -> Self {
-        Self {
+    pub fn new(core: Core, cx: &mut Context<Self>) -> Self {
+        let mut app = Self {
             core,
             status: Vec::new(),
+            screen: Screen::Main,
             picking_display: false,
-            panel: None,
+            candidates: Vec::new(),
+            thumbnails: HashMap::new(),
+            capturing: None,
+            focus_handle: cx.focus_handle(),
             applied_height: HEIGHT,
+        };
+        app.open_requested_screen();
+        app
+    }
+
+    /// Open straight onto a surface, the same way the eframe binary does.
+    ///
+    /// Debug only: a release build has no business reading this, and the
+    /// surfaces are all a press away in any case.
+    fn open_requested_screen(&mut self) {
+        #[cfg(debug_assertions)]
+        match std::env::var("WINSEND_SCREEN").as_deref() {
+            Ok("select") => self.open_picker(PickerFor::Zoom),
+            Ok("media") => self.open_picker(PickerFor::Media),
+            Ok("settings") => self.screen = Screen::Settings,
+            Ok("hotkeys") => self.screen = Screen::Hotkeys,
+            _ => {}
         }
+    }
+
+    fn open_picker(&mut self, picker: PickerFor) {
+        self.candidates = match picker {
+            PickerFor::Zoom => self.core.candidates(),
+            PickerFor::Media => self.core.media_candidates(),
+        };
+        self.thumbnails.clear();
+        for candidate in &self.candidates {
+            if let Some(shot) = self.core.platform.thumbnail(candidate.handle) {
+                if let Some(image) = render_image(&shot) {
+                    self.thumbnails.insert(candidate.handle, image);
+                }
+            }
+        }
+        self.screen = Screen::Picker(picker);
+    }
+
+    fn confirm(&mut self, picker: PickerFor, candidate: &WindowCandidate) {
+        let outcome = match picker {
+            PickerFor::Zoom => self.core.confirm_window(candidate),
+            PickerFor::Media => self.core.confirm_media_window(candidate),
+        };
+        self.report(outcome);
+        self.screen = Screen::Main;
+        self.candidates.clear();
+        self.thumbnails.clear();
+    }
+
+    /// Turn a captured keystroke into a binding, or say why it cannot be one.
+    ///
+    /// The rules live in `Hotkey` and `Core`, not here: a bare key is refused
+    /// because a global binding swallows it everywhere, and a duplicate is
+    /// refused because two actions cannot share one combination. This only
+    /// translates GPUI's keystroke into the shape those rules are written in.
+    fn capture(&mut self, action: Action, event: &KeyDownEvent) {
+        let modifiers = event.keystroke.modifiers;
+        // A press that is only a modifier is the operator on their way to the
+        // combination, not the combination.
+        let Some(key) = key_from_keystroke(&event.keystroke.key) else {
+            return;
+        };
+        let hotkey = Hotkey {
+            ctrl: modifiers.control,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+            win: modifiers.platform,
+            key,
+        };
+        self.capturing = None;
+        let outcome = self.core.set_hotkey(action, Some(hotkey));
+        self.report(outcome);
     }
 
     fn state(&self) -> State {
@@ -206,31 +318,25 @@ impl WinSendGpui {
         };
         self.report(outcome);
     }
-
-    /// The picker is not ported yet. This takes the same path it would, on the
-    /// candidate `Core` already considers most likely to be Zoom.
-    fn confirm_zoom(&mut self) {
-        match self.core.candidates().into_iter().find(|c| c.likely_zoom) {
-            Some(candidate) => {
-                let outcome = self.core.confirm_window(&candidate);
-                self.report(outcome);
-            }
-            None => self.note("No Zoom video window is open", true),
-        }
-    }
-
     fn height(&self) -> f32 {
-        let mut height = HEIGHT;
-        if self.picking_display {
-            let rows = self.core.monitors().len() as f32;
-            height += BLOCK_GAP + PANEL_HEADING + rows * PICKER_ROW + (rows - 1.0).max(0.0) * ROW_GAP;
+        match self.screen {
+            Screen::Picker(_) => {
+                let rows = self.candidates.len() as f32;
+                let content = HEADER_HEIGHT + 48.0 + rows * CANDIDATE_ROW + 7.0;
+                content.min(PICKER_MAX_HEIGHT).max(240.0)
+            }
+            Screen::Settings => SETTINGS_HEIGHT,
+            Screen::Hotkeys => HOTKEYS_HEIGHT,
+            Screen::Main if self.picking_display => {
+                let rows = self.core.monitors().len() as f32;
+                HEIGHT
+                    + BLOCK_GAP
+                    + PANEL_HEADING
+                    + rows * PICKER_ROW
+                    + (rows - 1.0).max(0.0) * ROW_GAP
+            }
+            Screen::Main => HEIGHT,
         }
-        height += match self.panel {
-            Some(Panel::Hotkeys) => BLOCK_GAP + PANEL_HEADING + 3.0 * 18.0,
-            Some(Panel::Settings) => BLOCK_GAP + PANEL_HEADING + 4.0 * 24.0,
-            None => 0.0,
-        };
-        height
     }
 }
 
@@ -271,6 +377,7 @@ fn chip(kind: Chip) -> impl IntoElement {
         Chip::Set => ("SET", OK),
         Chip::Needed => ("NEEDED", WARN),
         Chip::Optional => ("OPTIONAL", FAINT),
+        Chip::Likely => ("LIKELY", ACCENT),
     };
     div()
         .px_2()
@@ -363,7 +470,6 @@ fn footer_button(
     id: &'static str,
     glyph: &'static str,
     label: &'static str,
-    active: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -380,15 +486,10 @@ fn footer_button(
                 .w(px(38.))
                 .h(px(38.))
                 .rounded_full()
-                .bg(rgb(if active { ROW_HOVER } else { ROW }))
-                .child(icon(glyph, 17.0, if active { ACCENT } else { SUBDUED })),
+                .bg(rgb(ROW))
+                .child(icon(glyph, 17.0, SUBDUED)),
         )
-        .child(
-            div()
-                .text_size(px(10.))
-                .text_color(rgb(if active { TEXT } else { FAINT }))
-                .child(label),
-        )
+        .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(label))
 }
 
 fn section(label: &'static str) -> impl IntoElement {
@@ -399,18 +500,51 @@ fn section(label: &'static str) -> impl IntoElement {
         .child(label)
 }
 
+/// A window thumbnail, converted for GPUI.
+///
+/// `RenderImage` is BGRA and `Thumbnail` is RGBA, so the red and blue channels
+/// are swapped on the way in. Without it every preview comes out looking like
+/// a colour-negative, which reads as a broken capture rather than a wrong
+/// channel order.
+fn render_image(shot: &crate::platform::Thumbnail) -> Option<Arc<RenderImage>> {
+    let mut bgra = shot.rgba.clone();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::ImageBuffer::from_raw(shot.width, shot.height, bgra)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
+/// GPUI names keys the way they are printed; `Key` parses the same names with
+/// a capital. Everything that is not a single character or a function key is
+/// spelled differently at the two ends and is mapped by hand.
+fn key_from_keystroke(key: &str) -> Option<Key> {
+    let name = match key {
+        "escape" => "Escape",
+        "tab" => "Tab",
+        "backspace" => "Backspace",
+        "enter" => "Enter",
+        "space" => "Space",
+        "insert" => "Insert",
+        "delete" => "Delete",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
+        "left" => "Left",
+        "right" => "Right",
+        "up" => "Up",
+        "down" => "Down",
+        // A modifier on its own is the operator part-way to a combination.
+        "ctrl" | "alt" | "shift" | "cmd" | "win" | "fn" => return None,
+        // Letters, digits and function keys name themselves.
+        other => return other.to_uppercase().parse().ok(),
+    };
+    name.parse().ok()
+}
+
 impl Render for WinSendGpui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.state();
-        let target = self.target();
-        let monitors = self.core.monitors();
-        let can_retrieve = self.core.can_retrieve();
-        let can_send = state != State::Blocked;
-        // Exactly one control is filled, and which one follows the state: Send
-        // while nothing is out, Retrieve once something is. Pressing Send twice
-        // is already a no-op, so nothing is lost by demoting it.
-        let sent = state == State::Sent;
-
         // Only when the shape actually changed. Resizing every frame would
         // fight the user's own drag on the window edge.
         let wanted = self.height();
@@ -418,6 +552,57 @@ impl Render for WinSendGpui {
             window.resize(size(px(WIDTH), px(wanted)));
             self.applied_height = wanted;
         }
+
+        let screen = self.screen;
+        let capturing = self.capturing;
+
+        div()
+            .track_focus(&self.focus_handle)
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            // Armed only while a binding is being captured, so ordinary typing
+            // in the window is never swallowed.
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if let Some(action) = capturing {
+                    this.capture(action, event);
+                    cx.notify();
+                }
+            }))
+            .child(match screen {
+                Screen::Main => self.main_header(cx).into_any_element(),
+                Screen::Picker(PickerFor::Zoom) => {
+                    self.sub_header("Select Zoom window", cx).into_any_element()
+                }
+                Screen::Picker(PickerFor::Media) => {
+                    self.sub_header("Select media window", cx).into_any_element()
+                }
+                Screen::Settings => self.sub_header("Settings", cx).into_any_element(),
+                Screen::Hotkeys => self.sub_header("Hotkeys", cx).into_any_element(),
+            })
+            .child(match screen {
+                Screen::Main => self.main(cx).into_any_element(),
+                Screen::Picker(picker) => self.picker(picker, cx).into_any_element(),
+                Screen::Settings => self.settings(cx).into_any_element(),
+                Screen::Hotkeys => self.hotkeys(cx).into_any_element(),
+            })
+    }
+}
+
+impl WinSendGpui {
+    /// The live surface: the three rows, the two actions, the footer.
+    fn main(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state();
+        let target = self.target();
+        let monitors = self.core.monitors();
+        let can_retrieve = self.core.can_retrieve();
+        let can_send = state != State::Blocked;
+        let sent = state == State::Sent;
+        let zoom_set = self.core.config.zoom_window.is_some();
+        let media_set = self.core.config.media_window.is_some();
+        let picking = self.picking_display;
 
         let zoom_label = self
             .core
@@ -434,18 +619,11 @@ impl Render for WinSendGpui {
             .as_ref()
             .map(|w| if w.title.is_empty() { w.process_name.clone() } else { w.title.clone() })
             .unwrap_or_else(|| "Media player".to_string());
-        let zoom_set = self.core.config.zoom_window.is_some();
-        let media_set = self.core.config.media_window.is_some();
-        let picking = self.picking_display;
-        let panel = self.panel;
 
         div()
             .flex()
             .flex_col()
-            .size_full()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
-            .child(header(sent, cx))
+            .flex_1()
             .child(
                 div()
                     .flex()
@@ -453,8 +631,6 @@ impl Render for WinSendGpui {
                     .gap_2()
                     .px_4()
                     .pb_3()
-                    // The row is the value, and opens the picker in place
-                    // rather than navigating anywhere.
                     .child(
                         row(
                             "row-display",
@@ -498,7 +674,7 @@ impl Render for WinSendGpui {
                             Some(if zoom_set {
                                 "confirmed".to_string()
                             } else {
-                                "pin someone in Zoom, then confirm".to_string()
+                                "pin someone in Zoom, then choose".to_string()
                             }),
                             if zoom_set {
                                 chip(Chip::Set).into_any_element()
@@ -507,7 +683,7 @@ impl Render for WinSendGpui {
                             },
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.confirm_zoom();
+                            this.open_picker(PickerFor::Zoom);
                             cx.notify();
                         })),
                     )
@@ -528,7 +704,7 @@ impl Render for WinSendGpui {
                             },
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.note("The media window picker is not ported yet", false);
+                            this.open_picker(PickerFor::Media);
                             cx.notify();
                         })),
                     ),
@@ -557,37 +733,18 @@ impl Render for WinSendGpui {
                     ),
             )
             .child(status_strip(&self.status))
-            .when_some(panel, |this, panel| {
-                this.child(div().px_4().pb_2().child(match panel {
-                    Panel::Hotkeys => hotkeys_panel(&self.core).into_any_element(),
-                    Panel::Settings => settings_panel(&self.core).into_any_element(),
-                }))
-            })
-            .child(footer(panel, cx))
+            .child(footer(cx))
     }
 }
 
-/// The drawn header: name and live state on the left, close on the right.
-///
-/// Where Loom puts its logo. The state lives here rather than in a banner of
-/// its own, because with the rows carrying their own chips the only thing left
-/// to say at the top is whether a window is out right now.
-fn header(sent: bool, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
-    let (tone, label) = if sent { (ACCENT, "ON TARGET") } else { (FAINT, "IDLE") };
+impl WinSendGpui {
+    /// The live surface's header: state on the left, window controls right.
+    fn main_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sent = self.state() == State::Sent;
+        let (tone, label) = if sent { (ACCENT, "ON TARGET") } else { (FAINT, "IDLE") };
 
-    div()
-        .id("header")
-        .flex()
-        .items_center()
-        .justify_between()
-        .w_full()
-        .h(px(HEADER_HEIGHT))
-        .pr_2()
-        .pl(px(TITLE_INSET))
-        // The system titlebar is transparent, which takes the window's drag
-        // handle with it. This puts it back on the header, where it was.
-        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-        .child(
+        header_shell(cx)
+            .child(
             div()
                 .flex()
                 .items_center()
@@ -604,19 +761,495 @@ fn header(sent: bool, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
                         .text_color(rgb(tone))
                         .child(label),
                 ),
-        )
-        .child(
+            )
+            .child(header_controls(cx))
+    }
+
+    /// A sub-surface's header: a way back, and what this is.
+    fn sub_header(&self, title: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        header_shell(cx)
+            .child(
             div()
                 .flex()
                 .items_center()
-                .gap_1()
-                .child(chrome_button("minimize", "minimize").on_click(cx.listener(
-                    |_, _, window, _| window.minimize_window(),
-                )))
-                .child(chrome_button("close", "close").on_click(cx.listener(
-                    |_, _, window, _| window.remove_window(),
-                ))),
+                .gap_2()
+                .child(
+                    div()
+                        .id("back")
+                        .flex()
+                        .justify_center()
+                        .items_center()
+                        .w(px(26.))
+                        .h(px(26.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(ROW_HOVER)))
+                        .child(icon("back", 15.0, SUBDUED))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.screen = Screen::Main;
+                            this.capturing = None;
+                            this.candidates.clear();
+                            this.thumbnails.clear();
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                ),
+            )
+            .child(header_controls(cx))
+    }
+
+    /// The window selector.
+    ///
+    /// The thumbnail is the point rather than decoration: Zoom's main and
+    /// video windows carry the same process, class and title, so the list can
+    /// only be told apart by looking at it.
+    fn picker(&mut self, picker: PickerFor, cx: &mut Context<Self>) -> impl IntoElement {
+        let hint = match picker {
+            PickerFor::Zoom => "Pin someone in Zoom first, then pick the window showing only that video feed.",
+            PickerFor::Media => "Pick the media player to restore. A full-screen video window often has no title, so go by the process.",
+        };
+        let candidates = self.candidates.clone();
+        let thumbnails: HashMap<u64, Arc<RenderImage>> = self.thumbnails.clone();
+
+        div()
+            .id("picker")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap_2()
+            .px_4()
+            .pb_4()
+            .overflow_y_scroll()
+            .child(div().text_size(px(11.)).text_color(rgb(SUBDUED)).pb_1().child(hint))
+            .when(candidates.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .py_8()
+                        .text_size(px(12.))
+                        .text_color(rgb(FAINT))
+                        .child("Nothing to choose from"),
+                )
+            })
+            .children(candidates.into_iter().map(move |candidate| {
+                candidate_row(candidate, thumbnails.clone(), picker, cx)
+            }))
+    }
+
+    /// The settings, as toggles that write straight through `Core`.
+    fn settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let config = &self.core.config;
+        let rows = [
+            (
+                "set-clear",
+                "Minimize others on target",
+                "Some players pause while minimized",
+                config.clear_target,
+                Setting::ClearTarget,
+            ),
+            (
+                "set-borderless",
+                "Strip window frame when sending",
+                "Fills the target display edge to edge",
+                config.borderless,
+                Setting::Borderless,
+            ),
+            (
+                "set-fade",
+                "Fade out when retrieving",
+                "Uncovers the display smoothly instead of cutting",
+                config.fade_on_retrieve,
+                Setting::Fade,
+            ),
+            (
+                "set-restore",
+                "Return full-screen video after Retrieve",
+                "Uses the player's own shortcut, at most once",
+                config.restore_fullscreen,
+                Setting::RestoreFullscreen,
+            ),
+            (
+                "set-updates",
+                "Check for updates on startup",
+                "Nothing downloads until you click it",
+                config.check_for_updates,
+                Setting::CheckUpdates,
+            ),
+        ];
+
+        div()
+            .id("settings")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap_2()
+            .px_4()
+            .pb_4()
+            .overflow_y_scroll()
+            .children(rows.into_iter().map(|(id, label, detail, on, setting)| {
+                setting_row(id, label, detail, on, setting, cx)
+            }))
+            .child(
+                div()
+                    .id("diagnostics")
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .w_full()
+                    .h(px(38.))
+                    .mt_2()
+                    .rounded_full()
+                    .bg(rgb(ROW))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(ROW_HOVER)))
+                    .text_size(px(12.))
+                    .child("Copy diagnostics")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // The clipboard first, because the file lands in
+                        // AppData, which Explorer hides by default.
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            this.core.diagnostics(),
+                        ));
+                        let saved = this.core.save_diagnostics();
+                        this.report(saved.map(|where_to| format!("Copied. {where_to}")));
+                        cx.notify();
+                    })),
+            )
+            .child(status_strip(&self.status))
+    }
+
+    /// The bindings, and the capture that sets them.
+    fn hotkeys(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let capturing = self.capturing;
+        let bindings: Vec<(Action, Option<Hotkey>)> = Action::ALL
+            .into_iter()
+            .map(|action| (action, self.core.config.hotkeys.binding(action)))
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap_2()
+            .px_4()
+            .pb_4()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(SUBDUED))
+                    .pb_1()
+                    .child("Work from inside Zoom, without focusing this window."),
+            )
+            .children(bindings.into_iter().map(|(action, bound)| {
+                binding_row(action, bound, capturing == Some(action), cx)
+            }))
+            .child(status_strip(&self.status))
+    }
+}
+
+/// Which setting a toggle writes. Named rather than passed as a closure so the
+/// list above stays a table of what exists rather than a list of callbacks.
+#[derive(Clone, Copy)]
+enum Setting {
+    ClearTarget,
+    Borderless,
+    Fade,
+    RestoreFullscreen,
+    CheckUpdates,
+}
+
+impl Setting {
+    fn apply(self, core: &mut Core, on: bool) -> Result<(), String> {
+        match self {
+            Setting::ClearTarget => core.set_clear_target(on),
+            Setting::Borderless => core.set_borderless(on),
+            Setting::Fade => core.set_fade_on_retrieve(on),
+            Setting::RestoreFullscreen => core.set_restore_fullscreen(on),
+            Setting::CheckUpdates => core.set_check_for_updates(on),
+        }
+    }
+}
+
+/// The header both surfaces share: content on the left, window controls right.
+fn header_shell(cx: &mut Context<WinSendGpui>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("header")
+        .flex()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .h(px(HEADER_HEIGHT))
+        .pr_2()
+        .pl(px(TITLE_INSET))
+        // The system titlebar is transparent, which takes the window's drag
+        // handle with it. This puts it back on the header, where it was.
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+}
+
+/// The window controls, added after a header's own content so that
+/// `justify_between` puts them on the right.
+fn header_controls(cx: &mut Context<WinSendGpui>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(chrome_button("minimize", "minimize").on_click(cx.listener(
+            |_, _, window, _| window.minimize_window(),
+        )))
+        .child(chrome_button("close", "close").on_click(cx.listener(
+            |_, _, window, _| window.remove_window(),
+        )))
+}
+
+/// A window in the selector: a picture, what it is, and where.
+fn candidate_row(
+    candidate: WindowCandidate,
+    thumbnails: HashMap<u64, Arc<RenderImage>>,
+    picker: PickerFor,
+    cx: &mut Context<WinSendGpui>,
+) -> impl IntoElement {
+    // An untitled window is included on purpose in the media list; a blank
+    // heading would read as a bug.
+    let heading = if candidate.title.is_empty() {
+        "(no title)".to_string()
+    } else {
+        candidate.title.clone()
+    };
+    let detail = format!("{} · {}", candidate.process_name, candidate.class_name);
+    let where_to = format!(
+        "{}x{} on {}",
+        candidate.bounds.width, candidate.bounds.height, candidate.monitor_id
+    );
+    let thumbnail = thumbnails.get(&candidate.handle).cloned();
+    let id = SharedString::from(format!("cand-{}", candidate.handle));
+
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_3()
+        .w_full()
+        .p_2()
+        .rounded_lg()
+        .bg(rgb(ROW))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .child(match thumbnail {
+            Some(image) => img(image)
+                .w(px(96.))
+                .h(px(54.))
+                .rounded_md()
+                .into_any_element(),
+            // A window that will not be captured is still a window that can be
+            // chosen. GPU-composited ones routinely refuse.
+            None => div()
+                .flex()
+                .justify_center()
+                .items_center()
+                .w(px(96.))
+                .h(px(54.))
+                .rounded_md()
+                .bg(rgb(BG))
+                .text_size(px(9.))
+                .text_color(rgb(FAINT))
+                .child("no preview")
+                .into_any_element(),
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .truncate()
+                        .child(heading),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(SUBDUED))
+                        .truncate()
+                        .child(detail),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(FAINT))
+                        .truncate()
+                        .child(where_to),
+                ),
         )
+        .when(candidate.likely_zoom && picker == PickerFor::Zoom, |this| {
+            this.child(chip(Chip::Likely))
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.confirm(picker, &candidate);
+            cx.notify();
+        }))
+}
+
+/// A setting: what it does, why, and a switch.
+fn setting_row(
+    id: &'static str,
+    label: &'static str,
+    detail: &'static str,
+    on: bool,
+    setting: Setting,
+    cx: &mut Context<WinSendGpui>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_3()
+        .w_full()
+        .p_3()
+        .rounded_lg()
+        .bg(rgb(ROW))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(ROW_HOVER)))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label),
+                )
+                .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child(detail)),
+        )
+        .child(switch(on))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Err(message) = setting.apply(&mut this.core, !on) {
+                this.note(&message, true);
+            }
+            cx.notify();
+        }))
+}
+
+/// A drawn switch. GPUI ships no controls, so this is a track and a knob.
+fn switch(on: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .w(px(36.))
+        .h(px(20.))
+        .p(px(2.))
+        .rounded_full()
+        .bg(if on { rgb(ACCENT).into() } else { tint(TEXT, 0.12) })
+        .when(!on, |this| this.justify_start())
+        .when(on, |this| this.justify_end())
+        .child(div().w(px(16.)).h(px(16.)).rounded_full().bg(rgb(0xffffff)))
+}
+
+/// One action, its binding, and the controls that change it.
+fn binding_row(
+    action: Action,
+    bound: Option<Hotkey>,
+    capturing: bool,
+    cx: &mut Context<WinSendGpui>,
+) -> impl IntoElement {
+    let row_id = SharedString::from(format!("bind-{}", action.label()));
+    let set_id = SharedString::from(format!("set-{}", action.label()));
+    let clear_id = SharedString::from(format!("clear-{}", action.label()));
+
+    div()
+        .id(row_id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .h(px(52.))
+        .px_3()
+        .rounded_lg()
+        .bg(rgb(ROW))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(action.label()),
+                )
+                .child(if capturing {
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(ACCENT))
+                        .child("press a combination")
+                        .into_any_element()
+                } else {
+                    match &bound {
+                        Some(hotkey) => div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(SUBDUED))
+                            .child(hotkey.to_string())
+                            .into_any_element(),
+                        None => div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(FAINT))
+                            .child("not set")
+                            .into_any_element(),
+                    }
+                }),
+        )
+        .when(bound.is_some() && !capturing, |this| {
+            this.child(
+                small_button(clear_id, "Clear").on_click(cx.listener(move |this, _, _, cx| {
+                    let outcome = this.core.set_hotkey(action, None);
+                    this.report(outcome);
+                    cx.notify();
+                })),
+            )
+        })
+        .child(
+            small_button(set_id, if capturing { "Cancel" } else if bound.is_some() { "Change" } else { "Set" })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.capturing = if capturing { None } else { Some(action) };
+                    // The key listener sits on the root and only fires while
+                    // the window holds focus, so capture has to take it.
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                })),
+        )
+}
+
+fn small_button(id: SharedString, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .justify_center()
+        .items_center()
+        .h(px(26.))
+        .px_3()
+        .rounded_full()
+        .bg(rgb(BG))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .cursor_pointer()
+        .hover(|style| style.border_color(rgb(ACCENT)))
+        .text_size(px(11.))
+        .child(label)
 }
 
 /// A window control in the drawn header.
@@ -641,7 +1274,7 @@ fn chrome_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
-/// One display in the in-place picker.
+/// One display in the in-place picker on the live surface.
 fn picker_row(
     monitor: MonitorInfo,
     chosen: bool,
@@ -697,68 +1330,10 @@ fn status_strip(status: &[Message]) -> impl IntoElement {
         }))
 }
 
-/// What is bound. Behind a footer button rather than on the surface: with the
-/// rows carrying the setup, the live shape has room for what is urgent only.
-fn hotkeys_panel(core: &Core) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .w_full()
-        .child(section("HOTKEYS"))
-        .children(Action::ALL.into_iter().map(|action| {
-            let bound = core.config.hotkeys.binding(action);
-            let (text, colour) = match bound {
-                Some(hotkey) => (hotkey.to_string(), TEXT),
-                None => ("not set".to_string(), FAINT),
-            };
-            div()
-                .flex()
-                .justify_between()
-                .w_full()
-                .text_size(px(11.))
-                .child(div().text_color(rgb(SUBDUED)).child(action.label()))
-                .child(div().text_color(rgb(colour)).child(text))
-        }))
-}
-
-/// Read-only for now: the toggles write through `Core` in the eframe surface,
-/// and duplicating that here before the front end is chosen would be two
-/// places to keep one setting true.
-fn settings_panel(core: &Core) -> impl IntoElement {
-    let settings = [
-        ("Minimize others on target", core.config.clear_target),
-        ("Strip window frame", core.config.borderless),
-        ("Fade out on Retrieve", core.config.fade_on_retrieve),
-        ("Restore full-screen video", core.config.restore_fullscreen),
-    ];
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .w_full()
-        .child(section("SETTINGS"))
-        .children(settings.into_iter().map(|(label, on)| {
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .w_full()
-                .h(px(22.))
-                .text_size(px(11.))
-                .child(div().text_color(rgb(SUBDUED)).child(label))
-                .child(if on {
-                    icon("check", 13.0, OK).into_any_element()
-                } else {
-                    div().text_size(px(10.)).text_color(rgb(FAINT)).child("off").into_any_element()
-                })
-        }))
-}
-
 /// Loom's row of circular buttons, for what is occasionally needed and never
-/// urgent.
-fn footer(open: Option<Panel>, cx: &mut Context<WinSendGpui>) -> impl IntoElement {
+/// urgent. Each opens a surface of its own rather than expanding in place:
+/// they are reached by a press, so the resize is always asked for.
+fn footer(cx: &mut Context<WinSendGpui>) -> impl IntoElement {
     div()
         .flex()
         .justify_around()
@@ -770,21 +1345,23 @@ fn footer(open: Option<Panel>, cx: &mut Context<WinSendGpui>) -> impl IntoElemen
         .border_t_1()
         .border_color(rgb(BORDER))
         .child(
-            footer_button("f-hotkeys", "keyboard", "Hotkeys", open == Some(Panel::Hotkeys))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.panel = (this.panel != Some(Panel::Hotkeys)).then_some(Panel::Hotkeys);
+            footer_button("f-hotkeys", "keyboard", "Hotkeys").on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.screen = Screen::Hotkeys;
                     cx.notify();
-                })),
+                },
+            )),
         )
         .child(
-            footer_button("f-settings", "settings", "Settings", open == Some(Panel::Settings))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.panel = (this.panel != Some(Panel::Settings)).then_some(Panel::Settings);
+            footer_button("f-settings", "settings", "Settings").on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.screen = Screen::Settings;
                     cx.notify();
-                })),
+                },
+            )),
         )
         .child(
-            footer_button("f-diagnostics", "info", "Diagnostics", false).on_click(cx.listener(
+            footer_button("f-diagnostics", "info", "Diagnostics").on_click(cx.listener(
                 |this, _, _, cx| {
                     // The clipboard first, because the file lands in AppData,
                     // which Explorer hides by default.
