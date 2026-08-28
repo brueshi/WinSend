@@ -41,20 +41,23 @@ pub const WIDTH: f32 = 340.0;
 /// broadcast, and the one worth keeping small.
 pub const HEIGHT: f32 = 416.0;
 
-/// The sub-surfaces, each sized for its own content.
+/// The chooser beside the surface.
+const PANEL_WIDTH: f32 = 340.0;
+const PANEL_GAP: f32 = 10.0;
+/// A panel's own margins and padding, its header and its hint, before any
+/// rows. Measured against the widest hint, which wraps to two lines.
+const PANEL_CHROME: f32 = 122.0;
+
 /// A row plus the gap under it, measured rather than guessed.
-const CANDIDATE_ROW: f32 = 79.0;
+const CANDIDATE_ROW: f32 = 74.0;
 /// Beyond this the list scrolls rather than the window growing off the screen.
 const PICKER_MAX_HEIGHT: f32 = 620.0;
 const SETTINGS_HEIGHT: f32 = 512.0;
 const HOTKEYS_HEIGHT: f32 = 260.0;
 
-/// What an expanded block adds.
-const PANEL_HEADING: f32 = 21.0;
 const PICKER_ROW: f32 = 36.0;
 const ROW_HEIGHT: f32 = 56.0;
 const ROW_GAP: f32 = 10.0;
-const BLOCK_GAP: f32 = 12.0;
 
 /// The colours the surface is drawn from.
 ///
@@ -253,7 +256,6 @@ enum Chip {
     Set,
     Needed,
     Optional,
-    Likely,
 }
 
 #[derive(Clone)]
@@ -281,9 +283,23 @@ pub enum PickerFor {
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
     Main,
-    Picker(PickerFor),
     Settings,
     Hotkeys,
+}
+
+/// A chooser, open beside the surface rather than over it.
+///
+/// Loom opens its camera and screen pickers as a panel to the side, with the
+/// row that opened it still filled and still readable. That is worth copying:
+/// a picker that replaces the surface takes away the context you are picking
+/// for. GPUI's native anchored popup is rejected on both macOS and Windows, so
+/// this is one window that grows sideways rather than a second window placed
+/// by hand — which in an application about multi-monitor placement is the
+/// hand-placing worth avoiding.
+#[derive(PartialEq, Clone, Copy)]
+enum Side {
+    Display,
+    Window(PickerFor),
 }
 
 pub struct WinSendGpui {
@@ -296,9 +312,8 @@ pub struct WinSendGpui {
     /// cleared by the timer armed for the one it replaced.
     toast_seq: u64,
     screen: Screen,
-    /// Open only while the target display is being chosen, so the row reads as
-    /// a value most of the time and a picker briefly.
-    picking_display: bool,
+    /// The chooser open beside the surface, if any.
+    side: Option<Side>,
     /// The candidates the picker is showing, held rather than re-read each
     /// frame: enumerating every window on the desktop is not a thing to do
     /// sixty times a second, and a list that reordered under the pointer
@@ -311,9 +326,9 @@ pub struct WinSendGpui {
     /// The action whose binding is being captured, if any.
     capturing: Option<Action>,
     focus_handle: FocusHandle,
-    /// The height last asked for, so the window is resized when the layout
+    /// The size last asked for, so the window is resized when the layout
     /// changes shape rather than on every frame.
-    applied_height: f32,
+    applied: (f32, f32),
 }
 
 impl WinSendGpui {
@@ -323,12 +338,12 @@ impl WinSendGpui {
             toast: None,
             toast_seq: 0,
             screen: Screen::Main,
-            picking_display: false,
+            side: None,
             candidates: Vec::new(),
             thumbnails: HashMap::new(),
             capturing: None,
             focus_handle: cx.focus_handle(),
-            applied_height: HEIGHT,
+            applied: (WIDTH, HEIGHT),
         };
         set_palette(app.core.config.light_theme);
         app.open_requested_screen();
@@ -342,9 +357,9 @@ impl WinSendGpui {
     fn open_requested_screen(&mut self) {
         #[cfg(debug_assertions)]
         match std::env::var("WINSEND_SCREEN").as_deref() {
-            Ok("select") => self.open_picker(PickerFor::Zoom),
-            Ok("media") => self.open_picker(PickerFor::Media),
-            Ok("display") => self.picking_display = true,
+            Ok("select") => self.open_side(Side::Window(PickerFor::Zoom)),
+            Ok("media") => self.open_side(Side::Window(PickerFor::Media)),
+            Ok("display") => self.open_side(Side::Display),
             // Goes through Core against the mock desktop, so what is on
             // screen afterwards is the real sent state rather than a flag.
             // The window has to be confirmed first: the config remembers what
@@ -366,7 +381,26 @@ impl WinSendGpui {
 
 
 
-    fn open_picker(&mut self, picker: PickerFor) {
+    fn open_side(&mut self, side: Side) {
+        // A second press on the row that opened it closes it, the way a menu
+        // button works.
+        if self.side == Some(side) {
+            self.close_side();
+            return;
+        }
+        if let Side::Window(picker) = side {
+            self.load_candidates(picker);
+        }
+        self.side = Some(side);
+    }
+
+    fn close_side(&mut self) {
+        self.side = None;
+        self.candidates.clear();
+        self.thumbnails.clear();
+    }
+
+    fn load_candidates(&mut self, picker: PickerFor) {
         self.candidates = match picker {
             PickerFor::Zoom => self.core.candidates(),
             PickerFor::Media => self.core.media_candidates(),
@@ -379,7 +413,6 @@ impl WinSendGpui {
                 }
             }
         }
-        self.screen = Screen::Picker(picker);
     }
 
     fn confirm(&mut self, picker: PickerFor, candidate: &WindowCandidate, cx: &mut Context<Self>) {
@@ -388,9 +421,7 @@ impl WinSendGpui {
             PickerFor::Media => self.core.confirm_media_window(candidate),
         };
         self.report(outcome, cx);
-        self.screen = Screen::Main;
-        self.candidates.clear();
-        self.thumbnails.clear();
+        self.close_side();
     }
 
     /// Turn a captured keystroke into a binding, or say why it cannot be one.
@@ -483,25 +514,29 @@ impl WinSendGpui {
         };
         self.report(outcome, cx);
     }
+    fn width(&self) -> f32 {
+        if self.side.is_some() { WIDTH + PANEL_GAP + PANEL_WIDTH } else { WIDTH }
+    }
+
+    /// Tall enough for whichever column needs more.
     fn height(&self) -> f32 {
-        match self.screen {
-            Screen::Picker(_) => {
-                let rows = self.candidates.len() as f32;
-                let content = HEADER_HEIGHT + 48.0 + rows * CANDIDATE_ROW + 7.0;
-                content.min(PICKER_MAX_HEIGHT).max(240.0)
-            }
+        let main = match self.screen {
             Screen::Settings => SETTINGS_HEIGHT,
             Screen::Hotkeys => HOTKEYS_HEIGHT,
-            Screen::Main if self.picking_display => {
-                let rows = self.core.monitors().len() as f32;
-                HEIGHT
-                    + BLOCK_GAP
-                    + PANEL_HEADING
-                    + rows * PICKER_ROW
-                    + (rows - 1.0).max(0.0) * ROW_GAP
-            }
             Screen::Main => HEIGHT,
-        }
+        };
+        let panel = match self.side {
+            None => 0.0,
+            Some(Side::Display) => {
+                let rows = self.core.monitors().len() as f32;
+                PANEL_CHROME + rows * (PICKER_ROW + ROW_GAP)
+            }
+            Some(Side::Window(_)) => {
+                let rows = self.candidates.len().max(1) as f32;
+                PANEL_CHROME + rows * CANDIDATE_ROW
+            }
+        };
+        main.max(panel.min(PICKER_MAX_HEIGHT))
     }
 }
 
@@ -542,7 +577,6 @@ fn chip(kind: Chip, on_accent: bool) -> impl IntoElement {
         Chip::Set => ("SET", ok()),
         Chip::Needed => ("NEEDED", warn()),
         Chip::Optional => ("OPTIONAL", faint()),
-        Chip::Likely => ("LIKELY", ACCENT),
     };
     // Solid rather than tinted, the way Loom's "Off" is solid red: a chip that
     // is a wash of its own colour reads as decoration. On an accent row it
@@ -693,14 +727,6 @@ fn footer_button(
         )
 }
 
-fn section(label: &'static str) -> impl IntoElement {
-    div()
-        .text_size(px(9.5))
-        .font_weight(FontWeight::BOLD)
-        .text_color(rgb(faint()))
-        .child(label)
-}
-
 /// A window thumbnail, converted for GPUI.
 ///
 /// `RenderImage` is BGRA and `Thumbnail` is RGBA, so the red and blue channels
@@ -748,23 +774,31 @@ impl Render for WinSendGpui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Only when the shape actually changed. Resizing every frame would
         // fight the user's own drag on the window edge.
-        let wanted = self.height();
-        if (wanted - self.applied_height).abs() > 0.5 {
-            window.resize(size(px(WIDTH), px(wanted)));
-            self.applied_height = wanted;
+        let wanted = (self.width(), self.height());
+        if (wanted.0 - self.applied.0).abs() > 0.5 || (wanted.1 - self.applied.1).abs() > 0.5 {
+            window.resize(size(px(wanted.0), px(wanted.1)));
+            self.applied = wanted;
         }
 
         let screen = self.screen;
         let capturing = self.capturing;
 
+        let panel = self.side.map(|side| self.side_panel(side, cx).into_any_element());
+
         div()
             .track_focus(&self.focus_handle)
-            .relative()
             .flex()
-            .flex_col()
             .size_full()
             .bg(rgb(bg()))
             .text_color(rgb(text()))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .w(px(WIDTH))
+                    .h_full()
+                    .flex_none()
             // Armed only while a binding is being captured, so ordinary typing
             // in the window is never swallowed.
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -773,24 +807,23 @@ impl Render for WinSendGpui {
                     cx.notify();
                 }
             }))
-            .child(match screen {
-                Screen::Main => self.main_header(cx).into_any_element(),
-                Screen::Picker(PickerFor::Zoom) => {
-                    self.sub_header("Select Zoom window", cx).into_any_element()
-                }
-                Screen::Picker(PickerFor::Media) => {
-                    self.sub_header("Select media window", cx).into_any_element()
-                }
-                Screen::Settings => self.sub_header("Settings", cx).into_any_element(),
-                Screen::Hotkeys => self.sub_header("Hotkeys", cx).into_any_element(),
-            })
+                    .child(match screen {
+                        Screen::Main => self.main_header(cx).into_any_element(),
+                        Screen::Settings => {
+                            self.sub_header("Settings", cx).into_any_element()
+                        }
+                        Screen::Hotkeys => self.sub_header("Hotkeys", cx).into_any_element(),
+                    })
             .child(match screen {
                 Screen::Main => self.main(cx).into_any_element(),
-                Screen::Picker(picker) => self.picker(picker, cx).into_any_element(),
                 Screen::Settings => self.settings(cx).into_any_element(),
                 Screen::Hotkeys => self.hotkeys(cx).into_any_element(),
             })
-            .when_some(self.toast.clone(), |this, message| this.child(toast(&message, cx)))
+                    .when_some(self.toast.clone(), |this, message| {
+                        this.child(toast(&message, cx))
+                    }),
+            )
+            .children(panel)
     }
 }
 
@@ -799,13 +832,12 @@ impl WinSendGpui {
     fn main(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state();
         let target = self.target();
-        let monitors = self.core.monitors();
         let can_retrieve = self.core.can_retrieve();
         let can_send = state != State::Blocked;
         let sent = state == State::Sent;
         let zoom_set = self.core.config.zoom_window.is_some();
         let media_set = self.core.config.media_window.is_some();
-        let picking = self.picking_display;
+        let side = self.side;
 
         let zoom_label = self
             .core
@@ -843,48 +875,33 @@ impl WinSendGpui {
                                 .map(display_name)
                                 .unwrap_or_else(|| "Choose a display".to_string()),
                             if target.is_some() {
-                                chip(Chip::Set, picking).into_any_element()
+                                chip(Chip::Set, side == Some(Side::Display)).into_any_element()
                             } else {
-                                chip(Chip::Needed, picking).into_any_element()
+                                chip(Chip::Needed, side == Some(Side::Display)).into_any_element()
                             },
                             target.is_none(),
-                            picking,
+                            side == Some(Side::Display),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.picking_display = !this.picking_display;
+                            this.open_side(Side::Display);
                             cx.notify();
                         })),
                     )
-                    .when(picking, |this| {
-                        this.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .pt_1()
-                                .child(section("CHOOSE A DISPLAY"))
-                                .children(monitors.into_iter().map(|monitor| {
-                                    let chosen =
-                                        target.as_ref().map(|t| t.id.as_str()) == Some(&monitor.id);
-                                    picker_row(monitor, chosen, cx)
-                                })),
-                        )
-                    })
                     .child(
                         row(
                             "row-zoom",
                             "video",
                             zoom_label,
                             if zoom_set {
-                                chip(Chip::Set, false).into_any_element()
+                                chip(Chip::Set, side == Some(Side::Window(PickerFor::Zoom))).into_any_element()
                             } else {
-                                chip(Chip::Needed, false).into_any_element()
+                                chip(Chip::Needed, side == Some(Side::Window(PickerFor::Zoom))).into_any_element()
                             },
                             !zoom_set,
-                            false,
+                            side == Some(Side::Window(PickerFor::Zoom)),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_picker(PickerFor::Zoom);
+                            this.open_side(Side::Window(PickerFor::Zoom));
                             cx.notify();
                         })),
                     )
@@ -894,15 +911,15 @@ impl WinSendGpui {
                             "media",
                             media_label,
                             if media_set {
-                                chip(Chip::Set, false).into_any_element()
+                                chip(Chip::Set, side == Some(Side::Window(PickerFor::Media))).into_any_element()
                             } else {
-                                chip(Chip::Optional, false).into_any_element()
+                                chip(Chip::Optional, side == Some(Side::Window(PickerFor::Media))).into_any_element()
                             },
                             !media_set,
-                            false,
+                            side == Some(Side::Window(PickerFor::Media)),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_picker(PickerFor::Media);
+                            this.open_side(Side::Window(PickerFor::Media));
                             cx.notify();
                         })),
                     ),
@@ -921,7 +938,7 @@ impl WinSendGpui {
                             // Quiet while a picker is open: nothing is sent
                             // mid-configuration, and the open row already owns
                             // the accent.
-                            (!sent && can_send && !picking).then_some(ACCENT),
+                            (!sent && can_send && side.is_none()).then_some(ACCENT),
                             can_send,
                         )
                         .on_click(
@@ -1017,43 +1034,100 @@ impl WinSendGpui {
             .child(header_controls(cx))
     }
 
-    /// The window selector.
+    /// The chooser, beside the surface.
     ///
     /// The thumbnail is the point rather than decoration: Zoom's main and
     /// video windows carry the same process, class and title, so the list can
     /// only be told apart by looking at it.
-    fn picker(&mut self, picker: PickerFor, cx: &mut Context<Self>) -> impl IntoElement {
-        let hint = match picker {
-            PickerFor::Zoom => "Pin someone in Zoom first, then pick the window showing only that video feed.",
-            PickerFor::Media => "Pick the media player to restore. A full-screen video window often has no title, so go by the process.",
+    fn side_panel(&mut self, side: Side, cx: &mut Context<Self>) -> impl IntoElement {
+        let (title, hint) = match side {
+            Side::Display => ("Target display", "Where the video window is sent."),
+            Side::Window(PickerFor::Zoom) => (
+                "Zoom video window",
+                "Pin someone in Zoom first, then pick the window showing only that feed.",
+            ),
+            Side::Window(PickerFor::Media) => (
+                "Media window",
+                "A full-screen video window often has no title, so go by the process.",
+            ),
         };
+
+        let monitors = self.core.monitors();
+        let selected = self.target().map(|m| m.id);
         let candidates = self.candidates.clone();
-        let thumbnails: HashMap<u64, Arc<RenderImage>> = self.thumbnails.clone();
+        let thumbnails = self.thumbnails.clone();
 
         div()
-            .id("picker")
+            .id("side-panel")
             .flex()
             .flex_col()
-            .flex_1()
+            .w(px(PANEL_WIDTH))
+            .h_full()
+            .flex_none()
+            .ml(px(PANEL_GAP))
+            .my_3()
+            .mr_3()
+            .p_3()
             .gap_2()
-            .px_4()
-            .pb_4()
+            // Its own card, so it reads as a thing that opened rather than as
+            // more of the surface.
+            .rounded_2xl()
+            .bg(rgb(bg()))
+            .border_1()
+            .border_color(rgb(border()))
+            .shadow_lg()
             .overflow_y_scroll()
-            .child(div().text_size(px(11.)).text_color(rgb(subdued())).pb_1().child(hint))
-            .when(candidates.is_empty(), |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .justify_center()
-                        .py_8()
-                        .text_size(px(12.))
-                        .text_color(rgb(faint()))
-                        .child("Nothing to choose from"),
-                )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id("close-panel")
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .w(px(22.))
+                            .h(px(22.))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(row_hover())))
+                            .child(icon("close", 12.0, subdued()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_side();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().text_size(px(10.5)).text_color(rgb(faint())).pb_1().child(hint))
+            .map(|this| match side {
+                Side::Display => this.children(monitors.into_iter().map(|monitor| {
+                    let chosen = selected.as_deref() == Some(monitor.id.as_str());
+                    picker_row(monitor, chosen, cx)
+                })),
+                Side::Window(picker) => this
+                    .when(candidates.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .justify_center()
+                                .py_6()
+                                .text_size(px(11.))
+                                .text_color(rgb(faint()))
+                                .child("Nothing to choose from"),
+                        )
+                    })
+                    .children(candidates.into_iter().map(move |candidate| {
+                        candidate_row(candidate, thumbnails.clone(), picker, cx)
+                    })),
             })
-            .children(candidates.into_iter().map(move |candidate| {
-                candidate_row(candidate, thumbnails.clone(), picker, cx)
-            }))
     }
 
     /// The settings, as toggles that write straight through `Core`.
@@ -1269,14 +1343,13 @@ fn candidate_row(
         .w_full()
         .p_2()
         .rounded_2xl()
-        .bg(rgb(row_fill()))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(row_hover())))
         .active(|style| style.opacity(0.7))
         .child(match thumbnail {
             Some(image) => img(image)
-                .w(px(96.))
-                .h(px(54.))
+                .w(px(88.))
+                .h(px(50.))
                 .rounded_lg()
                 .into_any_element(),
             // A window that will not be captured is still a window that can be
@@ -1285,10 +1358,10 @@ fn candidate_row(
                 .flex()
                 .justify_center()
                 .items_center()
-                .w(px(96.))
-                .h(px(54.))
+                .w(px(88.))
+                .h(px(50.))
                 .rounded_lg()
-                .bg(rgb(bg()))
+                .bg(rgb(row_fill()))
                 .text_size(px(9.))
                 .text_color(rgb(faint()))
                 .child("no preview")
@@ -1323,9 +1396,6 @@ fn candidate_row(
                         .child(where_to),
                 ),
         )
-        .when(candidate.likely_zoom && picker == PickerFor::Zoom, |this| {
-            this.child(chip(Chip::Likely, false))
-        })
         .on_click(cx.listener(move |this, _, _, cx| {
             this.confirm(picker, &candidate, cx);
             cx.notify();
@@ -1528,9 +1598,9 @@ fn picker_row(
         .h(px(PICKER_ROW))
         .px_4()
         .rounded_full()
-        .bg(rgb(row_fill()))
+        .when(chosen, |this| this.bg(tint(ACCENT, 0.14)))
         .border_1()
-        .border_color(rgb(if chosen { ACCENT } else { row_fill() }))
+        .border_color(rgb(if chosen { ACCENT } else { bg() }))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(row_hover())))
         .active(|style| style.opacity(0.7))
@@ -1539,7 +1609,7 @@ fn picker_row(
         .on_click(cx.listener(move |this, _, _, cx| {
             let outcome = this.core.set_target_monitor(&monitor);
             this.report(outcome, cx);
-            this.picking_display = false;
+            this.close_side();
             cx.notify();
         }))
 }
